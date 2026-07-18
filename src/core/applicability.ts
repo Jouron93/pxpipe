@@ -19,7 +19,16 @@ export interface PxpipeApplicabilityInput {
 const VARIANT_TAG = /\[[^\]]*\]/g;
 
 function baseModelId(model: string): string {
-  return model.replace(VARIANT_TAG, '');
+  return model
+    .trim()
+    .toLowerCase()
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/\((thinking|high|medium|med|low)\)/g, '')
+    .replace(/^models\//, '')
+    .replace(/^(openai|anthropic|google|x-ai|xai|moonshot|zhipu|kimi|nvidia|agy|codex|hermes)[/:-]/, '')
+    .replace(/[ _]+/g, '-')
+    .replace(/-(thinking|high|medium|med|low|fast|stable|low-context|long-context)$/, '')
+    .replace(/^-|-$/g, '');
 }
 
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
