@@ -25,9 +25,10 @@ function baseModelId(model: string): string {
     .replace(/\[[^\]]*\]/g, '')
     .replace(/\((thinking|high|medium|med|low)\)/g, '')
     .replace(/^models\//, '')
-    .replace(/^(openai|anthropic|google|x-ai|xai|moonshot|zhipu|kimi|nvidia|agy|codex|hermes)[/:-]/, '')
+    .replace(/^(openai|anthropic|google|x-ai|xai|agy|codex)[/:-]/, '')
+    .replace(/^(moonshot|zhipu|kimi|nvidia|hermes|deepseek)[/:]/, '')
     .replace(/[ _]+/g, '-')
-    .replace(/-(thinking|high|medium|med|low|fast|stable|low-context|long-context|reason|nonreason)$/, '')
+    .replace(/-(thinking|high|medium|med|low|fast|stable|low-context|long-context|reason|nonreason|reasoning|reasoner|effort|thought|extended-thinking|extended|high-effort|medium-effort|low-effort|high-thinking|medium-thinking|low-thinking)$/, '')
     .replace(/^-|-$/g, '');
 }
 
@@ -101,11 +102,22 @@ const READER_VALIDATION: Readonly<Record<string, PxpipeReaderValidation>> = {
   'claude-fable-5': { status: 'validated', note: '100/100 novel arithmetic, 13/15 verbatim, 98/98 gist parity (FINDINGS.md 2026-06-10/11)' },
   'claude-opus-4-8': { status: 'degraded', note: '6/15 dense-hex; confident confabulation on imaged detail (FINDINGS.md 2026-06-12/16)' },
   'claude-opus-4-7': { status: 'degraded', note: 'Opus imaged-reading failure family; disabled alongside 4.8 (FINDINGS.md)' },
+  'claude-opus-4-6': { status: 'degraded', note: 'Opus imaged-reading failure family; disabled alongside 4.8 (FINDINGS.md)' },
   'claude-sonnet-5': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
   'claude-sonnet-4-6': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'claude-haiku-4-5': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
   'gpt-5.6-sol': { status: 'degraded', note: '98/100 arithmetic but 0/15 dense-hex and 4/15 confabulation guard (FINDINGS.md 2026-07-09)' },
+  'gpt-5.6': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
   'gpt-5.5': { status: 'degraded', note: 'degrades on imaged history/context (FINDINGS.md)' },
+  'gpt-5.4': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
   'grok-4.5': { status: 'degraded', note: '82/100 arithmetic, 83/98 gist, 13/18 state tracking (FINDINGS.md)' },
+  'grok-4': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'gemini-3.5-flash': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'gemini-3.1-pro': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'gemini-3.1-flash-lite': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'deepseek-v4-pro': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'deepseek-v4-flash': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'deepseek-reasoner': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
 };
 
 /** Verdict for a model base; unknown ids fail closed as 'unvalidated'. */
