@@ -27,7 +27,7 @@ function baseModelId(model: string): string {
     .replace(/^models\//, '')
     .replace(/^(openai|anthropic|google|x-ai|xai|moonshot|zhipu|kimi|nvidia|agy|codex|hermes)[/:-]/, '')
     .replace(/[ _]+/g, '-')
-    .replace(/-(thinking|high|medium|med|low|fast|stable|low-context|long-context)$/, '')
+    .replace(/-(thinking|high|medium|med|low|fast|stable|low-context|long-context|reason|nonreason)$/, '')
     .replace(/^-|-$/g, '');
 }
 
