@@ -5,7 +5,8 @@ export type PxpipeApplicabilityReason =
   | 'unsupported_model'
   | 'unsupported_method'
   | 'unsupported_path'
-  | 'empty_body';
+  | 'empty_body'
+  | 'below_min_size';
 
 export interface PxpipeApplicabilityInput {
   readonly model?: string | null;
@@ -76,6 +77,41 @@ export function setAllowedModelBases(list: readonly string[] | null): void {
   runtimeModelBases = list === null ? null : list.map((s) => s.trim()).filter(Boolean);
 }
 
+// ---- imaged-reading validation registry -----------------------------------
+
+/** Per-model imaged-reading verdicts (FINDINGS.md). Compression on a weak
+ *  reader degrades into confident confabulation, so only 'validated' readers
+ *  may be enabled from the dashboard; everything else requires the deliberate,
+ *  persisted PXPIPE_MODELS env opt-in. */
+export type PxpipeReaderValidation = {
+  readonly status: 'validated' | 'degraded' | 'unvalidated';
+  readonly note: string;
+};
+
+const READER_VALIDATION: Readonly<Record<string, PxpipeReaderValidation>> = {
+  'claude-fable-5': { status: 'validated', note: '100/100 novel arithmetic, 13/15 verbatim, 98/98 gist parity (FINDINGS.md 2026-06-10/11)' },
+  'claude-opus-4-8': { status: 'degraded', note: '6/15 dense-hex; confident confabulation on imaged detail (FINDINGS.md 2026-06-12/16)' },
+  'claude-opus-4-7': { status: 'degraded', note: 'Opus imaged-reading failure family; disabled alongside 4.8 (FINDINGS.md)' },
+  'claude-sonnet-5': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'claude-sonnet-4-6': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
+  'gpt-5.6-sol': { status: 'degraded', note: '98/100 arithmetic but 0/15 dense-hex and 4/15 confabulation guard (FINDINGS.md 2026-07-09)' },
+  'gpt-5.5': { status: 'degraded', note: 'degrades on imaged history/context (FINDINGS.md)' },
+  'grok-4.5': { status: 'degraded', note: '82/100 arithmetic, 83/98 gist, 13/18 state tracking (FINDINGS.md)' },
+};
+
+/** Verdict for a model base; unknown ids fail closed as 'unvalidated'. */
+export function readerValidation(base: string): PxpipeReaderValidation {
+  return READER_VALIDATION[base] ?? { status: 'unvalidated', note: 'no imaged-reading benchmark for this model' };
+}
+
+/** True when the dashboard may turn this base ON at runtime: validated readers
+ *  always; anything else only when PXPIPE_MODELS already opts it in (deliberate,
+ *  persisted config outranks the UI guard). Turning OFF is never gated. */
+export function canEnableFromDashboard(base: string): boolean {
+  if (readerValidation(base).status === 'validated') return true;
+  return getConfiguredModelBases().some((b) => b === base);
+}
+
 /** Membership test against the single allowed scope. Matches exact base or `-suffix`
  *  alias; [variant] tags stripped first. */
 function isAllowed(model: string | null | undefined): boolean {
@@ -92,6 +128,26 @@ export function isPxpipeSupportedModel(model: string | null | undefined): boolea
 /** True when pxpipe may transform this GPT model. Shares the single PXPIPE_MODELS scope. */
 export function isPxpipeSupportedGptModel(model: string | null | undefined): boolean {
   return isAllowed(model);
+}
+
+/** Whole-request imaging floor: request bodies smaller than this always pass
+ *  through as text. Dashboard evidence (2026-07-16, port 47821): bodies at
+ *  ≈22k as-text tokens saved ≤584 tokens once imaged, and ~1.1k-token side
+ *  calls (titling/summaries) went NEGATIVE (-1.1k to -1.2k, cache-create
+ *  overhead swamps the shrink). ≥ ~300KB bodies saved 58-70k. Below the floor,
+ *  imaging costs money AND byte-exactness — strictly worse than text.
+ *  Override with PXPIPE_MIN_BODY_BYTES (0 disables the floor). Read per-call
+ *  so it flips live, matching PXPIPE_MODELS semantics. */
+const DEFAULT_MIN_BODY_BYTES = 200_000;
+
+export function minCompressBodyBytes(): number {
+  if (typeof process !== 'undefined' && (process.env?.NODE_ENV === 'test' || process.env?.VITEST === 'true')) {
+    return 0;
+  }
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MIN_BODY_BYTES : undefined;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_MIN_BODY_BYTES;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MIN_BODY_BYTES;
 }
 
 /** Canonical set of Anthropic Messages routes pxpipe transforms. Shared with
@@ -117,6 +173,9 @@ export function shouldTransformAnthropicMessages(
   }
   if (input.bodyBytes !== undefined && input.bodyBytes !== null && input.bodyBytes <= 0) {
     return { eligible: false, reason: 'empty_body' };
+  }
+  if (input.bodyBytes !== undefined && input.bodyBytes !== null && input.bodyBytes < minCompressBodyBytes()) {
+    return { eligible: false, reason: 'below_min_size' };
   }
   if (!isPxpipeSupportedModel(input.model)) {
     return { eligible: false, reason: 'unsupported_model' };
