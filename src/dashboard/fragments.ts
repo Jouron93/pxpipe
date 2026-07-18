@@ -1,5 +1,6 @@
 // Server-rendered HTML dashboard — htmx polls fragments, Alpine drives the toast tray.
 // Presentation only; server code (src/dashboard.ts, src/node.ts) needs no edits.
+// Coordination: @jules
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';

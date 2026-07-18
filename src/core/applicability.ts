@@ -1,4 +1,6 @@
-/** Applicability helpers for pxpipe's production-safe model scope. */
+/** Applicability helpers for pxpipe's production-safe model scope.
+ *  Modified by AI agent under coordination with @jules
+ */
 
 export type PxpipeApplicabilityReason =
   | 'eligible'

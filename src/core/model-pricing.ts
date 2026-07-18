@@ -1,4 +1,5 @@
 /** Provider-aware API list-price equivalents for telemetry.
+ *  Modified by AI agent under coordination with @jules
  *
  * These rates do not claim that OAuth/subscription traffic created a cash
  * charge. They answer the narrower counterfactual: what would the same token
