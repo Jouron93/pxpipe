@@ -102,6 +102,7 @@ const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
 ];
 
 const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
   { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { id: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
   { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
@@ -699,10 +700,17 @@ function nonInferenceRole(path: string): string {
 }
 
 export function renderRecentFragment(p: RecentPayload): string {
-  const rows = (p.recent ?? []).slice().reverse();
+  // This panel is about "what happened to your context" — i.e. inference requests
+  // that could be imaged. Discovery/control probes (/models, /version, /api/tags,
+  // health checks from Ollama-style clients) are non-inference noise that floods the
+  // table during probe bursts; keep them out of this view so real inference is visible.
+  const rows = (p.recent ?? [])
+    .filter((e: RecentRow) => isInferencePath(e.path))
+    .slice()
+    .reverse();
   const body =
     rows.length === 0
-      ? `<tr><td colspan="10" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
+      ? `<tr><td colspan="10" class="empty-cell">No inference requests yet — they stream in here live.</td></tr>`
       : rows
           .map((e: RecentRow, i: number) => {
             const inference = isInferencePath(e.path);
@@ -739,9 +747,12 @@ export function renderRecentFragment(p: RecentPayload): string {
               ? `<span class="badge badge-img">image</span>`
               : `<span class="badge badge-txt">text</span>`;
             const requestedDiffers = e.requested_model && e.actual_model && e.requested_model !== e.actual_model;
+            // A failed request (401/404/etc.) often has no resolved `model`, but the
+            // client still named one — show requested_model so no-usage rows aren't nameless.
+            const nameFallback = e.model || e.requested_model || e.actual_model || '';
             const modelCell = inference
-              ? (e.model
-                  ? `<code>${escapeHtml(e.model)}</code>${requestedDiffers ? `<br><span class="muted">requested ${escapeHtml(e.requested_model!)}</span>` : ''}`
+              ? (nameFallback
+                  ? `<code>${escapeHtml(nameFallback)}</code>${requestedDiffers ? `<br><span class="muted">requested ${escapeHtml(e.requested_model!)}</span>` : ''}`
                   : '<span class="muted">not reported</span>')
               : `<span class="muted">${notApplicable}</span>`;
             const usageCell = (value: number | undefined, missing: string): string =>
