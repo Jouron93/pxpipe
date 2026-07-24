@@ -12,7 +12,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import {
+  createProxy,
+  parseGatewayHeaders,
+  resolveUpstreams,
+  type BillingLane,
+  type ProxyConfig,
+} from './core/proxy.js';
 import {
   parseExportArgv,
   runExportCore,
@@ -49,6 +55,11 @@ interface RuntimeConfig {
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
+  captureRequestBodiesOn4xx: boolean;
+  agyMonthlySubscriptionUsd: number | null;
+  claudeMonthlySubscriptionUsd: number | null;
+  codexMonthlySubscriptionUsd: number | null;
+  billingLanes: Partial<Record<'anthropic' | 'openai' | 'passthrough', BillingLane>>;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -81,6 +92,62 @@ function applyConfigFileDefaults(): void {
     const models = normalizeModelsConfig(cfg.models);
     if (models !== undefined) process.env.PXPIPE_MODELS = models;
   }
+  if (process.env.PXPIPE_AGY_MONTHLY_USD === undefined) {
+    const monthly = cfg.agy_monthly_subscription_usd;
+    if (typeof monthly === 'number' || typeof monthly === 'string') {
+      process.env.PXPIPE_AGY_MONTHLY_USD = String(monthly);
+    }
+  }
+  if (process.env.PXPIPE_CLAUDE_MONTHLY_USD === undefined) {
+    const monthly = cfg.claude_max_monthly_subscription_usd ?? cfg.claude_monthly_subscription_usd;
+    if (typeof monthly === 'number' || typeof monthly === 'string') {
+      process.env.PXPIPE_CLAUDE_MONTHLY_USD = String(monthly);
+    }
+  }
+  if (process.env.PXPIPE_CODEX_MONTHLY_USD === undefined) {
+    const monthly = cfg.codex_monthly_subscription_usd;
+    if (typeof monthly === 'number' || typeof monthly === 'string') {
+      process.env.PXPIPE_CODEX_MONTHLY_USD = String(monthly);
+    }
+  }
+  const laneKeys = [
+    ['PXPIPE_ANTHROPIC_BILLING_LANE', 'anthropic_billing_lane'],
+    ['PXPIPE_OPENAI_BILLING_LANE', 'openai_billing_lane'],
+    ['PXPIPE_PASSTHROUGH_BILLING_LANE', 'passthrough_billing_lane'],
+  ] as const;
+  for (const [envKey, configKey] of laneKeys) {
+    if (process.env[envKey] === undefined && typeof cfg[configKey] === 'string') {
+      process.env[envKey] = String(cfg[configKey]);
+    }
+  }
+}
+
+function parsePositiveUsd(value: string | undefined, label: string): number | null {
+  if (value === undefined || value.trim() === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(`[pxpipe] ignored invalid ${label}: ${value}`);
+    return null;
+  }
+  return parsed;
+}
+
+const BILLING_LANES = new Set<BillingLane>([
+  'agy_ultra_subscription',
+  'claude_max_subscription',
+  'codex_subscription',
+  'nvidia_build_free',
+  'api_key',
+  'local',
+  'unknown',
+]);
+
+function parseBillingLane(value: string | undefined, label: string): BillingLane | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const lane = value.trim() as BillingLane;
+  if (BILLING_LANES.has(lane)) return lane;
+  console.warn(`[pxpipe] ignored invalid ${label}: ${value}`);
+  return undefined;
 }
 
 function parseCli(argv: string[]): RuntimeConfig {
@@ -117,6 +184,35 @@ function parseCli(argv: string[]): RuntimeConfig {
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
+    captureRequestBodiesOn4xx: /^(1|true|yes|on)$/i.test(
+      process.env.PXPIPE_CAPTURE_4XX_REQUEST_BODIES ?? '',
+    ),
+    agyMonthlySubscriptionUsd: parsePositiveUsd(
+      process.env.PXPIPE_AGY_MONTHLY_USD,
+      'PXPIPE_AGY_MONTHLY_USD',
+    ),
+    claudeMonthlySubscriptionUsd: parsePositiveUsd(
+      process.env.PXPIPE_CLAUDE_MONTHLY_USD,
+      'PXPIPE_CLAUDE_MONTHLY_USD',
+    ),
+    codexMonthlySubscriptionUsd: parsePositiveUsd(
+      process.env.PXPIPE_CODEX_MONTHLY_USD,
+      'PXPIPE_CODEX_MONTHLY_USD',
+    ),
+    billingLanes: {
+      anthropic: parseBillingLane(
+        process.env.PXPIPE_ANTHROPIC_BILLING_LANE,
+        'PXPIPE_ANTHROPIC_BILLING_LANE',
+      ),
+      openai: parseBillingLane(
+        process.env.PXPIPE_OPENAI_BILLING_LANE,
+        'PXPIPE_OPENAI_BILLING_LANE',
+      ),
+      passthrough: parseBillingLane(
+        process.env.PXPIPE_PASSTHROUGH_BILLING_LANE,
+        'PXPIPE_PASSTHROUGH_BILLING_LANE',
+      ),
+    },
   };
 }
 
@@ -164,13 +260,28 @@ Environment:
                           default claude-fable-5 (Sol/Opus/GPT-5.5/Grok opt-in);
                           off disables
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
-                          supports {"models": [...]} or {"models": "off"}
+                          supports models plus fixed subscription prices
+  PXPIPE_AGY_MONTHLY_USD  fixed AGY subscription price used for API-equivalent
+                          break-even accounting (no per-request cash claim)
+  PXPIPE_CLAUDE_MONTHLY_USD fixed Claude Max subscription price for the same
+                          API-equivalent break-even accounting
+  PXPIPE_CODEX_MONTHLY_USD fixed Codex/ChatGPT subscription price for the same
+                          API-equivalent break-even accounting
+  PXPIPE_*_BILLING_LANE   optional trusted route attribution for ANTHROPIC,
+                          OPENAI, or PASSTHROUGH; configured routes take precedence
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
+  PXPIPE_CAPTURE_4XX_REQUEST_BODIES
+                          debug only: retain full transformed request bodies on
+                          upstream 4xx (default off; may contain sensitive data)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+
+Use with Codex/ChatGPT OAuth:
+  OPENAI_UPSTREAM=https://chatgpt.com/backend-api/codex
+  Configure Codex base_url=http://127.0.0.1:47821/v1 and leave OPENAI_API_KEY unset
 
 Use with OpenAI-compatible GPT clients:
   OPENAI_BASE_URL=http://127.0.0.1:47821/v1
@@ -324,6 +435,7 @@ async function dispatchDashboard(
   req: IncomingMessage,
   url: URL,
   port: number,
+  healthMeta?: { openAIUpstream: string; anthropicUpstream: string },
 ): Promise<Response | undefined> {
   const method = req.method ?? 'GET';
   switch (route.kind) {
@@ -336,6 +448,24 @@ async function dispatchDashboard(
     case 'recent':
       if (method !== 'GET') return undefined;
       return dashboard.serveRecent();
+    case 'health': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      const body = JSON.stringify({
+        ok: true,
+        service: 'pxpipe',
+        upstream_openai: healthMeta?.openAIUpstream ?? '',
+        upstream_anthropic: healthMeta?.anthropicUpstream ?? '',
+        pid: process.pid,
+        uptime_s: Math.round(process.uptime() * 10) / 10,
+      });
+      return new Response(method === 'HEAD' ? null : body, {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
     case 'png': {
       if (method !== 'GET') return undefined;
       const idRaw = url.searchParams.get('id');
@@ -921,6 +1051,10 @@ async function main(): Promise<void> {
   const dashboard = new DashboardState({
     eventsFile: opts.eventsFile,
     sidecarDir: bodySidecarDir,
+  }, undefined, {
+    agyMonthlySubscriptionUsd: opts.agyMonthlySubscriptionUsd,
+    claudeMonthlySubscriptionUsd: opts.claudeMonthlySubscriptionUsd,
+    codexMonthlySubscriptionUsd: opts.codexMonthlySubscriptionUsd,
   });
   // Seed the "recent requests" table from the JSONL log so a process restart
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
@@ -933,6 +1067,8 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
+    billingLanes: opts.billingLanes,
+    captureRequestBodiesOn4xx: opts.captureRequestBodiesOn4xx,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -978,11 +1114,9 @@ async function main(): Promise<void> {
       const tag = e.info?.compressed
         ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
         : (e.info?.reason ?? '');
-      const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
-      const inputTokens = e.usage?.input_tokens ?? 0;
       const usageTag =
         e.usage !== undefined
-          ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
+          ? ` tokens=${e.usage.input_tokens ?? 'not reported'}+${e.usage.output_tokens ?? 'not reported'} cache_read=${e.usage.cache_read_input_tokens ?? 'not reported'}`
           : '';
       console.log(
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
@@ -1029,6 +1163,11 @@ async function main(): Promise<void> {
     },
   };
   const handle = createProxy(config);
+  const upstreamRoutes = resolveUpstreams(config);
+  const healthMeta = {
+    openAIUpstream: upstreamRoutes.openai,
+    anthropicUpstream: upstreamRoutes.anthropic,
+  };
 
   const server = createServer((req, res) => {
     Promise.resolve()
@@ -1038,7 +1177,7 @@ async function main(): Promise<void> {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const route = dashboardPath(url.pathname);
         if (route) {
-          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
+          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port, healthMeta);
           if (webRes) {
             await writeWebResponse(webRes, res);
             return;
@@ -1068,9 +1207,8 @@ async function main(): Promise<void> {
           `Unset HOST to restrict to loopback.`,
       );
     }
-    const routes = resolveUpstreams(config);
-    console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
-    console.log(`[pxpipe] openai upstream → ${routes.openai}`);
+    console.log(`[pxpipe] anthropic upstream → ${upstreamRoutes.anthropic}`);
+    console.log(`[pxpipe] openai upstream → ${upstreamRoutes.openai}`);
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
   });

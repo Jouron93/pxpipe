@@ -211,18 +211,25 @@ const combinedLines = [
   ``,
   `## Overview`,
   ``,
-  l1Results ? [
-    `### L1: OCR Fidelity`,
-    ``,
-    `| | Baseline | Reflow | Δ |`,
-    `|--|---------|--------|---|`,
-    `| Mean char accuracy | ${(l1Results.baselineAgg.meanAccuracy * 100).toFixed(2)}% | ${(l1Results.reflowAgg.meanAccuracy * 100).toFixed(2)}% | ${((l1Results.reflowAgg.meanAccuracy - l1Results.baselineAgg.meanAccuracy) * 100).toFixed(2)}pp |`,
-    `| Macro accuracy | ${(l1Results.baselineAgg.macroAccuracy * 100).toFixed(2)}% | ${(l1Results.reflowAgg.macroAccuracy * 100).toFixed(2)}% | ${((l1Results.reflowAgg.macroAccuracy - l1Results.baselineAgg.macroAccuracy) * 100).toFixed(2)}pp |`,
-    `| Image savings | — | ${l1Results.imageSavingsPct.toFixed(1)}% | |`,
-    ``,
-    `Full L1 report: [l1-report.md](l1-report.md)`,
-    ``,
-  ].join('\n') : '*(L1 not run)*',
+  l1Results ? (() => {
+    const baselineAgg = l1Results.perVariant.baseline?.agg;
+    const reflowAgg = l1Results.perVariant.reflow?.agg;
+    const baselineImgCount = l1Results.perVariant.baseline?.imageCount ?? 1;
+    const reflowImgCount = l1Results.perVariant.reflow?.imageCount ?? 0;
+    const imageSavingsPct = (1 - reflowImgCount / (baselineImgCount || 1)) * 100;
+    return [
+      `### L1: OCR Fidelity`,
+      ``,
+      `| | Baseline | Reflow | Δ |`,
+      `|--|---------|--------|---|`,
+      `| Mean char accuracy | ${(baselineAgg.meanAccuracy * 100).toFixed(2)}% | ${(reflowAgg.meanAccuracy * 100).toFixed(2)}% | ${((reflowAgg.meanAccuracy - baselineAgg.meanAccuracy) * 100).toFixed(2)}pp |`,
+      `| Macro accuracy | ${(baselineAgg.macroAccuracy * 100).toFixed(2)}% | ${(reflowAgg.macroAccuracy * 100).toFixed(2)}% | ${((reflowAgg.macroAccuracy - baselineAgg.macroAccuracy) * 100).toFixed(2)}pp |`,
+      `| Image savings | — | ${imageSavingsPct.toFixed(1)}% | |`,
+      ``,
+      `Full L1 report: [l1-report.md](l1-report.md)`,
+      ``,
+    ].join('\n');
+  })() : '*(L1 not run)*',
 
   ``,
 

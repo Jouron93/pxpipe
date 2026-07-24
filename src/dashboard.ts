@@ -11,6 +11,7 @@
  *   GET  /proxy-stats                → JSON aggregate over the in-mem ring
  *   GET  /proxy-recent               → JSON ring buffer of recent requests
  *   GET  /proxy-latest-png[?crop=N]  → raw PNG of the latest rendered image
+ *   GET  /health, /v1/health         → liveness JSON {ok, service, ...}
  *
  * Session endpoints (read-only telemetry — no destructive operations):
  *
@@ -44,6 +45,11 @@ import {
   openAIOutputRate,
 } from './core/openai-savings.js';
 import {
+  outputInputRatio,
+  resolveModelRate,
+  type ModelRateCard,
+} from './core/model-pricing.js';
+import {
   aggregateSessions,
   claudeCodeMap,
   filterSessions,
@@ -69,6 +75,7 @@ import {
   type ContextMapData,
 } from './dashboard/fragments.js';
 import {
+  canEnableFromDashboard,
   getAllowedModelBases,
   getConfiguredModelBases,
   setAllowedModelBases,
@@ -120,6 +127,8 @@ export interface RecentRow {
   method: string;
   path: string;
   model?: string;
+  requested_model?: string;
+  actual_model?: string;
   status: number;
   size_in?: number;
   compressed: boolean;
@@ -282,6 +291,24 @@ interface Totals {
   passthroughPaidRequests: number;
   passthroughActualInputWeighted: number;
   passthroughOutputWeighted: number;
+  pricedUsageRequests: number;
+  unpricedUsageRequests: number;
+  compressedPricedRequests: number;
+  passthroughPricedRequests: number;
+  apiEquivalentSavedUsd: number;
+  compressedApiEquivalentUsd: number;
+  passthroughApiEquivalentUsd: number;
+  /** Public-API-equivalent value consumed through an AGY subscription lane.
+   *  This is compared with the configured fixed monthly subscription price;
+   *  it is never reported as a per-request cash charge. */
+  agyApiEquivalentUsd: number;
+  agyUsageRequests: number;
+  claudeApiEquivalentUsd: number;
+  claudeUsageRequests: number;
+  codexApiEquivalentUsd: number;
+  codexUsageRequests: number;
+  rateLimit429Responses: number;
+  rateLimitHeaderResponses: number;
   /** Sum of ground-truth output character counts from the SSE/JSON scanner
    *  (see `OutputMeasurement` in proxy.ts). These three accumulators are
    *  independent of Anthropic's `usage.output_tokens` — they let the operator
@@ -319,32 +346,6 @@ interface Totals {
  *  Source: [docs-pricing] — Opus 4.7 lists $5/Mtok input and $25/Mtok
  *  output (5×); Sonnet 4.7 lists $3/Mtok input and $15/Mtok output (5×).
  *  Same ratio holds on Haiku 4.5 ($1/$5). */
-const OUTPUT_TOKEN_RATE = 5.0;
-
-/** Per-million-token input rate ASSUMED for the headline dollar figure.
- *  Source: https://docs.claude.com/en/docs/about-claude/pricing — Opus 4.7
- *  input is $5/Mtok (same as Opus 4.5 / 4.6; the previous "$2.50" value
- *  here was a regression). Cache-write 5m = $6.25/Mtok (1.25×),
- *  cache-read = $0.50/Mtok (0.10×).
- *
- *  This is exposed on /proxy-stats as `pricing_assumptions.input_per_mtok`
- *  so the operator can see what we assumed and override if they're
- *  running against a non-default deployment (Bedrock/Vertex add a 10%
- *  premium; Sonnet would be $3/Mtok, etc.).
- *
- *  NOTE: Opus 4.7 uses a different tokenizer than 4.5/4.6 (per
- *  docs.claude.com/en/docs/about-claude/pricing), so even at the same
- *  $/Mtok rate, the same string maps to a different token count. The
- *  honest oracle for "tokens in this body" is `count_tokens` against the
- *  actual target model; do not trust hardcoded chars-per-token or
- *  tokens-per-image constants on 4.7 without verifying against the
- *  upstream probe. */
-// 2026-06-09: gate is Fable-5-only and Fable 5 bills $10/MTok input,
-// so the dashboard dollar figure uses that rate. Output tokens are
-// excluded entirely (the proxy can't move them), so this still
-// understates the real bill - treat it as "input-side $ saved".
-export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
-
 /** Route per-event accounting by upstream. OpenAI paths use the GPT cost
  *  model (vision-token imaging, automatic 0.1× prefix cache, no count_tokens
  *  probe, 8× output); everything else uses the Anthropic cache-aware baseline.
@@ -361,8 +362,9 @@ function isOpenAIEvent(path: string | undefined): boolean {
  *  GPT differs from Anthropic on every axis: input_tokens already INCLUDES the
  *  cached subset (`cachedTokens`), there is no cache-create premium, the cached
  *  prefix reads at ~0.1×, and the baseline is the measured `baselineImagedTokens`
- *  (o200k text-token cost of the imaged content) vs the vision-token `imageTokens`
- *  pxpipe actually paid — not a count_tokens probe. No per-session warmth state:
+ *  (o200k text-token cost of the imaged content) vs the replacement cost: vision
+ *  `imageTokens` plus compression-only `preservedTextTokens` — not a count_tokens probe.
+ *  No per-session warmth state:
  *  OpenAI caching is automatic/prefix-based and the discount is already folded
  *  into the cached-input rate. See src/core/openai-savings.ts. */
 function gptEff(args: {
@@ -371,6 +373,7 @@ function gptEff(args: {
   outputTokens: number;
   cachedTokens: number;
   imageTokens: number;
+  preservedTextTokens: number;
   baselineImagedTokens: number;
   compressed: boolean;
 }): {
@@ -384,7 +387,8 @@ function gptEff(args: {
   rawBaseline: number;
 } {
   const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached } = args;
-  const { imageTokens, baselineImagedTokens, compressed } = args;
+  const { imageTokens, preservedTextTokens, baselineImagedTokens, compressed } = args;
+  const replacementTokens = imageTokens + preservedTextTokens;
   const haveUsage = inp > 0 || out > 0;
   // The transform measured what the imaged content would have cost as o200k
   // text; without it there is no counterfactual to credit.
@@ -392,13 +396,13 @@ function gptEff(args: {
   const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model) : 0;
   const creditSaving = haveBaseline && haveUsage && compressed;
   const baselineInputEff = creditSaving
-    ? computeOpenAIBaselineInputEff(inp, cached, imageTokens, baselineImagedTokens, model)
+    ? computeOpenAIBaselineInputEff(inp, cached, replacementTokens, baselineImagedTokens, model)
     : actualInputEff;
   const outputEquiv = haveUsage ? out * openAIOutputRate(model) : 0;
   // Raw, rate-free token counts for the session's compression ratio and the
   // Details panel: actual = what we sent; baseline = the text-only equivalent.
   const rawActual = inp;
-  const rawBaseline = computeOpenAIBaselineRawTokens(inp, imageTokens, baselineImagedTokens);
+  const rawBaseline = computeOpenAIBaselineRawTokens(inp, replacementTokens, baselineImagedTokens);
   return {
     haveUsage,
     haveBaseline,
@@ -451,6 +455,21 @@ export class DashboardState {
     passthroughPaidRequests: 0,
     passthroughActualInputWeighted: 0,
     passthroughOutputWeighted: 0,
+    pricedUsageRequests: 0,
+    unpricedUsageRequests: 0,
+    compressedPricedRequests: 0,
+    passthroughPricedRequests: 0,
+    apiEquivalentSavedUsd: 0,
+    compressedApiEquivalentUsd: 0,
+    passthroughApiEquivalentUsd: 0,
+    agyApiEquivalentUsd: 0,
+    agyUsageRequests: 0,
+    claudeApiEquivalentUsd: 0,
+    claudeUsageRequests: 0,
+    codexApiEquivalentUsd: 0,
+    codexUsageRequests: 0,
+    rateLimit429Responses: 0,
+    rateLimitHeaderResponses: 0,
     textCharsMeasured: 0,
     thinkingCharsMeasured: 0,
     toolUseCharsMeasured: 0,
@@ -458,6 +477,7 @@ export class DashboardState {
     eventsWithMeasurement: 0,
     startedAt: Date.now() / 1000,
   };
+  private readonly pricingRateCards = new Map<string, ModelRateCard>();
   /** Bounded ring of the most recently rendered images (last IMAGE_RING_CAP).
    *  Each request that rendered an image pushes one entry; the matching
    *  RecentRow carries `img_id` so the dashboard can pull any image still in
@@ -499,13 +519,36 @@ export class DashboardState {
    *  path. Lets unit tests run in tens of ms instead of scanning hundreds of
    *  the developer's actual Claude Code session files. */
   private readonly ccMapFn: () => Promise<Map<string, ClaudeCodeSessionRef>>;
+  private readonly agyMonthlySubscriptionUsd: number | null;
+  private readonly claudeMonthlySubscriptionUsd: number | null;
+  private readonly codexMonthlySubscriptionUsd: number | null;
+  private latestRateLimit: {
+    ts: number;
+    status: number;
+    model?: string;
+    retry_after?: string;
+    request_limit?: string;
+    request_remaining?: string;
+    request_reset?: string;
+    token_limit?: string;
+    token_remaining?: string;
+    token_reset?: string;
+  } | undefined;
 
   constructor(
     paths?: SessionsPaths,
     ccMapFn?: () => Promise<Map<string, ClaudeCodeSessionRef>>,
+    economics?: {
+      agyMonthlySubscriptionUsd?: number | null;
+      claudeMonthlySubscriptionUsd?: number | null;
+      codexMonthlySubscriptionUsd?: number | null;
+    },
   ) {
     this.paths = paths;
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
+    this.agyMonthlySubscriptionUsd = economics?.agyMonthlySubscriptionUsd ?? null;
+    this.claudeMonthlySubscriptionUsd = economics?.claudeMonthlySubscriptionUsd ?? null;
+    this.codexMonthlySubscriptionUsd = economics?.codexMonthlySubscriptionUsd ?? null;
   }
 
   /** Stash every rendered image into the ring (called from onRequest with the
@@ -563,6 +606,26 @@ export class DashboardState {
     const u = ev.usage;
     const info = ev.info;
     const compressed = info?.compressed === true;
+    const requestedModel = ev.requestedModel ?? ev.model;
+    const actualModel = ev.actualModel;
+    const effectiveModel = actualModel ?? requestedModel;
+
+    if (ev.status === 429) this.totals.rateLimit429Responses += 1;
+    if (ev.rateLimit) {
+      this.totals.rateLimitHeaderResponses += 1;
+      this.latestRateLimit = {
+        ts: Date.now(),
+        status: ev.status,
+        model: effectiveModel,
+        retry_after: ev.rateLimit.retryAfter,
+        request_limit: ev.rateLimit.requestLimit,
+        request_remaining: ev.rateLimit.requestRemaining,
+        request_reset: ev.rateLimit.requestReset,
+        token_limit: ev.rateLimit.tokenLimit,
+        token_remaining: ev.rateLimit.tokenRemaining,
+        token_reset: ev.rateLimit.tokenReset,
+      };
+    }
 
     const inp = u?.input_tokens ?? 0;
     const out = u?.output_tokens ?? 0;
@@ -591,11 +654,12 @@ export class DashboardState {
       // per-session warmth — the discount is automatic and folded into the
       // cached-input rate. Baseline is the measured imaged-vs-text delta.
       const e = gptEff({
-        model: ev.model,
+        model: effectiveModel,
         inputTokens: inp,
         outputTokens: out,
         cachedTokens: u?.cached_tokens ?? 0,
         imageTokens: info?.imageTokens ?? 0,
+        preservedTextTokens: info?.preservedTextTokens ?? 0,
         baselineImagedTokens: info?.baselineImagedTokens ?? 0,
         compressed,
       });
@@ -700,7 +764,7 @@ export class DashboardState {
       // this, an output-heavy turn would silently inflate the "saved %"
       // headline relative to what Anthropic's weekly limit meters as token
       // consumption (input + output × 5).
-      outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
+      outputEquiv = haveUsage ? out * outputInputRatio(effectiveModel, inp) : 0;
       rawActual = inp + cc + cr;
       rawBaseline = baseline ?? 0;
       baselineForRow = baseline ?? 0;
@@ -732,7 +796,7 @@ export class DashboardState {
         buckets: { ...(info.bucketChars ?? {}) },
         imageIds: [...imgIds],
         compressed,
-        model: ev.model,
+        model: effectiveModel,
         responsesComposition: info.responsesComposition,
         responsesUnexplainedTokens: info.responsesComposition
           ? Math.max(0, rawBaseline - info.responsesComposition.totalLocal)
@@ -786,6 +850,48 @@ export class DashboardState {
         this.totals.passthroughPaidRequests += 1;
         this.totals.passthroughActualInputWeighted += actualInputEff;
         this.totals.passthroughOutputWeighted += outputEquiv;
+      }
+
+      const rate = resolveModelRate(requestedModel, inp, {
+        billingLane: ev.billingLane,
+        billingLaneSource: ev.billingLaneSource,
+        actualModel,
+      });
+      const hasReferenceRate =
+        rate.inputPerMtok !== undefined && rate.outputPerMtok !== undefined;
+      if (ev.billingLane === 'agy_ultra_subscription') {
+        this.totals.agyUsageRequests += 1;
+      } else if (ev.billingLane === 'claude_max_subscription') {
+        this.totals.claudeUsageRequests += 1;
+      } else if (ev.billingLane === 'codex_subscription') {
+        this.totals.codexUsageRequests += 1;
+      }
+      if (hasReferenceRate) {
+        this.pricingRateCards.set(rate.id, rate);
+        this.totals.pricedUsageRequests += 1;
+        const actualUsd =
+          (actualInputEff * rate.inputPerMtok! + out * rate.outputPerMtok!) / 1e6;
+        if (ev.billingLane === 'agy_ultra_subscription') {
+          this.totals.agyApiEquivalentUsd += actualUsd;
+        } else if (ev.billingLane === 'claude_max_subscription') {
+          this.totals.claudeApiEquivalentUsd += actualUsd;
+        } else if (ev.billingLane === 'codex_subscription') {
+          this.totals.codexApiEquivalentUsd += actualUsd;
+        }
+        if (creditSaving) {
+          this.totals.apiEquivalentSavedUsd +=
+            ((baselineInputEff - actualInputEff) * rate.inputPerMtok!) / 1e6;
+        }
+        if (compressed) {
+          this.totals.compressedPricedRequests += 1;
+          this.totals.compressedApiEquivalentUsd += actualUsd;
+        } else {
+          this.totals.passthroughPricedRequests += 1;
+          this.totals.passthroughApiEquivalentUsd += actualUsd;
+        }
+      } else {
+        this.pricingRateCards.set(rate.id, rate);
+        this.totals.unpricedUsageRequests += 1;
       }
     }
 
@@ -863,7 +969,9 @@ export class DashboardState {
       ts: Date.now() / 1000,
       method: ev.method,
       path: ev.path,
-      model: ev.model,
+      model: effectiveModel,
+      requested_model: requestedModel,
+      actual_model: actualModel,
       status: ev.status,
       compressed,
       cc_added: compressed ? 1 : undefined,
@@ -930,11 +1038,13 @@ export class DashboardState {
 
       if (gpt) {
         const e = gptEff({
-          model: t.model,
+          model: t.actual_model ?? t.model,
           inputTokens: inp,
           outputTokens: out,
           cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
           imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
+          preservedTextTokens:
+            (t as { preserved_text_tokens?: number }).preserved_text_tokens ?? 0,
           baselineImagedTokens:
             (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
           compressed,
@@ -1051,6 +1161,8 @@ export class DashboardState {
         method: t.method,
         path: t.path,
         model: t.model,
+        requested_model: t.requested_model,
+        actual_model: t.actual_model,
         status: t.status,
         compressed,
         cc_added: compressed ? 1 : undefined,
@@ -1165,30 +1277,17 @@ export class DashboardState {
     const pctAllSpend =
       allCounterfactualBill > 0 ? (saved / allCounterfactualBill) * 100 : 0;
 
-    // Direct observed split — actual $ per request, partitioned by which
-    // path ran. Token-equivalent (input × 1.0 + cache_create × 1.25 +
-    // cache_read × 0.10 + output × 5) → $ at the assumed Opus 4.7 input
-    // rate. Same $/Mtok rate is applied to both buckets, so the bias from
-    // the rate assumption cancels in the delta. Selection bias from the
-    // gate is NOT cancelled — the operator interprets that via the
-    // sample-count caveat below.
-    const compressedTokenEquiv =
-      this.totals.compressedActualInputWeighted +
-      this.totals.compressedOutputWeighted;
-    const passthroughTokenEquiv =
-      this.totals.passthroughActualInputWeighted +
-      this.totals.passthroughOutputWeighted;
-    const compressedActualUsd =
-      (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
-    const passthroughActualUsd =
-      (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    // API-list-price-equivalent split, summed from each event's resolved
+    // model card. This is not presented as an OAuth/subscription cash charge.
+    const compressedActualUsd = this.totals.compressedApiEquivalentUsd;
+    const passthroughActualUsd = this.totals.passthroughApiEquivalentUsd;
     const compressedAvgUsd =
-      this.totals.compressedPaidRequests > 0
-        ? compressedActualUsd / this.totals.compressedPaidRequests
+      this.totals.compressedPricedRequests > 0
+        ? compressedActualUsd / this.totals.compressedPricedRequests
         : 0;
     const passthroughAvgUsd =
-      this.totals.passthroughPaidRequests > 0
-        ? passthroughActualUsd / this.totals.passthroughPaidRequests
+      this.totals.passthroughPricedRequests > 0
+        ? passthroughActualUsd / this.totals.passthroughPricedRequests
         : 0;
     // Sufficient-sample threshold is a soft heuristic. 20 paid requests per
     // bucket is enough to see a real effect on Opus 4.7 traffic (a single
@@ -1196,9 +1295,26 @@ export class DashboardState {
     // bucket numbers but hides the delta and surfaces "small sample".
     const SUFFICIENT = 20;
     const splitSufficient =
-      this.totals.compressedPaidRequests >= SUFFICIENT &&
-      this.totals.passthroughPaidRequests >= SUFFICIENT;
+      this.totals.compressedPricedRequests >= SUFFICIENT &&
+      this.totals.passthroughPricedRequests >= SUFFICIENT;
     const splitDeltaUsd = compressedAvgUsd - passthroughAvgUsd;
+    const rateCards = [...this.pricingRateCards.values()];
+    const agyMonthlyUsd = this.agyMonthlySubscriptionUsd;
+    const agyEquivalentUsedUsd = this.totals.agyApiEquivalentUsd;
+    const subscriptionStats = (monthlyUsd: number | null, usedUsd: number, requests: number) => ({
+      monthly_usd: monthlyUsd,
+      api_equivalent_used_usd: round4(usedUsd),
+      break_even_pct:
+        monthlyUsd !== null && monthlyUsd > 0
+          ? round1((usedUsd / monthlyUsd) * 100)
+          : null,
+      api_equivalent_remaining_usd:
+        monthlyUsd !== null && monthlyUsd > 0
+          ? round4(Math.max(0, monthlyUsd - usedUsd))
+          : null,
+      usage_requests: requests,
+    });
+    const singleRate = rateCards.length === 1 ? rateCards[0] : undefined;
 
     const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
     const payload = {
@@ -1228,29 +1344,105 @@ export class DashboardState {
       // bucket is what each path actually billed.
       compressed_paid_requests: this.totals.compressedPaidRequests,
       passthrough_paid_requests: this.totals.passthroughPaidRequests,
+      compressed_priced_requests: this.totals.compressedPricedRequests,
+      passthrough_priced_requests: this.totals.passthroughPricedRequests,
+      priced_usage_requests: this.totals.pricedUsageRequests,
+      unpriced_usage_requests: this.totals.unpricedUsageRequests,
       compressed_actual_usd: round4(compressedActualUsd),
       passthrough_actual_usd: round4(passthroughActualUsd),
+      compressed_api_equivalent_usd: round4(compressedActualUsd),
+      passthrough_api_equivalent_usd: round4(passthroughActualUsd),
       compressed_avg_usd_per_request: round4(compressedAvgUsd),
       passthrough_avg_usd_per_request: round4(passthroughAvgUsd),
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((saved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      saved_usd: round4(this.totals.apiEquivalentSavedUsd),
+      api_equivalent_saved_usd: round4(this.totals.apiEquivalentSavedUsd),
+      actual_cost_usd: null,
+      actual_cost_status: 'not_measured',
+      agy_subscription: subscriptionStats(
+        agyMonthlyUsd,
+        agyEquivalentUsedUsd,
+        this.totals.agyUsageRequests,
+      ),
+      claude_subscription: subscriptionStats(
+        this.claudeMonthlySubscriptionUsd,
+        this.totals.claudeApiEquivalentUsd,
+        this.totals.claudeUsageRequests,
+      ),
+      codex_subscription: subscriptionStats(
+        this.codexMonthlySubscriptionUsd,
+        this.totals.codexApiEquivalentUsd,
+        this.totals.codexUsageRequests,
+      ),
+      rate_limits: {
+        responses_429: this.totals.rateLimit429Responses,
+        responses_with_headers: this.totals.rateLimitHeaderResponses,
+        ...(this.latestRateLimit ? { latest: this.latestRateLimit } : {}),
+      },
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),
       pricing_assumptions: {
-        input_per_mtok: ASSUMED_INPUT_USD_PER_MTOK,
-        output_multiplier: OUTPUT_TOKEN_RATE,
-        cache_write_5m_multiplier: 1.25,
-        cache_write_1h_multiplier: 2.0,
-        cache_read_multiplier: 0.1,
-        source: 'docs.anthropic.com/en/docs/about-claude/pricing (verified 2026-05-19)',
+        status:
+          this.totals.pricedUsageRequests === 0
+            ? 'unavailable'
+            : this.totals.unpricedUsageRequests > 0 || rateCards.length > 1
+              ? 'mixed'
+              : rateCards[0]?.status === 'quota_only'
+                ? 'quota_only'
+                : rateCards[0]?.status === 'api_equivalent'
+                  ? 'api_equivalent'
+                  : rateCards[0]?.status === 'free_by_terms'
+                    ? 'free_by_terms'
+                    : 'mixed',
+        basis: 'public_api_list_price_equivalent',
+        priced_requests: this.totals.pricedUsageRequests,
+        unpriced_requests: this.totals.unpricedUsageRequests,
+        ...(singleRate?.inputPerMtok !== undefined
+          ? { input_per_mtok: singleRate.inputPerMtok }
+          : {}),
+        ...(singleRate?.outputPerMtok !== undefined && singleRate.inputPerMtok
+          ? { output_multiplier: singleRate.outputPerMtok / singleRate.inputPerMtok }
+          : {}),
+        ...(singleRate?.cacheWrite5mPerMtok !== undefined && singleRate.inputPerMtok
+          ? { cache_write_5m_multiplier: singleRate.cacheWrite5mPerMtok / singleRate.inputPerMtok }
+          : {}),
+        ...(singleRate?.cacheWrite1hPerMtok !== undefined && singleRate.inputPerMtok
+          ? { cache_write_1h_multiplier: singleRate.cacheWrite1hPerMtok / singleRate.inputPerMtok }
+          : {}),
+        ...(singleRate?.cachedInputPerMtok !== undefined && singleRate.inputPerMtok
+          ? { cache_read_multiplier: singleRate.cachedInputPerMtok / singleRate.inputPerMtok }
+          : {}),
+        source: 'Per-event public API rate cards; OAuth/subscription charges are not inferred.',
+        rate_cards: rateCards.map((card) => ({
+          id: card.id,
+          provider: card.provider,
+          model: card.canonicalModel,
+          cost_status: card.status,
+          input_per_mtok: card.inputPerMtok,
+          cached_input_per_mtok: card.cachedInputPerMtok,
+          output_per_mtok: card.outputPerMtok,
+          context_window_tokens: card.contextWindowTokens,
+          max_output_tokens: card.maxOutputTokens,
+          source: card.source,
+          note: card.note,
+          ...(card.status === 'quota_only' && agyMonthlyUsd !== null && agyMonthlyUsd > 0 && card.inputPerMtok
+            ? { subscription_break_even_input_tokens: Math.round((agyMonthlyUsd / card.inputPerMtok) * 1e6) }
+            : {}),
+          ...(card.status === 'quota_only' && agyMonthlyUsd !== null && agyMonthlyUsd > 0 && card.cachedInputPerMtok
+            ? { subscription_break_even_cached_input_tokens: Math.round((agyMonthlyUsd / card.cachedInputPerMtok) * 1e6) }
+            : {}),
+          ...(card.status === 'quota_only' && agyMonthlyUsd !== null && agyMonthlyUsd > 0 && card.outputPerMtok
+            ? { subscription_break_even_output_tokens: Math.round((agyMonthlyUsd / card.outputPerMtok) * 1e6) }
+            : {}),
+        })),
       },
       // Honest output measurement — char counts from the SSE/JSON scanner,
-      // independent of Anthropic's `usage.output_tokens`. Surfaces the gap
-      // the May-2026 weekly-meter audit hypothesized (redacted_thinking adds
-      // billed tokens that we can't see). `events_with_measurement` lets the
+      // independent of provider-reported `usage.output_tokens`. Opaque or
+      // redacted reasoning blocks can still be billed but remain unmeasurable.
+      // `events_with_measurement` lets the
       // operator weigh how representative the numbers are; when it's near
       // `requests`, the gap is real. When it's 0, the scanner never landed
       // (5xx-heavy session, no /v1/messages traffic).
@@ -1455,6 +1647,11 @@ export class DashboardState {
    *  runtime compress scope. In-memory only; restart resets to the PXPIPE_MODELS
    *  env / built-in default. The model checks read this live. */
   handleModelsToggle(model: string, on: boolean): void {
+    // OFF is always honored. ON is refused for weak/unvalidated imaged-readers
+    // unless PXPIPE_MODELS opted them in: the dashboard renders no enable
+    // button for those, so such a POST is forged or stale — keeping the scope
+    // unchanged makes the 2s fragment poll re-render the truth.
+    if (on && !canEnableFromDashboard(model)) return;
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);
     else next.delete(model);
@@ -1495,6 +1692,7 @@ export type DashboardRoute =
   | { kind: 'stats' } // /proxy-stats — legacy live counter
   | { kind: 'recent' } // /proxy-recent — legacy ring buffer
   | { kind: 'png' } // /proxy-latest-png
+  | { kind: 'health' } // /health, /v1/health — liveness probe
   | { kind: 'api-sessions' } // /api/sessions.json
   | { kind: 'api-stats' } // /api/stats.json
   | { kind: 'current-session' } // /api/current-session.json
@@ -1508,6 +1706,7 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/proxy-stats') return { kind: 'stats' };
   if (pathname === '/proxy-recent') return { kind: 'recent' };
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
+  if (pathname === '/health' || pathname === '/v1/health') return { kind: 'health' };
   if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
   if (pathname === '/api/current-session.json') return { kind: 'current-session' };

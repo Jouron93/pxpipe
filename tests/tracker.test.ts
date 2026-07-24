@@ -8,9 +8,19 @@ describe('toTrackEvent', () => {
       method: 'POST',
       path: '/v1/messages',
       model: 'gpt-5.5',
+      requestedModel: 'gpt-5.6-sol',
+      actualModel: 'gpt-5.6-sol-2026-07-01',
+      billingLane: 'codex_subscription',
+      billingLaneSource: 'chatgpt_codex_origin',
       status: 200,
       durationMs: 1234,
       firstByteMs: 200,
+      responseContentType: '<missing>',
+      usageScanStatus: 'partial_stream_error',
+      usageScanError: 'Error',
+      usageTerminalEventSeen: true,
+      usageSseEventCount: 4,
+      usageParseErrorCount: 0,
       info: {
         compressed: true,
         origChars: 16000,
@@ -45,9 +55,19 @@ describe('toTrackEvent', () => {
     expect(out.method).toBe('POST');
     expect(out.path).toBe('/v1/messages');
     expect(out.model).toBe('gpt-5.5');
+    expect(out.requested_model).toBe('gpt-5.6-sol');
+    expect(out.actual_model).toBe('gpt-5.6-sol-2026-07-01');
+    expect(out.billing_lane).toBe('codex_subscription');
+    expect(out.billing_lane_source).toBe('chatgpt_codex_origin');
     expect(out.status).toBe(200);
     expect(out.duration_ms).toBe(1234);
     expect(out.first_byte_ms).toBe(200);
+    expect(out.response_content_type).toBe('<missing>');
+    expect(out.usage_scan_status).toBe('partial_stream_error');
+    expect(out.usage_scan_error).toBe('Error');
+    expect(out.usage_terminal_event_seen).toBe(true);
+    expect(out.usage_sse_event_count).toBe(4);
+    expect(out.usage_parse_error_count).toBe(0);
     expect(out.compressed).toBe(true);
     expect(out.orig_chars).toBe(16000);
     expect(out.static_chars).toBe(14000);

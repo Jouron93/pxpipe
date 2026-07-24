@@ -5,12 +5,30 @@
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
-import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
+import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel, minCompressBodyBytes } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
 } from './measurement.js';
 import type { Usage } from './types.js';
+
+export type BillingLane =
+  | 'agy_ultra_subscription'
+  | 'claude_max_subscription'
+  | 'codex_subscription'
+  | 'nvidia_build_free'
+  | 'api_key'
+  | 'local'
+  | 'unknown';
+
+export type BillingLaneSource =
+  | 'configured_route'
+  | 'agy_bridge_origin'
+  | 'anthropic_oauth_marker'
+  | 'chatgpt_codex_origin'
+  | 'api_key'
+  | 'local_origin'
+  | 'unresolved';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -28,9 +46,15 @@ export interface ProxyConfig {
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
+  /** Trusted route-level billing attribution. Never derived from model names. */
+  billingLanes?: Partial<Record<'anthropic' | 'openai' | 'passthrough', BillingLane>>;
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
    *  static object for Workers/tests. */
   transform?: TransformOptions | (() => TransformOptions);
+  /** Debug-only: retain the full transformed request body on upstream 4xx.
+   *  Disabled by default because coding-agent requests can contain credentials,
+   *  source code, and other sensitive operator context. */
+  captureRequestBodiesOn4xx?: boolean;
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
 }
@@ -40,11 +64,32 @@ export interface ProxyEvent {
   path: string;
   /** Top-level request model when present. Used for telemetry/dashboard labels only. */
   model?: string;
+  /** Model requested by the client before gateway aliases or fallback routing. */
+  requestedModel?: string;
+  /** Model identity reported by the successful upstream response. */
+  actualModel?: string;
+  billingLane: BillingLane;
+  billingLaneSource: BillingLaneSource;
+  /** Provider rate-limit headers observed on the upstream response. Values are
+   * retained verbatim because providers use both durations and timestamps. */
+  rateLimit?: RateLimitTelemetry;
   status: number;
   /** Wall-clock ms from request start to event fire (≈ end of upstream body). */
   durationMs: number;
   /** Wall-clock ms from request start to upstream response headers. */
   firstByteMs?: number;
+  /** Upstream response media type, retained to diagnose usage scanner coverage. */
+  responseContentType?: string;
+  /** Whether response usage scanning completed, degraded, or was intentionally skipped. */
+  usageScanStatus?: UsageScanStatus;
+  /** Safe scanner failure category. Never contains response content. */
+  usageScanError?: string;
+  /** True when the scanner observed a provider terminal event or sentinel. */
+  usageTerminalEventSeen?: boolean;
+  /** Number of JSON SSE events parsed successfully. */
+  usageSseEventCount?: number;
+  /** Number of malformed SSE data payloads encountered. */
+  usageParseErrorCount?: number;
   info?: TransformInfo;
   /** Usage block from Anthropic's response — input/output/cache tokens. */
   usage?: Usage;
@@ -59,13 +104,44 @@ export interface ProxyEvent {
   errorBody?: string;
   /** sha256[0..8] of the transformed outgoing body — set on every /v1/messages POST for correlation. */
   reqBodySha8?: string;
-  /** Gzipped transformed body, populated only on 4xx. Node may write to sidecar (see reqBodySamplePath). */
+  /** Gzipped transformed body, populated only on 4xx when explicitly enabled.
+   *  Node may write to sidecar (see reqBodySamplePath). */
   reqBodyGz?: Uint8Array;
   /** Set by the Node host instead of reqBodyGz when the body was written to a sidecar file. */
   reqBodySamplePath?: string;
   /** Ground-truth char counts from the response stream, independent of usage.output_tokens.
    *  Absent when the body couldn't be scanned (5xx, unknown content-type). See OutputMeasurement. */
   measurement?: OutputMeasurement;
+}
+
+export interface RateLimitTelemetry {
+  retryAfter?: string;
+  requestLimit?: string;
+  requestRemaining?: string;
+  requestReset?: string;
+  tokenLimit?: string;
+  tokenRemaining?: string;
+  tokenReset?: string;
+}
+
+function readRateLimitTelemetry(headers: Headers): RateLimitTelemetry | undefined {
+  const first = (...names: string[]): string | undefined => {
+    for (const name of names) {
+      const value = headers.get(name);
+      if (value !== null && value.trim() !== '') return value.trim();
+    }
+    return undefined;
+  };
+  const out: RateLimitTelemetry = {
+    retryAfter: first('retry-after'),
+    requestLimit: first('anthropic-ratelimit-requests-limit', 'x-ratelimit-limit-requests', 'ratelimit-limit'),
+    requestRemaining: first('anthropic-ratelimit-requests-remaining', 'x-ratelimit-remaining-requests', 'ratelimit-remaining'),
+    requestReset: first('anthropic-ratelimit-requests-reset', 'x-ratelimit-reset-requests', 'ratelimit-reset'),
+    tokenLimit: first('anthropic-ratelimit-tokens-limit', 'x-ratelimit-limit-tokens'),
+    tokenRemaining: first('anthropic-ratelimit-tokens-remaining', 'x-ratelimit-remaining-tokens'),
+    tokenReset: first('anthropic-ratelimit-tokens-reset', 'x-ratelimit-reset-tokens'),
+  };
+  return Object.values(out).some((value) => value !== undefined) ? out : undefined;
 }
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
@@ -114,27 +190,76 @@ export interface OutputMeasurement {
   redactedBlockCount: number;
 }
 
+export type UsageScanStatus =
+  | 'complete'
+  | 'no_usage'
+  | 'partial_stream_error'
+  | 'partial_parse_error'
+  | 'invalid_json'
+  | 'unsupported_content_type'
+  | 'no_body'
+  | 'skipped_client_error'
+  | 'skipped_server_error';
+
+interface UsageScanState {
+  usage: Usage | undefined;
+  actualModel: string | undefined;
+  stopReason: string | undefined;
+  terminalEventSeen: boolean;
+  sseEventCount: number;
+  parseErrorCount: number;
+}
+
+function readResponseModel(obj: Record<string, unknown>): string | undefined {
+  if (typeof obj.model === 'string' && obj.model.trim() !== '') return obj.model;
+  const response = obj.response as { model?: unknown } | undefined;
+  if (typeof response?.model === 'string' && response.model.trim() !== '') return response.model;
+  const message = obj.message as { model?: unknown } | undefined;
+  if (typeof message?.model === 'string' && message.model.trim() !== '') return message.model;
+  return undefined;
+}
+
 /** Parse one SSE block into the running usage + measurement accumulators. Silent on malformed input. */
 function processSseEvent(
   block: string,
   m: OutputMeasurement,
-  state: { usage: Usage | undefined; stopReason: string | undefined },
+  state: UsageScanState,
 ): void {
   // Parse `event:` + `data:` lines; continuation data: lines concatenate per SSE spec.
   let event = '';
-  let data = '';
+  const dataLines: string[] = [];
   for (const line of block.split('\n')) {
     if (line.startsWith('event:')) event = line.slice(6).trim();
-    else if (line.startsWith('data:')) data += line.slice(5).replace(/^\s/, '');
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^\s/, ''));
   }
-  if (!data) return;
+  if (dataLines.length === 0) return;
+  const data = dataLines.join('');
+  if (data.trim() === '[DONE]') {
+    state.terminalEventSeen = true;
+    return;
+  }
   let j: unknown;
   try {
     j = JSON.parse(data);
   } catch {
+    // Some compatible gateways coalesce one-JSON-object-per-data-line streams
+    // without blank SSE separators. Recover each complete line independently.
+    if (dataLines.length > 1) {
+      for (const dataLine of dataLines) {
+        processSseEvent(`${event ? `event: ${event}\n` : ''}data: ${dataLine}`, m, state);
+      }
+    } else {
+      state.parseErrorCount += 1;
+    }
     return;
   }
+  state.sseEventCount += 1;
   const obj = j as Record<string, unknown>;
+  const responseModel = readResponseModel(obj);
+  if (responseModel) state.actualModel = responseModel;
+  // OpenAI Responses streams commonly carry the discriminator only in JSON.
+  // Prefer the explicit SSE event name when present, otherwise use `type`.
+  if (!event && typeof obj.type === 'string') event = obj.type;
 
   // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
   const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
@@ -142,6 +267,7 @@ function processSseEvent(
   // OpenAI Responses API streams usage nested under `response` on the terminal
   // `response.completed` (or `.incomplete`) event — not at the top level.
   if (event === 'response.completed' || event === 'response.incomplete') {
+    state.terminalEventSeen = true;
     const resp = obj.response as
       | { usage?: unknown; incomplete_details?: { reason?: unknown } }
       | undefined;
@@ -152,6 +278,16 @@ function processSseEvent(
     state.stopReason = typeof reason === 'string' ? reason
       : event === 'response.incomplete' ? 'incomplete' : 'stop';
   }
+  if (event === 'response.output_text.delta' && typeof obj.delta === 'string') {
+    m.textChars += obj.delta.length;
+  } else if (
+    (event === 'response.reasoning_summary_text.delta' || event === 'response.reasoning_text.delta') &&
+    typeof obj.delta === 'string'
+  ) {
+    m.thinkingChars += obj.delta.length;
+  } else if (event === 'response.function_call_arguments.delta' && typeof obj.delta === 'string') {
+    m.toolUseChars += obj.delta.length;
+  }
   measureOpenAIChoices(obj, m);
   // OpenAI chat chunks: the final chunk carries choices[].finish_reason (earlier chunks ship null).
   const choices = obj.choices;
@@ -159,6 +295,7 @@ function processSseEvent(
     for (const c of choices) {
       const fr = (c as { finish_reason?: unknown } | undefined)?.finish_reason;
       if (typeof fr === 'string') state.stopReason = fr;
+      if (typeof fr === 'string') state.terminalEventSeen = true;
     }
   }
 
@@ -200,6 +337,8 @@ function processSseEvent(
         cur.cache_read_input_tokens = u.cache_read_input_tokens;
       }
     }
+  } else if (event === 'message_stop') {
+    state.terminalEventSeen = true;
   }
 }
 
@@ -315,18 +454,30 @@ function readStopReasonFromJson(j: unknown): string | undefined {
 function teeForUsage(res: Response): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
+  actualModelPromise: Promise<string | undefined>;
   errorBodyPromise: Promise<string | undefined>;
   measurementPromise: Promise<OutputMeasurement | undefined>;
   stopReasonPromise: Promise<string | undefined>;
+  scanStatusPromise: Promise<UsageScanStatus>;
+  scanErrorPromise: Promise<string | undefined>;
+  terminalEventSeenPromise: Promise<boolean | undefined>;
+  sseEventCountPromise: Promise<number | undefined>;
+  parseErrorCountPromise: Promise<number | undefined>;
 } {
   // No body at all: nothing to extract on either path.
   if (!res.body) {
     return {
       response: res,
       usagePromise: Promise.resolve(undefined),
+      actualModelPromise: Promise.resolve(undefined),
       errorBodyPromise: Promise.resolve(undefined),
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
+      scanStatusPromise: Promise.resolve('no_body'),
+      scanErrorPromise: Promise.resolve(undefined),
+      terminalEventSeenPromise: Promise.resolve(undefined),
+      sseEventCountPromise: Promise.resolve(undefined),
+      parseErrorCountPromise: Promise.resolve(undefined),
     };
   }
   // 4xx: tee for the error body but skip usage scanning entirely.
@@ -360,9 +511,15 @@ function teeForUsage(res: Response): {
         headers: res.headers,
       }),
       usagePromise: Promise.resolve(undefined),
+      actualModelPromise: Promise.resolve(undefined),
       errorBodyPromise,
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
+      scanStatusPromise: Promise.resolve('skipped_client_error'),
+      scanErrorPromise: Promise.resolve(undefined),
+      terminalEventSeenPromise: Promise.resolve(undefined),
+      sseEventCountPromise: Promise.resolve(undefined),
+      parseErrorCountPromise: Promise.resolve(undefined),
     };
   }
   // 5xx: skip both (the host already synthesizes an error message).
@@ -370,9 +527,15 @@ function teeForUsage(res: Response): {
     return {
       response: res,
       usagePromise: Promise.resolve(undefined),
+      actualModelPromise: Promise.resolve(undefined),
       errorBodyPromise: Promise.resolve(undefined),
       measurementPromise: Promise.resolve(undefined),
       stopReasonPromise: Promise.resolve(undefined),
+      scanStatusPromise: Promise.resolve('skipped_server_error'),
+      scanErrorPromise: Promise.resolve(undefined),
+      terminalEventSeenPromise: Promise.resolve(undefined),
+      sseEventCountPromise: Promise.resolve(undefined),
+      parseErrorCountPromise: Promise.resolve(undefined),
     };
   }
   const ct = (res.headers.get('content-type') ?? '').toLowerCase();
@@ -381,44 +544,87 @@ function teeForUsage(res: Response): {
   // Single read loop resolves all three; exposed as separate promises for call-site readability.
   const scanResult = (async (): Promise<{
     usage: Usage | undefined;
+    actualModel: string | undefined;
     measurement: OutputMeasurement | undefined;
     stopReason: string | undefined;
+    scanStatus: UsageScanStatus;
+    scanError: string | undefined;
+    terminalEventSeen: boolean | undefined;
+    sseEventCount: number | undefined;
+    parseErrorCount: number | undefined;
   }> => {
     const reader = forUs.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    const m: OutputMeasurement = {
+      textChars: 0,
+      thinkingChars: 0,
+      toolUseChars: 0,
+      redactedBlockCount: 0,
+    };
+    const state: UsageScanState = {
+      usage: undefined,
+      actualModel: undefined,
+      stopReason: undefined,
+      terminalEventSeen: false,
+      sseEventCount: 0,
+      parseErrorCount: 0,
+    };
+    let mode: 'sse' | 'json' | 'unsupported' = ct.includes('text/event-stream')
+      ? 'sse'
+      : ct.includes('application/json')
+        ? 'json'
+        : 'unsupported';
 
     try {
-      if (ct.includes('text/event-stream')) {
+      if (ct === '' && res.status >= 200 && res.status < 300) {
+        const first = await reader.read();
+        if (!first.done && first.value) buf += decoder.decode(first.value, { stream: true });
+        const prefix = buf.trimStart();
+        mode = prefix.startsWith('{') || prefix.startsWith('[') ? 'json' : 'sse';
+      }
+
+      if (mode === 'sse') {
         // Walk every SSE event to EOF — message_delta (final output_tokens) is last.
-        const m: OutputMeasurement = {
-          textChars: 0,
-          thinkingChars: 0,
-          toolUseChars: 0,
-          redactedBlockCount: 0,
-        };
-        const state: { usage: Usage | undefined; stopReason: string | undefined } = {
-          usage: undefined,
-          stopReason: undefined,
+        const processBufferedEvents = (): void => {
+          let boundary: RegExpExecArray | null;
+          while ((boundary = /\r?\n\r?\n/.exec(buf)) !== null) {
+            const block = buf.slice(0, boundary.index);
+            buf = buf.slice(boundary.index + boundary[0].length);
+            processSseEvent(block, m, state);
+          }
         };
         while (true) {
+          // Headerless streams are sniffed by reading one chunk above. Parse it
+          // before the next read so a late transport error cannot erase a
+          // terminal event that is already buffered locally.
+          processBufferedEvents();
           const { done, value } = await reader.read();
           if (done) break;
           buf += decoder.decode(value, { stream: true });
-          // SSE events are terminated by a blank line.
-          let evEnd: number;
-          while ((evEnd = buf.indexOf('\n\n')) >= 0) {
-            const block = buf.slice(0, evEnd);
-            buf = buf.slice(evEnd + 2);
-            processSseEvent(block, m, state);
-          }
         }
         buf += decoder.decode();
+        processBufferedEvents();
         if (buf.trim().length > 0) processSseEvent(buf, m, state); // trailing partial event
-        return { usage: state.usage, measurement: m, stopReason: state.stopReason };
+        const scanStatus: UsageScanStatus = state.parseErrorCount > 0
+          ? 'partial_parse_error'
+          : state.usage
+            ? 'complete'
+            : 'no_usage';
+        return {
+          usage: state.usage,
+          actualModel: state.actualModel,
+          measurement: m,
+          stopReason: state.stopReason,
+          scanStatus,
+          scanError: state.parseErrorCount > 0 ? 'malformed_sse_data' : undefined,
+          terminalEventSeen: state.terminalEventSeen,
+          sseEventCount: state.sseEventCount,
+          parseErrorCount: state.parseErrorCount,
+        };
       }
 
-      if (ct.includes('application/json')) {
+      if (mode === 'json') {
         // Buffer fully, capped at 4 MiB.
         const MAX = 4 * 1024 * 1024;
         while (buf.length < MAX) {
@@ -426,19 +632,52 @@ function teeForUsage(res: Response): {
           if (done) break;
           buf += decoder.decode(value, { stream: true });
         }
+        buf += decoder.decode();
         try {
           const j = JSON.parse(buf);
+          const usage = normalizeUsage(j?.usage);
+          const actualModel = j && typeof j === 'object'
+            ? readResponseModel(j as Record<string, unknown>)
+            : undefined;
           return {
-            usage: normalizeUsage(j?.usage),
+            usage,
+            actualModel,
             measurement: measureFromMessageJson(j),
             stopReason: readStopReasonFromJson(j),
+            scanStatus: usage ? 'complete' : 'no_usage',
+            scanError: undefined,
+            terminalEventSeen: true,
+            sseEventCount: undefined,
+            parseErrorCount: undefined,
           };
         } catch {
-          return { usage: undefined, measurement: undefined, stopReason: undefined };
+          return {
+            usage: undefined,
+            actualModel: undefined,
+            measurement: undefined,
+            stopReason: undefined,
+            scanStatus: 'invalid_json',
+            scanError: 'invalid_json',
+            terminalEventSeen: undefined,
+            sseEventCount: undefined,
+            parseErrorCount: undefined,
+          };
         }
       }
-    } catch {
-      /* tee released early (client abort) */
+    } catch (error) {
+      // A provider can deliver the terminal usage event and then fail while the
+      // tee drains. Preserve everything already parsed instead of erasing it.
+      return {
+        usage: state.usage,
+        actualModel: state.actualModel,
+        measurement: mode === 'sse' ? m : undefined,
+        stopReason: state.stopReason,
+        scanStatus: 'partial_stream_error',
+        scanError: error instanceof Error ? error.name : 'stream_read_error',
+        terminalEventSeen: mode === 'sse' ? state.terminalEventSeen : undefined,
+        sseEventCount: mode === 'sse' ? state.sseEventCount : undefined,
+        parseErrorCount: mode === 'sse' ? state.parseErrorCount : undefined,
+      };
     }
     // Unknown content-type: drain to release the tee buffer.
     try {
@@ -449,7 +688,17 @@ function teeForUsage(res: Response): {
     } catch {
       /* ignore */
     }
-    return { usage: undefined, measurement: undefined, stopReason: undefined };
+    return {
+      usage: undefined,
+      actualModel: undefined,
+      measurement: undefined,
+      stopReason: undefined,
+      scanStatus: 'unsupported_content_type',
+      scanError: undefined,
+      terminalEventSeen: undefined,
+      sseEventCount: undefined,
+      parseErrorCount: undefined,
+    };
   })();
 
   return {
@@ -459,9 +708,15 @@ function teeForUsage(res: Response): {
       headers: res.headers,
     }),
     usagePromise: scanResult.then((s) => s.usage),
+    actualModelPromise: scanResult.then((s) => s.actualModel),
     errorBodyPromise: Promise.resolve(undefined),
     measurementPromise: scanResult.then((s) => s.measurement),
     stopReasonPromise: scanResult.then((s) => s.stopReason),
+    scanStatusPromise: scanResult.then((s) => s.scanStatus),
+    scanErrorPromise: scanResult.then((s) => s.scanError),
+    terminalEventSeenPromise: scanResult.then((s) => s.terminalEventSeen),
+    sseEventCountPromise: scanResult.then((s) => s.sseEventCount),
+    parseErrorCountPromise: scanResult.then((s) => s.parseErrorCount),
   };
 }
 
@@ -567,11 +822,40 @@ export function resolveUpstreams(config: ProxyConfig): {
     }
     return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
   }
+  const openai = (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, '');
+  const chatGptCodex = isChatGptCodexUpstream(openai);
+  if (chatGptCodex && config.openAIApiKey) {
+    throw new Error('ChatGPT Codex OAuth upstream cannot be combined with OPENAI_API_KEY');
+  }
+  if (chatGptCodex) {
+    const sensitiveOverrides = Object.keys(config.gatewayHeaders ?? {}).filter((key) =>
+      /^(authorization|chatgpt-account-id|x-openai-fedramp)$/i.test(key),
+    );
+    if (sensitiveOverrides.length > 0) {
+      throw new Error('ChatGPT Codex OAuth upstream cannot override authentication headers');
+    }
+  }
   return {
     anthropic: (config.upstream ?? DEFAULT_UPSTREAM).replace(/\/+$/, ''),
-    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).replace(/\/+$/, ''),
-    stripOpenAIV1: false,
+    openai,
+    stripOpenAIV1: chatGptCodex,
   };
+}
+
+function isChatGptCodexUpstream(base: string): boolean {
+  try {
+    const url = new URL(base);
+    return url.protocol === 'https:'
+      && url.hostname.toLowerCase() === 'chatgpt.com'
+      && url.port === ''
+      && url.username === ''
+      && url.password === ''
+      && url.search === ''
+      && url.hash === ''
+      && url.pathname.replace(/\/+$/, '') === '/backend-api/codex';
+  } catch {
+    return false;
+  }
 }
 
 /** Parse PXPIPE_GATEWAY_HEADERS — JSON object or `k=v;k2=v2`. */
@@ -615,6 +899,8 @@ export function createProxy(config: ProxyConfig = {}) {
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
     let reqBodySha8: string | undefined;
+    let billingLane: BillingLane = 'unknown';
+    let billingLaneSource: BillingLaneSource = 'unresolved';
 
     const fire = (
       status: number,
@@ -625,12 +911,25 @@ export function createProxy(config: ProxyConfig = {}) {
       errorBody?: string,
       measurement?: OutputMeasurement,
       stopReason?: string,
+      responseContentType?: string,
+      usageScanStatus?: UsageScanStatus,
+      usageScanError?: string,
+      usageTerminalEventSeen?: boolean,
+      usageSseEventCount?: number,
+      usageParseErrorCount?: number,
+      actualModel?: string,
+      rateLimit?: RateLimitTelemetry,
     ): void => {
       const is4xx = status >= 400 && status < 500;
       // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
       const finalize = async (): Promise<void> => {
         let reqBodyGz: Uint8Array | undefined;
-        if (is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
+        if (
+          config.captureRequestBodiesOn4xx === true &&
+          is4xx &&
+          reqBodyBytes &&
+          reqBodyBytes.byteLength > 0
+        ) {
           try {
             reqBodyGz = await gzipBytes(reqBodyBytes);
           } catch {
@@ -674,6 +973,11 @@ export function createProxy(config: ProxyConfig = {}) {
           method: req.method,
           path: url.pathname,
           model: requestModel,
+          requestedModel: requestModel,
+          actualModel,
+          billingLane,
+          billingLaneSource,
+          rateLimit,
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
@@ -685,6 +989,12 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodyGz,
           measurement,
           stopReason,
+          responseContentType,
+          usageScanStatus,
+          usageScanError,
+          usageTerminalEventSeen,
+          usageSseEventCount,
+          usageParseErrorCount,
         });
       };
       void finalize();
@@ -701,6 +1011,37 @@ export function createProxy(config: ProxyConfig = {}) {
       config.openAIApiKey !== undefined,
     );
     const upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
+    const routeKey = providerPrefixed ? 'passthrough' : isOpenAIPath ? 'openai' : 'anthropic';
+    const configuredLane = config.billingLanes?.[routeKey];
+    const upstreamOrigin = (() => {
+      try { return new URL(upstreamBase).origin; } catch { return ''; }
+    })();
+    if (configuredLane) {
+      billingLane = configuredLane;
+      billingLaneSource = 'configured_route';
+    } else if (upstreamOrigin === 'http://127.0.0.1:4017') {
+      billingLane = 'agy_ultra_subscription';
+      billingLaneSource = 'agy_bridge_origin';
+    } else if (upstreamOrigin === 'http://127.0.0.1:1234') {
+      billingLane = 'local';
+      billingLaneSource = 'local_origin';
+    } else if (isOpenAIPath && isChatGptCodexUpstream(openAIUpstream)) {
+      billingLane = 'codex_subscription';
+      billingLaneSource = 'chatgpt_codex_origin';
+    } else if (isOpenAIPath && config.openAIApiKey) {
+      billingLane = 'api_key';
+      billingLaneSource = 'api_key';
+    } else if (!isOpenAIPath && (config.apiKey || req.headers.has('x-api-key'))) {
+      billingLane = 'api_key';
+      billingLaneSource = 'api_key';
+    } else if (
+      !isOpenAIPath
+      && req.headers.get('authorization')?.toLowerCase().startsWith('bearer ')
+      && req.headers.get('anthropic-beta')?.toLowerCase().includes('oauth-2025-04-20')
+    ) {
+      billingLane = 'claude_max_subscription';
+      billingLaneSource = 'anthropic_oauth_marker';
+    }
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
@@ -733,7 +1074,11 @@ export function createProxy(config: ProxyConfig = {}) {
           : isPxpipeSupportedGptModel(model);
         // Unsupported model → a true passthrough: no break-even compression
         // (a text-only model may not accept injected image blocks at all).
-        const effectiveOpts = modelOk
+        // Below the size floor → same passthrough: small bodies (side calls,
+        // titling, early turns) lose tokens to image + cache-create overhead
+        // and byte-exactness for zero real savings (see minCompressBodyBytes).
+        const floorOk = bodyIn.byteLength >= minCompressBodyBytes();
+        const effectiveOpts = modelOk && floorOk
           ? transformOpts
           : { ...transformOpts, compress: false };
         const r = isMessages
@@ -742,6 +1087,7 @@ export function createProxy(config: ProxyConfig = {}) {
             ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
             : await transformOpenAIResponses(bodyIn, effectiveOpts);
         if (!modelOk) r.info.reason = 'unsupported_model';
+        else if (!floorOk) r.info.reason = 'below_min_size';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
@@ -776,11 +1122,23 @@ export function createProxy(config: ProxyConfig = {}) {
           }
         }
       } catch (e) {
-        fire(502, undefined, `transform_error: ${(e as Error).message}`);
-        return new Response(JSON.stringify({ error: 'pxpipe transform failed' }), {
-          status: 502,
-          headers: { 'content-type': 'application/json' },
-        });
+        // Compression is an optimization, never a reason to break an agent
+        // session. Forward the exact original body and retain a telemetry reason.
+        bodyOut = bodyIn as unknown as BodyInit;
+        reqBodyBytes = bodyIn;
+        if (bodyIn.byteLength > 0) reqBodySha8 = await sha8Bytes(bodyIn);
+        info = {
+          compressed: false,
+          reason: `transform_error: ${(e as Error).message}`,
+          origChars: 0,
+          compressedChars: 0,
+          imageCount: 0,
+          imageBytes: 0,
+          staticChars: 0,
+          dynamicChars: 0,
+          dynamicBlockCount: 0,
+          droppedChars: 0,
+        };
       }
     } else {
       bodyOut = req.body; // pass through unchanged
@@ -820,17 +1178,62 @@ export function createProxy(config: ProxyConfig = {}) {
     const firstByteMs = Date.now() - t0;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-    const { response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
-      teeForUsage(upstreamRes);
+    const {
+      response: teed,
+      usagePromise,
+      actualModelPromise,
+      errorBodyPromise,
+      measurementPromise,
+      stopReasonPromise,
+      scanStatusPromise,
+      scanErrorPromise,
+      terminalEventSeenPromise,
+      sseEventCountPromise,
+      parseErrorCountPromise,
+    } = teeForUsage(upstreamRes);
 
     // Fire event in background once all four resolve (all share the same stream read).
     void Promise.all([
       usagePromise.catch(() => undefined),
+      actualModelPromise.catch(() => undefined),
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
-    ]).then(([usage, errorBody, measurement, stopReason]) =>
-      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody, measurement, stopReason),
+      scanStatusPromise.catch(() => 'partial_stream_error' as const),
+      scanErrorPromise.catch(() => 'scan_promise_error'),
+      terminalEventSeenPromise.catch(() => undefined),
+      sseEventCountPromise.catch(() => undefined),
+      parseErrorCountPromise.catch(() => undefined),
+    ]).then(([
+      usage,
+      actualModel,
+      errorBody,
+      measurement,
+      stopReason,
+      usageScanStatus,
+      usageScanError,
+      usageTerminalEventSeen,
+      usageSseEventCount,
+      usageParseErrorCount,
+    ]) =>
+      fire(
+        upstreamRes.status,
+        info,
+        undefined,
+        firstByteMs,
+        usage,
+        errorBody,
+        measurement,
+        stopReason,
+        upstreamRes.headers.get('content-type') ?? '<missing>',
+        usageScanStatus,
+        usageScanError,
+        usageTerminalEventSeen,
+        usageSseEventCount,
+        usageParseErrorCount,
+        actualModel,
+        readRateLimitTelemetry(upstreamRes.headers),
+      ),
     );
 
     return new Response(teed.body, {

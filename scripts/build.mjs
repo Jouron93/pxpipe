@@ -6,6 +6,7 @@ import { build } from 'esbuild';
 import { mkdir, rm, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 // Single source of truth for the CLI version: read it here, inline it into the
 // bundle via esbuild `define`. Reading npm_package_version at CLI *runtime* is
@@ -17,7 +18,8 @@ const OUT = 'dist';
 if (existsSync(OUT)) await rm(OUT, { recursive: true, force: true });
 await mkdir(OUT, { recursive: true });
 
-const tsc = spawnSync('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], {
+const tscBin = fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url));
+const tsc = spawnSync(process.execPath, [tscBin, '-p', 'tsconfig.json'], {
   stdio: 'inherit',
   shell: false,
 });

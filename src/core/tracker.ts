@@ -4,7 +4,7 @@
  * Never emits raw text; only sizes, counts, durations, env fields, and sha256 prefixes.
  */
 
-import type { ProxyEvent } from './proxy.js';
+import type { BillingLane, BillingLaneSource, ProxyEvent, UsageScanStatus } from './proxy.js';
 import { bytesToBase64 } from './png.js';
 
 /** Flat record persisted per request. Adding a field is non-breaking for readers. */
@@ -14,9 +14,28 @@ export interface TrackEvent {
   path: string;
   /** Top-level request model when present. */
   model?: string;
+  /** Model requested by the client before any gateway fallback or alias resolution. */
+  requested_model?: string;
+  /** Model reported by the successful upstream response. */
+  actual_model?: string;
+  billing_lane: BillingLane;
+  billing_lane_source: BillingLaneSource;
+  retry_after?: string;
+  rate_limit_requests?: string;
+  rate_limit_requests_remaining?: string;
+  rate_limit_requests_reset?: string;
+  rate_limit_tokens?: string;
+  rate_limit_tokens_remaining?: string;
+  rate_limit_tokens_reset?: string;
   status: number;
   duration_ms: number;
   first_byte_ms?: number;
+  response_content_type?: string;
+  usage_scan_status?: UsageScanStatus;
+  usage_scan_error?: string;
+  usage_terminal_event_seen?: boolean;
+  usage_sse_event_count?: number;
+  usage_parse_error_count?: number;
 
   // From TransformInfo:
   compressed?: boolean;
@@ -31,6 +50,12 @@ export interface TrackEvent {
   image_pixels?: number;
   /** GPT only: vision tokens billed for rendered images. */
   image_tokens?: number;
+  /** GPT Responses only: compression-only native exact-context token cost. */
+  preserved_text_tokens?: number;
+  /** GPT Responses only: exact source lines emitted natively beside the slab. */
+  exact_context_lines?: number;
+  /** GPT Responses only: original source chars retained in exact source lines. */
+  exact_context_chars?: number;
   /** GPT only: o200k text tokens the imaged/stripped content would have cost. */
   baseline_imaged_tokens?: number;
   /** TEXT chars in the outgoing body (all text blocks, incl. non-compressed tool_results).
@@ -175,9 +200,30 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     path: ev.path,
     status: ev.status,
     duration_ms: ev.durationMs,
+    billing_lane: ev.billingLane,
+    billing_lane_source: ev.billingLaneSource,
   };
   if (ev.model) out.model = ev.model;
+  if (ev.requestedModel) out.requested_model = ev.requestedModel;
+  if (ev.actualModel) out.actual_model = ev.actualModel;
+  if (ev.rateLimit?.retryAfter) out.retry_after = ev.rateLimit.retryAfter;
+  if (ev.rateLimit?.requestLimit) out.rate_limit_requests = ev.rateLimit.requestLimit;
+  if (ev.rateLimit?.requestRemaining) out.rate_limit_requests_remaining = ev.rateLimit.requestRemaining;
+  if (ev.rateLimit?.requestReset) out.rate_limit_requests_reset = ev.rateLimit.requestReset;
+  if (ev.rateLimit?.tokenLimit) out.rate_limit_tokens = ev.rateLimit.tokenLimit;
+  if (ev.rateLimit?.tokenRemaining) out.rate_limit_tokens_remaining = ev.rateLimit.tokenRemaining;
+  if (ev.rateLimit?.tokenReset) out.rate_limit_tokens_reset = ev.rateLimit.tokenReset;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
+  if (ev.responseContentType) out.response_content_type = ev.responseContentType;
+  if (ev.usageScanStatus) out.usage_scan_status = ev.usageScanStatus;
+  if (ev.usageScanError) out.usage_scan_error = ev.usageScanError;
+  if (ev.usageTerminalEventSeen !== undefined) {
+    out.usage_terminal_event_seen = ev.usageTerminalEventSeen;
+  }
+  if (ev.usageSseEventCount !== undefined) out.usage_sse_event_count = ev.usageSseEventCount;
+  if (ev.usageParseErrorCount !== undefined) {
+    out.usage_parse_error_count = ev.usageParseErrorCount;
+  }
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
@@ -205,6 +251,15 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.imageTokens !== undefined && info.imageTokens > 0) {
       out.image_tokens = info.imageTokens;
+    }
+    if (info.preservedTextTokens !== undefined && info.preservedTextTokens > 0) {
+      out.preserved_text_tokens = info.preservedTextTokens;
+    }
+    if (info.exactContextLines !== undefined && info.exactContextLines > 0) {
+      out.exact_context_lines = info.exactContextLines;
+    }
+    if (info.exactContextChars !== undefined && info.exactContextChars > 0) {
+      out.exact_context_chars = info.exactContextChars;
     }
     if (info.baselineImagedTokens !== undefined && info.baselineImagedTokens > 0) {
       out.baseline_imaged_tokens = info.baselineImagedTokens;
@@ -312,11 +367,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   }
   const m = ev.measurement;
   if (m) {
-    if (m.textChars > 0) out.text_chars_measured = m.textChars;
-    if (m.thinkingChars > 0) out.thinking_chars_measured = m.thinkingChars;
-    if (m.toolUseChars > 0) out.tool_use_chars_measured = m.toolUseChars;
-    if (m.redactedBlockCount > 0)
-      out.redacted_block_count_measured = m.redactedBlockCount;
+    out.text_chars_measured = m.textChars;
+    out.thinking_chars_measured = m.thinkingChars;
+    out.tool_use_chars_measured = m.toolUseChars;
+    out.redacted_block_count_measured = m.redactedBlockCount;
   }
   if (ev.stopReason) {
     out.stop_reason = ev.stopReason;
@@ -334,8 +388,9 @@ export class JsonLogTracker implements Tracker {
   emit(ev: TrackEvent): void {
     try {
       this.sink(JSON.stringify(ev));
-    } catch {
-      /* swallow — tracker must never break a request */
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[pxpipe] tracker sink failed: ${message}`);
     }
   }
 }

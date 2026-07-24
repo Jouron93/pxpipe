@@ -422,6 +422,28 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     expect(out.tools[0].parameters.description).toBeUndefined();
   });
 
+  it('measures Codex native tool state without rewriting the request', async () => {
+    const request = {
+      model: 'gpt-5.6-sol',
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Run it.' }] },
+        { type: 'additional_tools', tools: [{ name: 'shell', description: 'Execute commands safely.' }] },
+        { type: 'custom_tool_call', call_id: 'call_1', name: 'shell', input: '{"command":"pwd"}' },
+        { type: 'custom_tool_call_output', call_id: 'call_1', output: 'C:\\\\Projects\\\\TraderBot' },
+      ],
+    };
+    const body = enc.encode(JSON.stringify(request));
+
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toBe('no_static_context');
+    expect(dec.decode(result.body)).toBe(dec.decode(body));
+    expect(result.info.responsesComposition?.toolsJson).toBeGreaterThan(0);
+    expect(result.info.responsesComposition?.functionCalls).toBeGreaterThan(0);
+    expect(result.info.responsesComposition?.functionOutputs).toBeGreaterThan(0);
+  });
+
   it('keeps a parameter literally named "description" (task-tool regression)', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',

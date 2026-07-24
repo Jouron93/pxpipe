@@ -34,7 +34,9 @@ import {
   DENSE_RENDER_STYLE,
   ANTHROPIC_SLAB_COLS,
   renderTextToPngsWithCharLimit,
+  type RenderStyle,
 } from './render.js';
+import { envStyleOverride } from './gpt-model-profiles.js';
 import { factSheetText } from './factsheet.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
@@ -505,6 +507,14 @@ export interface TransformInfo {
   /** GPT only. Vision tokens the rendered images actually cost as input
    *  (Σ openAIVisionTokens over real image dims). The "Sent as image" basis. */
   imageTokens?: number;
+  /** GPT Responses only. o200k tokens of compression-only native text that preserves
+   *  exact source associations beside the image. Savings math treats these as part
+   *  of the replacement cost, not as text that existed in the unproxied request. */
+  preservedTextTokens?: number;
+  /** GPT Responses only. Exact source lines emitted natively beside the slab image. */
+  exactContextLines?: number;
+  /** GPT Responses only. Original source chars retained in those exact lines. */
+  exactContextChars?: number;
   /** GPT only. o200k_base text tokens of the content pxpipe imaged/stripped —
    *  the would-have-paid "as plain text" baseline. Compared against imageTokens
    *  for the per-request saving. See src/core/openai-savings.ts. */
@@ -588,6 +598,8 @@ export interface TransformInfo {
   gateEval?: {
     readonly site: 'slab';
     readonly imageTokens: number;
+    /** Compression-only exact-context text on the image side of the gate. */
+    readonly preservedTextTokens?: number;
     readonly textTokens: number;
     /** `priorWarmTokens × (CC − CR)` added to image side. */
     readonly burnImageSide: number;
@@ -1345,6 +1357,9 @@ export async function textToImageBlocks(
   /** Shrink canvas to the longest wrapped line. `false` for the slab path
    *  (fills full `cols` for multi-col packing). Default `true`. */
   shrinkWidth: boolean = true,
+  /** Per-model density override for the Anthropic path (envStyleOverride).
+   *  Unset = DENSE_RENDER_STYLE, the validated 5×8 production density. @jules */
+  style: RenderStyle = DENSE_RENDER_STYLE,
 ): Promise<{
   blocks: ImageBlock[];
   /** Raw PNG bytes parallel to `blocks` (avoids re-decoding base64 for dashboard). */
@@ -1367,7 +1382,7 @@ export async function textToImageBlocks(
       // Single-col dense: shrink the 384-col base to content so the renderer matches the
       // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
       // Was hard-coded to DENSE_CONTENT_COLS, which threw away the shrink the gate assumed.
-      : await renderTextToPngsWithCharLimit(renderText, shrinkColsToContent(renderText, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+      : await renderTextToPngsWithCharLimit(renderText, shrinkColsToContent(renderText, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, style);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -1443,7 +1458,7 @@ async function runHistoryCollapseAndFinalize(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow },
+      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow, style: envStyleOverride((req as { model?: string }).model) },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -1526,6 +1541,11 @@ export async function transformRequest(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  // Per-model density override from the same PXPIPE_GPT_PROFILES env map the GPT
+  // path uses. undefined for models with no explicit entry → every render below
+  // keeps DENSE_RENDER_STYLE (the validated Fable 5×8 default). This is what pins
+  // e.g. claude-opus-4-8 to its measured-legible 9×12 while Fable stays 5×8. @jules
+  const denseStyle: RenderStyle | undefined = envStyleOverride((req as { model?: string }).model);
 
   // 1. Pull system text out. Split into:
   //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
@@ -1857,7 +1877,7 @@ export async function transformRequest(
             continue;
           }
           const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-            await textToImageBlocks(reminderText, o.cols, numCols);
+            await textToImageBlocks(reminderText, o.cols, numCols, undefined, denseStyle);
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
           const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
@@ -1940,7 +1960,7 @@ export async function transformRequest(
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols, numCols);
+                  await textToImageBlocks(paged.text, o.cols, numCols, undefined, denseStyle);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 for (const img of imgs) info.imageBytes += approxBlockBytes(img);
@@ -2006,7 +2026,7 @@ export async function transformRequest(
                   info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
-                  await textToImageBlocks(paged.text, o.cols, numCols);
+                  await textToImageBlocks(paged.text, o.cols, numCols, undefined, denseStyle);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
@@ -2079,7 +2099,7 @@ export async function transformRequest(
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow },
+      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow, style: denseStyle },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;

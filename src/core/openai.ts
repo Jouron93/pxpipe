@@ -44,6 +44,7 @@ import {
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { factSheetText } from './factsheet.js';
+import { buildExactContextManifest } from './exact-context.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
@@ -536,10 +537,14 @@ function measureResponsesComposition(
       c.systemDeveloper += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
     } else if (role === 'user' || role === 'assistant') {
       c.userAssistant += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
-    } else if (type === 'function_call') {
+    } else if (type === 'function_call' || type === 'custom_tool_call') {
       c.functionCalls += gptTextTokens(JSON.stringify(o));
-    } else if (type === 'function_call_output') {
+    } else if (type === 'function_call_output' || type === 'custom_tool_call_output') {
       c.functionOutputs += gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
+    } else if (type === 'additional_tools') {
+      // Codex places its native tool catalog inside input[] rather than the
+      // top-level Responses tools field. Measure it, but never rewrite it.
+      c.toolsJson += gptTextTokens(JSON.stringify(o));
     } else if (type === 'reasoning') {
       // Includes encrypted_content when present; this is often a large Codex-native bucket.
       c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));
@@ -609,7 +614,8 @@ function evalOpenAIGate(
   renderedText: string,
   cols: number,
   charsPerToken: number,
-): { imageTokens: number; textTokens: number; profitable: boolean } {
+  preservedText = '',
+): { imageTokens: number; preservedTextTokens: number; textTokens: number; profitable: boolean } {
   const profile = resolveGptProfile(model);
   const style = profile.style;
   const cellW = renderCellWidth(style);
@@ -654,7 +660,17 @@ function evalOpenAIGate(
     charsPerToken === DEFAULTS.charsPerToken
       ? Math.max(1, gptTextTokens(renderedText) || Math.ceil(renderedText.length / charsPerToken))
       : renderedText.length / Math.max(1e-6, charsPerToken);
-  return { imageTokens, textTokens, profitable: imageTokens < textTokens };
+  const preservedTextTokens = preservedText
+    ? (charsPerToken === DEFAULTS.charsPerToken
+      ? gptTextTokens(preservedText)
+      : preservedText.length / Math.max(1e-6, charsPerToken))
+    : 0;
+  return {
+    imageTokens,
+    preservedTextTokens,
+    textTokens,
+    profitable: imageTokens + preservedTextTokens < textTokens,
+  };
 }
 
 /** Shared image-part accumulation from rendered PNGs. */
@@ -1048,6 +1064,16 @@ export async function transformOpenAIResponses(
     return { body, info };
   }
 
+  // Sol's dense-image exact-id gate scored 0/15. A token-only factsheet retains
+  // spellings but not relations (for example dur_ms -> id), so preserve complete
+  // precision-sensitive source lines natively. Any bounded-manifest overflow is a
+  // hard fail-closed signal: never send a partial exact-context index.
+  const exactContext = buildExactContextManifest(combinedRaw);
+  if (!exactContext.complete) {
+    info.reason = `exact_context_${exactContext.reason ?? 'incomplete'}`;
+    return { body, info };
+  }
+
   const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
@@ -1069,10 +1095,17 @@ export async function transformOpenAIResponses(
     profile.stripCols,
   );
 
-  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
+  const gate = evalOpenAIGate(
+    req.model,
+    renderedText,
+    cols,
+    o.charsPerToken,
+    exactContext.text,
+  );
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
+    preservedTextTokens: gate.preservedTextTokens,
     textTokens: gate.textTokens,
     burnImageSide: 0,
     burnTextSide: 0,
@@ -1098,6 +1131,9 @@ export async function transformOpenAIResponses(
   // GPT savings basis (see src/core/openai-savings.ts). req.tools is still the
   // original here — reassigned to the stripped set below.
   info.imageTokens = gptImageTokens(req.model, images);
+  info.preservedTextTokens = gptTextTokens(exactContext.text);
+  info.exactContextLines = exactContext.lineCount;
+  info.exactContextChars = exactContext.preservedChars;
   info.baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
   info.compressedChars = combinedRaw.length;
   info.bucketChars = { static_slab: combinedRaw.length };
@@ -1114,10 +1150,8 @@ export async function transformOpenAIResponses(
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map(responsesImagePart);
   const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
-  // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
-  const slabFactSheet = factSheetText(combinedRaw);
-  const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet
-    ? [{ type: 'input_text', text: slabFactSheet }]
+  const exactContextParts: ResponsesInputTextPart[] = exactContext.text
+    ? [{ type: 'input_text', text: exactContext.text }]
     : [];
 
   if (inputWasString) {
@@ -1126,7 +1160,7 @@ export async function transformOpenAIResponses(
       role: 'user',
       content: [
         ...imagePartsResp,
-        ...slabFactSheetPart,
+        ...exactContextParts,
         endMarker,
         { type: 'input_text', text: originalInputString! },
       ],
@@ -1137,7 +1171,7 @@ export async function transformOpenAIResponses(
     // and protecting it made stale first-turn requests look live.
     const slabUserItem: ResponsesInputItem = {
       role: 'user',
-      content: [...imagePartsResp, ...slabFactSheetPart, endMarker],
+      content: [...imagePartsResp, ...exactContextParts, endMarker],
     };
     inputItems = [
       ...inputItems.slice(0, firstUserIdx),

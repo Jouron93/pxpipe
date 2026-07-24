@@ -16,21 +16,24 @@
 import { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..', '..');
 
-const RENDER_PATH = resolve(ROOT, 'dist', 'core', 'render.js');
-const PNG_PATH    = resolve(ROOT, 'dist', 'core', 'png.js');
+const RENDER_PATH_ABS = resolve(ROOT, 'dist', 'core', 'render.js');
+const PNG_PATH_ABS    = resolve(ROOT, 'dist', 'core', 'png.js');
 
-if (!existsSync(RENDER_PATH)) {
+if (!existsSync(RENDER_PATH_ABS)) {
   throw new Error(
     `[render-bridge] dist/core/render.js not found.\n` +
     `Run \`pnpm run build\` from the repo root first.\n` +
-    `Expected: ${RENDER_PATH}`,
+    `Expected: ${RENDER_PATH_ABS}`,
   );
 }
+
+const RENDER_PATH = pathToFileURL(RENDER_PATH_ABS).href;
+const PNG_PATH    = pathToFileURL(PNG_PATH_ABS).href;
 
 const renderModule = await import(RENDER_PATH);
 const pngModule    = await import(PNG_PATH);
