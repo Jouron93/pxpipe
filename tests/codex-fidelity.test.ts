@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { countTokens as countO200kTokens } from 'gpt-tokenizer/encoding/o200k_base';
 import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
-import { buildExactContextManifest } from '../src/core/exact-context.js';
+import {
+  buildExactContextManifest,
+  buildExactContextPlan,
+} from '../src/core/exact-context.js';
 import {
   transformOpenAIChatCompletions,
   transformOpenAIResponses,
@@ -9,7 +13,7 @@ import {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-function responseInputText(body: Uint8Array): string {
+function responseInputTextParts(body: Uint8Array): string[] {
   const parsed = JSON.parse(dec.decode(body)) as {
     input?: Array<{ content?: unknown }>;
   };
@@ -24,7 +28,30 @@ function responseInputText(body: Uint8Array): string {
       if (part.type === 'input_text' && typeof part.text === 'string') text.push(part.text);
     }
   }
-  return text.join('\n');
+  return text;
+}
+
+function responseInputText(body: Uint8Array): string {
+  return responseInputTextParts(body).join('\n');
+}
+
+function occurrenceCount(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+function mixedAuthorityContext(targetChars: number): string {
+  const lines = [
+    '# Runtime assignment',
+    'trace_id=a1b2c3d4e5f6 lane=x7',
+    '',
+  ];
+  const prose = 'This authority paragraph explains normal behavior using ordinary language without structured identifiers.';
+  let chars = lines.join('\n').length;
+  while (chars < targetChars) {
+    lines.push(prose);
+    chars += prose.length + 1;
+  }
+  return lines.join('\n');
 }
 
 function chatText(body: Uint8Array): string {
@@ -64,7 +91,7 @@ describe('safe Codex static-context compression', () => {
     expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
   });
 
-  it('still images large non-critical prose without adding an exact-context manifest', async () => {
+  it('still images large non-critical prose while charging pointer and end-marker overhead', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       instructions: 'ordinary prose without precision-sensitive tokens or code fences. '.repeat(500),
@@ -77,8 +104,9 @@ describe('safe Codex static-context compression', () => {
 
     expect(result.info.compressed).toBe(true);
     expect(result.info.imageCount ?? 0).toBeGreaterThan(0);
-    expect(result.info.preservedTextTokens ?? 0).toBe(0);
-    expect(responseInputText(result.body)).not.toContain('[Exact source lines');
+    expect(result.info.preservedTextTokens ?? 0).toBeGreaterThan(0);
+    expect(result.info.preservedTextTokens).toBe(result.info.gateEval?.preservedTextTokens);
+    expect(responseInputText(result.body)).not.toContain('[Exact native source');
   });
 
   it('keeps all fifteen dur_ms/id associations as exact native text and charges them to the gate', async () => {
@@ -86,13 +114,15 @@ describe('safe Codex static-context compression', () => {
       const id = `a1b2c3d4${i.toString(16).padStart(4, '0')}`;
       return `dur_ms=${4439 + i} id=${id}`;
     });
+    const instructions = [
+      'This is non-critical explanatory context. '.repeat(500),
+      '## Exact timing table',
+      ...associations,
+    ].join('\n');
+    const plan = buildExactContextPlan(instructions);
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
-      instructions: [
-        'This is non-critical explanatory context. '.repeat(500),
-        '## Exact timing table',
-        ...associations,
-      ].join('\n'),
+      instructions,
       input: [{ role: 'user', content: 'Return the id associated with each duration.' }],
     }));
 
@@ -100,16 +130,54 @@ describe('safe Codex static-context compression', () => {
 
     expect(result.info.compressed).toBe(true);
     const nativeText = responseInputText(result.body);
-    expect(nativeText).toContain('[Exact source lines from the rendered context above.]');
-    for (const association of associations) expect(nativeText).toContain(association);
+    expect(nativeText).toContain('[Exact native source removed from the rendered context.]');
+    for (const association of associations) {
+      expect(occurrenceCount(nativeText, association)).toBe(1);
+      expect(plan.imageSource).not.toContain(association);
+      expect(plan.imageableText).not.toContain(association);
+      expect(result.info.imageSourceText).not.toContain(association);
+    }
 
     const gate = result.info.gateEval;
     expect(gate).toBeDefined();
-    expect(gate!.preservedTextTokens).toBeGreaterThan(0);
-    expect(result.info.preservedTextTokens).toBe(gate!.preservedTextTokens);
+    const transformed = JSON.parse(dec.decode(result.body)) as { instructions: string };
+    const expectedOverhead = Math.max(
+      0,
+      countO200kTokens(plan.text) - countO200kTokens(plan.protectedText),
+    ) + countO200kTokens(transformed.instructions)
+      + countO200kTokens('[End of rendered GPT system/tool context.]');
+    expect(result.info.origChars).toBe(instructions.length);
+    expect(result.info.compressedChars).toBe(plan.imageableChars);
+    expect(result.info.baselineImagedTokens).toBe(countO200kTokens(plan.imageableText));
+    expect(gate!.textTokens).toBe(result.info.baselineImagedTokens);
+    expect(gate!.preservedTextTokens).toBe(expectedOverhead);
+    expect(result.info.preservedTextTokens).toBe(expectedOverhead);
     expect(gate!.profitable).toBe(
       gate!.imageTokens + (gate!.preservedTextTokens ?? 0) < gate!.textTokens,
     );
+  });
+
+  it.each([65_000, 106_000])('compresses a representative %i-character mixed authority context', async (targetChars) => {
+    const instructions = mixedAuthorityContext(targetChars);
+    const protectedLine = 'trace_id=a1b2c3d4e5f6 lane=x7';
+    const plan = buildExactContextPlan(instructions);
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6-sol',
+      instructions,
+      input: [{ role: 'user', content: 'Return the runtime assignment.' }],
+    }));
+
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+
+    expect(instructions.length).toBeGreaterThanOrEqual(targetChars);
+    expect(plan.complete).toBe(true);
+    expect(result.info.compressed).toBe(true);
+    expect(result.info.imageCount ?? 0).toBeGreaterThan(0);
+    expect(result.info.reason).not.toBe('exact_context_too_many_chars');
+    expect(occurrenceCount(responseInputText(result.body), protectedLine)).toBe(1);
+    expect(plan.imageSource).not.toContain(protectedLine);
+    expect(plan.imageableText).not.toContain(protectedLine);
+    expect(result.info.imageSourceText).not.toContain(protectedLine);
   });
 
   it('preserves small structured associations with only their active heading provenance', () => {
@@ -178,15 +246,85 @@ describe('safe Codex static-context compression', () => {
     expect(buildExactContextManifest('a=123', { maxLineChars: 4 }).reason).toBe('line_too_long');
   });
 
+  it('builds a source-exclusive selective plan with active heading and fence provenance', () => {
+    const exactLine = 'retry=3 lane=x7 trace_id=a1b2c3d4e5f6';
+    const codeLine = 'const route_id = "r7";';
+    const source = [
+      '# Unrelated section',
+      'ordinary introductory prose',
+      '# Runtime state',
+      'ordinary qualifying prose',
+      exactLine,
+      'more ordinary prose',
+      '```ts',
+      codeLine,
+      '```',
+      'ordinary closing prose',
+    ].join('\n');
+
+    const plan = buildExactContextPlan(source);
+
+    expect(plan.complete).toBe(true);
+    expect(plan.nativeParts.length).toBeGreaterThan(0);
+    expect(plan.text).toBe(plan.nativeParts.join('\n'));
+    expect(plan.nativeParts.every((part) => part.length <= 32_768)).toBe(true);
+    expect(plan.nativeWrapperChars).toBe(plan.text.length - plan.protectedText.length);
+    expect(plan.protectedText).toContain('# Runtime state');
+    expect(plan.protectedText).not.toContain('# Unrelated section');
+    for (const protectedValue of [exactLine, codeLine, '```ts']) {
+      expect(occurrenceCount(plan.protectedText, protectedValue)).toBe(1);
+      expect(plan.imageSource).not.toContain(protectedValue);
+      expect(plan.imageableText).not.toContain(protectedValue);
+    }
+    expect(plan.protectedText.split('\n').filter((line) => line === '```')).toHaveLength(1);
+    expect(plan.imageSource.split('\n')).not.toContain('```');
+    expect(plan.imageableText.split('\n')).not.toContain('```');
+    expect(plan.imageSource).toMatch(/\[Exact native block B\d+: source lines /);
+  });
+
+  it('splits more than 256 protected lines into bounded native wire parts', async () => {
+    const associations = Array.from({ length: 257 }, (_, i) => {
+      const id = `b2c3d4e5${i.toString(16).padStart(4, '0')}`;
+      return `dur_ms=${10_000 + i} id=${id}`;
+    });
+    const prose = 'ordinary explanatory context with no structured identifiers '.repeat(900);
+    const instructions = [prose, '## Exact timing table', ...associations].join('\n');
+    const plan = buildExactContextPlan(instructions);
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6-sol',
+      instructions,
+      input: [{ role: 'user', content: 'Inspect the table.' }],
+    }));
+
+    const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
+    const nativeParts = responseInputTextParts(result.body).filter((part) =>
+      part.startsWith('[Exact native source removed from the rendered context.]'));
+
+    expect(plan.complete).toBe(true);
+    expect(plan.nativeParts).toHaveLength(2);
+    expect(plan.text).toBe(plan.nativeParts.join('\n'));
+    expect(plan.nativeParts.every((part) => part.length <= 32_768)).toBe(true);
+    expect(result.info.compressed).toBe(true);
+    expect(nativeParts).toHaveLength(2);
+    expect(nativeParts).toEqual(plan.nativeParts);
+    for (const association of associations) {
+      expect(occurrenceCount(nativeParts.join('\n'), association)).toBe(1);
+      expect(plan.imageSource).not.toContain(association);
+      expect(plan.imageableText).not.toContain(association);
+      expect(result.info.imageSourceText).not.toContain(association);
+    }
+  });
+
   it('rejects a structured slab when preservation cost makes an image-only peer unprofitable', async () => {
     const plain = Array.from(
       { length: 40 },
       () => `ordinary prose row containing descriptive words only ${'detail '.repeat(8)}`,
     ).join('\n');
-    const structured = Array.from(
+    const structuredRows = Array.from(
       { length: 40 },
       (_, i) => `retry_${i}=${i} lane=x${i} ${'detail '.repeat(8)}`,
     ).join('\n');
+    const structured = `${structuredRows}\n${'ordinary prose remainder '.repeat(12)}`;
     const request = (instructions: string): Uint8Array => enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       instructions,
@@ -209,11 +347,11 @@ describe('safe Codex static-context compression', () => {
     expect(withExactText.body).toEqual(request(structured));
   });
 
-  it('fails closed and returns the original bytes when exact context exceeds its bounded manifest', async () => {
-    const dense = Array.from({ length: 257 }, (_, i) => {
-      const id = `b2c3d4e5${i.toString(16).padStart(4, '0')}`;
-      return `dur_ms=${10_000 + i} id=${id}`;
-    }).join('\n');
+  it('fails closed when protected source exceeds the explicit 64-part bound', async () => {
+    const dense = Array.from(
+      { length: 256 * 64 + 1 },
+      (_, i) => `relation_${i}=${i}`,
+    ).join('\n');
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       instructions: dense,
@@ -226,23 +364,53 @@ describe('safe Codex static-context compression', () => {
     });
 
     expect(result.info.compressed).toBe(false);
-    expect(result.info.reason).toBe('exact_context_too_many_lines');
+    expect(result.info.reason).toBe('exact_context_too_many_parts');
     expect(result.body).toEqual(body);
   });
 
+  it('reports planner wrapper overflow without truncating protected source', () => {
+    const plan = buildExactContextPlan('relation=exact-value', { maxChars: 64 });
+
+    expect(plan.complete).toBe(false);
+    expect(plan.reason).toBe('too_many_chars');
+    expect(plan.nativeParts).toEqual([]);
+    expect(plan.text).toBe('');
+  });
+
   it.each([
-    {
-      reason: 'exact_context_line_too_long',
-      instructions: `relation=${'x'.repeat(4_100)}`,
-    },
-    {
-      reason: 'exact_context_too_many_chars',
-      instructions: Array.from(
-        { length: 100 },
-        (_, i) => `relation_${i}=${'x'.repeat(340)}`,
-      ).join('\n'),
-    },
-  ])('returns byte-identical input for $reason', async ({ reason, instructions }) => {
+    ['CRLF', 'ordinary prose\r\ntrace_id=a1b2c3d4e5f6 lane=x7\r\n'],
+    ['lone CR', 'ordinary prose\rtrace_id=a1b2c3d4e5f6 lane=x7\r'],
+  ])('fails the selective plan closed for %s source instead of normalizing it', (_label, instructions) => {
+    const plan = buildExactContextPlan(instructions);
+
+    expect(plan.complete).toBe(false);
+    expect(plan.reason).toBe('unsupported_line_endings');
+    expect(plan.imageSource).toBe('');
+    expect(plan.imageableText).toBe('');
+    expect(plan.protectedText).toBe('');
+    expect(plan.nativeParts).toEqual([]);
+    expect(plan.text).toBe('');
+  });
+
+  it.each([
+    ['CRLF', 'ordinary prose\r\ntrace_id=a1b2c3d4e5f6 lane=x7\r\n'],
+    ['lone CR', 'ordinary prose\rtrace_id=a1b2c3d4e5f6 lane=x7\r'],
+  ])('returns byte-identical SOL input for unsupported %s source', async (_label, instructions) => {
+    const body = enc.encode(JSON.stringify({
+      model: 'gpt-5.6-sol',
+      instructions,
+      input: [{ role: 'user', content: 'Inspect the runtime assignment.' }],
+    }));
+
+    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
+
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toBe('exact_context_unsupported_line_endings');
+    expect(result.body).toEqual(body);
+  });
+
+  it('returns byte-identical input for an overlong protected line', async () => {
+    const instructions = `relation=${'x'.repeat(4_100)}`;
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       instructions,
@@ -252,7 +420,7 @@ describe('safe Codex static-context compression', () => {
     const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
 
     expect(result.info.compressed).toBe(false);
-    expect(result.info.reason).toBe(reason);
+    expect(result.info.reason).toBe('exact_context_line_too_long');
     expect(result.body).toEqual(body);
   });
 

@@ -276,7 +276,6 @@ describe('transformOpenAIChatCompletions (gpt-5.6-sol)', () => {
 const BIG_INSTRUCTIONS = 'These are detailed instructions. '.repeat(600); // ~20k chars
 const BIG_FLAT_TOOL_DESC = 'Flat tool description with lots of context. '.repeat(200); // ~8k chars
 const RESPONSES_TOOL_PARAMS = { type: 'object', description: 'Param root.', properties: { x: { type: 'string', description: 'x param' } } };
-const RESPONSES_TOOL_DOC = `## Tool: do_thing\n${BIG_FLAT_TOOL_DESC}\n\`\`\`json\n${JSON.stringify(RESPONSES_TOOL_PARAMS)}\n\`\`\``;
 
 describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
   it('records original Responses composition with local o200k buckets', async () => {
@@ -305,31 +304,33 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     );
   });
 
-  it('compresses GPT Responses instructions + tool docs while preserving native tool selection metadata', async () => {
+  it('compresses GPT Responses instructions while preserving native tools byte-for-byte', async () => {
+    const tool = {
+      type: 'function',
+      name: 'do_thing',
+      description: BIG_FLAT_TOOL_DESC,
+      parameters: RESPONSES_TOOL_PARAMS,
+    };
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       instructions: BIG_INSTRUCTIONS,
       input: [
         { role: 'user', content: 'Please do the thing.' },
       ],
-      tools: [{
-        type: 'function',
-        name: 'do_thing',
-        description: BIG_FLAT_TOOL_DESC,
-        parameters: RESPONSES_TOOL_PARAMS,
-      }],
+      tools: [tool],
     }));
 
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
     expect(result.info.compressed).toBe(true);
     expect(result.info.imageCount).toBeGreaterThan(0);
     expect(result.info.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
-    const expectedImagedChars = `## INSTRUCTIONS\n${BIG_INSTRUCTIONS}\n\n${RESPONSES_TOOL_DOC}`.length;
+    const expectedImagedChars = BIG_INSTRUCTIONS.length;
     expect(result.info.origChars).toBe(expectedImagedChars);
     expect(result.info.compressedChars).toBe(expectedImagedChars);
     expect(result.info.bucketChars?.static_slab).toBe(expectedImagedChars);
 
     const out = JSON.parse(dec.decode(result.body)) as Record<string, unknown>;
+    expect(out.model).toBe('gpt-5.6-sol');
     // instructions replaced with pointer.
     expect(out.instructions as string).toContain('rendered into image');
     expect(out.instructions as string).not.toContain('These are detailed');
@@ -342,11 +343,9 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     expect(parts[0]!.type).toBe('input_image');
     expect(parts[0]!.image_url).toMatch(/^data:image\/png;base64,/);
 
-    // Tool selection stays native; verbose schema prose moved into the image.
-    const tools = out.tools as Array<{ description?: string; parameters?: { description?: string; properties?: { x?: { description?: string } } } }>;
-    expect(tools[0]!.description).toBe(BIG_FLAT_TOOL_DESC);
-    expect(tools[0]!.parameters?.description).toBeUndefined();
-    expect(tools[0]!.parameters?.properties?.x?.description).toBeUndefined();
+    // SOL tools stay entirely native until source-span accounting can prove an
+    // honest stripped-tool baseline.
+    expect(out.tools).toEqual([tool]);
   });
 
   it('reflows Responses static context that contains a literal newline sentinel', async () => {
@@ -366,20 +365,29 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     const source = result.info.imageSourceText!;
     expect(source).not.toContain('\n');
     expect(source).not.toContain('↵IDS↵');
-    expect(source).toContain('BEGIN RENDERED CONTEXT ======================↵## INSTRUCTIONS↵');
+    expect(source).toContain('BEGIN RENDERED CONTEXT ======================↵alpha line');
     expect(source).toContain('beta line quotes ⏎ literally↵gamma line');
     expect(source).not.toMatch(/\s$/);
     expect(source).not.toMatch(/↵$/);
   });
 
-  it('images developer/system items whose content is an input_text part array, not just a string', async () => {
+  it('images developer/system text while preserving non-text parts in their original order', async () => {
     // Responses allows message content as a string OR an array of parts. The
     // array form for a developer/system item used to be dropped: not imaged and
     // not stubbed, so the verbose text rode uncompressed as native input.
+    const preservedImagePart = { type: 'input_image', image_url: 'data:image/png;base64,AAAA' };
+    const preservedFilePart = { type: 'input_file', file_id: 'file_authority_123' };
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       input: [
-        { role: 'developer', content: [{ type: 'input_text', text: BIG_INSTRUCTIONS }] },
+        {
+          role: 'developer',
+          content: [
+            preservedImagePart,
+            { type: 'input_text', text: BIG_INSTRUCTIONS },
+            preservedFilePart,
+          ],
+        },
         { role: 'user', content: 'Please do the thing.' },
       ],
     }));
@@ -392,17 +400,20 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
 
     const out = JSON.parse(dec.decode(result.body)) as { input: Array<{ role: string; content: unknown }> };
     const dev = out.input.find((i) => i.role === 'developer')!;
-    // Array shape preserved, but the big text is gone — replaced by a pointer part.
+    // Array shape and non-text order are preserved; only authority text becomes
+    // a single pointer at the position of its first input_text part.
     expect(Array.isArray(dev.content)).toBe(true);
-    const devParts = dev.content as Array<{ type: string; text?: string }>;
-    expect(devParts).toHaveLength(1);
-    expect(devParts[0]!.type).toBe('input_text');
-    expect(devParts[0]!.text).toContain('rendered into image');
+    const devParts = dev.content as Array<Record<string, unknown>>;
+    expect(devParts).toHaveLength(3);
+    expect(devParts[0]).toEqual(preservedImagePart);
+    expect(devParts[1]!.type).toBe('input_text');
+    expect(devParts[1]!.text).toContain('rendered into image');
+    expect(devParts[2]).toEqual(preservedFilePart);
     expect(JSON.stringify(dev.content)).not.toContain('These are detailed');
   });
 
-  it('images GPT Responses tool definitions even when there is no instruction context', async () => {
-    const body = enc.encode(JSON.stringify({
+  it('passes tool-only GPT Responses through byte-for-byte', async () => {
+    const request = {
       model: 'gpt-5.6-sol',
       input: [{ role: 'user', content: 'Please do the thing.' }],
       tools: [{
@@ -411,15 +422,14 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
         description: BIG_FLAT_TOOL_DESC,
         parameters: RESPONSES_TOOL_PARAMS,
       }],
-    }));
+    };
+    const body = enc.encode(JSON.stringify(request));
 
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
-    expect(result.info.compressed).toBe(true);
-    expect(result.info.origChars).toBe(RESPONSES_TOOL_DOC.length);
-    expect(result.info.compressedChars).toBe(RESPONSES_TOOL_DOC.length);
-    const out = JSON.parse(dec.decode(result.body)) as any;
-    expect(out.tools[0].description).toBe(BIG_FLAT_TOOL_DESC);
-    expect(out.tools[0].parameters.description).toBeUndefined();
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toBe('no_static_context');
+    expect(result.body).toEqual(body);
+    expect(JSON.parse(dec.decode(result.body))).toEqual(request);
   });
 
   it('measures Codex native tool state without rewriting the request', async () => {
@@ -444,22 +454,25 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     expect(result.info.responsesComposition?.functionOutputs).toBeGreaterThan(0);
   });
 
-  it('keeps a parameter literally named "description" (task-tool regression)', async () => {
-    const body = enc.encode(JSON.stringify({
+  it('keeps task-like tool schemas byte-identical on tool-only SOL requests', async () => {
+    const request = {
       model: 'gpt-5.6-sol',
       input: [{ role: 'user', content: 'Please do the thing.' }],
       tools: [{ type: 'function', name: 'task', description: BIG_FLAT_TOOL_DESC, parameters: TASK_LIKE_PARAMS }],
-    }));
+    };
+    const body = enc.encode(JSON.stringify(request));
 
     const result = await transformOpenAIResponses(body, { charsPerToken: 1, minCompressChars: 1 });
-    expect(result.info.compressed).toBe(true);
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toBe('no_static_context');
+    expect(result.body).toEqual(body);
     const out = JSON.parse(dec.decode(result.body)) as any;
     const params = out.tools[0].parameters;
     expect(Object.keys(params.properties).sort()).toEqual(['description', 'prompt', 'title']);
     expect(params.required).toEqual(['description', 'prompt']);
     for (const name of params.required) expect(params.properties[name]).toBeDefined();
     expect(params.properties.description.type).toBe('string');
-    expect(params.properties.description.description).toBeUndefined();
+    expect(params.properties.description.description).toBe(TASK_LIKE_PARAMS.properties.description.description);
   });
 
   it('handles bare string input (wraps into user item with images)', async () => {
@@ -474,15 +487,16 @@ describe('transformOpenAIResponses (gpt-5.6-sol)', () => {
     expect(result.info.firstUserSha8).toMatch(/^[0-9a-f]{8}$/);
 
     const out = JSON.parse(dec.decode(result.body)) as Record<string, unknown>;
+    expect(out.model).toBe('gpt-5.6-sol');
     // input should now be an array.
     expect(Array.isArray(out.input)).toBe(true);
     const inputItems = out.input as Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
     expect(inputItems[0]!.role).toBe('user');
     const parts = inputItems[0]!.content;
     expect(parts[0]!.type).toBe('input_image');
-    // Original string preserved as input_text part.
-    const textParts = parts.filter((p) => p.type === 'input_text');
-    expect(textParts.some((p) => p.text?.includes('Do the thing'))).toBe(true);
+    // Original string is the exact final text part after images, protected
+    // native parts, and the rendered-context end marker.
+    expect(parts.at(-1)).toEqual({ type: 'input_text', text: 'Do the thing please.' });
   });
 
   it('records outgoingTextChars for compressed Responses requests, counting text but not image base64', async () => {

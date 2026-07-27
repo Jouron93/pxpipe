@@ -45,7 +45,7 @@ import {
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { factSheetText } from './factsheet.js';
-import { buildExactContextManifest } from './exact-context.js';
+import { buildExactContextManifest, buildExactContextPlan } from './exact-context.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
@@ -359,6 +359,32 @@ function responsesContentText(content: ResponsesInputItem['content']): string {
     .join('\n\n');
 }
 
+function replaceResponsesTextWithPointer(
+  content: ResponsesInputItem['content'],
+  pointer: string,
+): ResponsesInputItem['content'] {
+  if (typeof content === 'string') return pointer;
+  if (!Array.isArray(content)) return content;
+
+  const replaced: ResponsesContentPart[] = [];
+  let pointerInserted = false;
+  for (const part of content) {
+    const isInputText = typeof part === 'object'
+      && part !== null
+      && (part as { type?: unknown }).type === 'input_text'
+      && typeof (part as { text?: unknown }).text === 'string';
+    if (!isInputText) {
+      replaced.push(part);
+      continue;
+    }
+    if (!pointerInserted) {
+      replaced.push({ type: 'input_text', text: pointer });
+      pointerInserted = true;
+    }
+  }
+  return replaced;
+}
+
 function firstResponsesUserText(
   inputWasString: boolean,
   originalInput: string | undefined,
@@ -610,12 +636,26 @@ function droppedCodepointsTop(droppedCodepoints: Map<number, number>): Record<st
  *  `charsPerToken` to force the length/cpt lever (tests use 1). Images bill full
  *  pages at maxHeight and the last page at residual height — charging every page
  *  as a full strip over-states cost and blocks profitable collapses. */
+interface OpenAIGateAccounting {
+  readonly baselineText?: string;
+  readonly textTokens?: number;
+  readonly preservedText?: string;
+  readonly preservedTextTokens?: number;
+}
+
+function gateTextTokens(text: string, charsPerToken: number): number {
+  if (!text) return 0;
+  return charsPerToken === DEFAULTS.charsPerToken
+    ? Math.max(1, gptTextTokens(text) || Math.ceil(text.length / charsPerToken))
+    : text.length / Math.max(1e-6, charsPerToken);
+}
+
 function evalOpenAIGate(
   model: string,
   renderedText: string,
   cols: number,
   charsPerToken: number,
-  preservedText = '',
+  accounting: OpenAIGateAccounting = {},
 ): { imageTokens: number; preservedTextTokens: number; textTokens: number; profitable: boolean } {
   const profile = resolveGptProfile(model);
   const style = profile.style;
@@ -657,15 +697,12 @@ function evalOpenAIGate(
       ? lastPageTokens
       : (estImages - 1) * fullPageTokens + lastPageTokens;
   // Default: o200k. Non-default charsPerToken keeps the force/override lever.
-  const textTokens =
-    charsPerToken === DEFAULTS.charsPerToken
-      ? Math.max(1, gptTextTokens(renderedText) || Math.ceil(renderedText.length / charsPerToken))
-      : renderedText.length / Math.max(1e-6, charsPerToken);
-  const preservedTextTokens = preservedText
-    ? (charsPerToken === DEFAULTS.charsPerToken
-      ? gptTextTokens(preservedText)
-      : preservedText.length / Math.max(1e-6, charsPerToken))
-    : 0;
+  // Selective transforms may supply an original-source baseline independently
+  // from the rendered source and a numeric native-overhead cost.
+  const textTokens = accounting.textTokens
+    ?? gateTextTokens(accounting.baselineText ?? renderedText, charsPerToken);
+  const preservedTextTokens = accounting.preservedTextTokens
+    ?? gateTextTokens(accounting.preservedText ?? '', charsPerToken);
   return {
     imageTokens,
     preservedTextTokens,
@@ -790,7 +827,9 @@ const CHAT_POINTER =
   'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
 
 const RESPONSES_POINTER =
-  'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
+  'Image-safe instruction text was rendered into image(s) attached by pxpipe. Exact protected source is attached beside the images as native text. Treat both with the original authority. Tool definitions remain in native JSON.';
+
+const RESPONSES_END_MARKER = '[End of rendered GPT system/tool context.]';
 
 export async function transformOpenAIChatCompletions(
   body: Uint8Array,
@@ -1047,6 +1086,8 @@ export async function transformOpenAIResponses(
     req, inputWasString, originalInputString, inputItems,
   );
 
+  const selectiveSolContext = req.model === 'gpt-5.6-sol';
+
   // Collect static context: instructions + system/developer items + flat tools.
   const authorityDocs: string[] = [];
   const systemTexts: string[] = [];
@@ -1068,33 +1109,48 @@ export async function transformOpenAIResponses(
     info.staticChars += text.length;
   }
 
-  const { tools: rewrittenTools, docs: toolDocs } = o.compressTools
+  // Keep Sol tools native until source-span accounting can distinguish stripped
+  // tool-description tokens from structure that remains in the native JSON.
+  const { tools: rewrittenTools, docs: toolDocs } = o.compressTools && !selectiveSolContext
     ? rewriteFlatToolsForGpt(req.tools)
     : { tools: req.tools, docs: '' };
 
-  const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
+  // Sol's selective baseline is original authority text only. Synthetic role
+  // headings and tool-doc renderings must not inflate claimed token savings.
+  const combinedRaw = selectiveSolContext
+    ? systemTexts.join('\n\n')
+    : [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
   if (!combinedRaw) {
     info.reason = 'no_static_context';
     return { body, info };
   }
 
-  // Sol's dense-image exact-id gate scored 0/15. A token-only factsheet retains
-  // spellings but not relations (for example dur_ms -> id), so preserve complete
-  // precision-sensitive source lines natively. Any bounded-manifest overflow is a
-  // hard fail-closed signal: never send a partial exact-context index.
-  const exactContext = buildExactContextManifest(combinedRaw);
-  if (!exactContext.complete) {
-    info.reason = `exact_context_${exactContext.reason ?? 'incomplete'}`;
+  // Sol's dense-image exact-id gate scored 0/15. Selectively remove complete
+  // precision-sensitive source blocks from the rendered slab and carry them in
+  // independently bounded native parts. Other Responses models retain the legacy
+  // manifest behavior until they have model-specific reader validation.
+  const exactContextPlan = selectiveSolContext
+    ? buildExactContextPlan(combinedRaw)
+    : undefined;
+  const exactContextManifest = selectiveSolContext
+    ? undefined
+    : buildExactContextManifest(combinedRaw);
+  const exactContextComplete = exactContextPlan?.complete ?? exactContextManifest!.complete;
+  const exactContextReason = exactContextPlan?.reason ?? exactContextManifest?.reason;
+  if (!exactContextComplete) {
+    info.reason = `exact_context_${exactContextReason ?? 'incomplete'}`;
     return { body, info };
   }
 
   const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
-  const combined = compactSlabWhitespace(combinedRaw).trimEnd();
-  if (combined.length < o.minCompressChars) {
-    info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
+  const imageSourceRaw = exactContextPlan?.imageSource ?? combinedRaw;
+  const imageableChars = exactContextPlan?.imageableChars ?? combinedRaw.length;
+  const combined = compactSlabWhitespace(imageSourceRaw).trimEnd();
+  if (imageableChars < o.minCompressChars) {
+    info.reason = `below_min_chars (${imageableChars} < ${o.minCompressChars})`;
     return { body, info };
   }
 
@@ -1110,12 +1166,26 @@ export async function transformOpenAIResponses(
     profile.stripCols,
   );
 
+  const nativeOverheadGateTokens = exactContextPlan
+    ? Math.max(
+        0,
+        gateTextTokens(exactContextPlan.text, o.charsPerToken)
+          - gateTextTokens(exactContextPlan.protectedText, o.charsPerToken),
+      )
+      + systemTexts.length * gateTextTokens(RESPONSES_POINTER, o.charsPerToken)
+      + gateTextTokens(RESPONSES_END_MARKER, o.charsPerToken)
+    : undefined;
   const gate = evalOpenAIGate(
     req.model,
     renderedText,
     cols,
     o.charsPerToken,
-    exactContext.text,
+    exactContextPlan
+      ? {
+          baselineText: exactContextPlan.imageableText,
+          preservedTextTokens: nativeOverheadGateTokens,
+        }
+      : { preservedText: exactContextManifest!.text },
   );
   info.gateEval = {
     site: 'slab',
@@ -1146,13 +1216,23 @@ export async function transformOpenAIResponses(
   // GPT savings basis (see src/core/openai-savings.ts). req.tools is still the
   // original here — reassigned to the stripped set below.
   info.imageTokens = gptImageTokens(req.model, images);
-  info.preservedTextTokens = gptTextTokens(exactContext.text);
-  info.exactContextLines = exactContext.lineCount;
-  info.exactContextChars = exactContext.preservedChars;
-  info.baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
-  info.compressedChars = combinedRaw.length;
-  info.bucketChars = { static_slab: combinedRaw.length };
-  info.systemSha8 = await sha8(combined);
+  const nativeOverheadTokens = exactContextPlan
+    ? Math.max(
+        0,
+        gptTextTokens(exactContextPlan.text) - gptTextTokens(exactContextPlan.protectedText),
+      )
+      + systemTexts.length * gptTextTokens(RESPONSES_POINTER)
+      + gptTextTokens(RESPONSES_END_MARKER)
+    : gptTextTokens(exactContextManifest!.text);
+  info.preservedTextTokens = nativeOverheadTokens;
+  info.exactContextLines = exactContextPlan?.lineCount ?? exactContextManifest!.lineCount;
+  info.exactContextChars = exactContextPlan?.preservedChars ?? exactContextManifest!.preservedChars;
+  info.baselineImagedTokens = exactContextPlan
+    ? gptTextTokens(exactContextPlan.imageableText)
+    : gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
+  info.compressedChars = imageableChars;
+  info.bucketChars = { static_slab: imageableChars };
+  info.systemSha8 = await sha8(exactContextPlan?.imageableText ?? combined);
   info.firstImagePng = images[0]!.png;
   info.firstImageWidth = images[0]!.width;
   info.firstImageHeight = images[0]!.height;
@@ -1164,10 +1244,12 @@ export async function transformOpenAIResponses(
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map(responsesImagePart);
-  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
-  const exactContextParts: ResponsesInputTextPart[] = exactContext.text
-    ? [{ type: 'input_text', text: exactContext.text }]
-    : [];
+  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: RESPONSES_END_MARKER };
+  const exactContextParts: ResponsesInputTextPart[] = exactContextPlan
+    ? exactContextPlan.nativeParts.map((text) => ({ type: 'input_text', text }))
+    : exactContextManifest!.text
+      ? [{ type: 'input_text', text: exactContextManifest!.text }]
+      : [];
 
   if (inputWasString) {
     // Wrap bare string input into a user item with images prepended.
@@ -1213,7 +1295,9 @@ export async function transformOpenAIResponses(
       if (typeof content === 'string') {
         if (content.length > 0) it.content = RESPONSES_POINTER;
       } else if (Array.isArray(content) && responsesContentText(content).length > 0) {
-        it.content = [{ type: 'input_text', text: RESPONSES_POINTER }];
+        it.content = selectiveSolContext
+          ? replaceResponsesTextWithPointer(content, RESPONSES_POINTER)
+          : [{ type: 'input_text', text: RESPONSES_POINTER }];
       }
     }
   }
