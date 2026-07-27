@@ -5,6 +5,7 @@
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
 import { canEnableFromDashboard, readerValidation } from '../core/applicability.js';
+import { getAllModelProfiles, resolveModelProfile, type PxpipeModelProfile } from '../core/model-registry.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -53,6 +54,34 @@ function shortPath(p: string | null | undefined): string {
   return parts[parts.length - 1] || p;
 }
 
+/** Format context window tokens into compact UI badge string (e.g. '1M', '2M', '262K', '128K', '524K', '500K', '200K'). */
+export function formatContextBadge(tokens: number | null | undefined): string {
+  if (tokens == null || tokens <= 0) return '';
+  const v = Math.round(Number(tokens));
+
+  // Canonical overrides for standard LLM context window bounds
+  if (v === 2_097_152) return '2M';
+  if (v === 1_048_576 || v === 1_050_000 || v === 1_000_000) return '1M';
+  if (v === 524_288) return '524K';
+  if (v === 500_000) return '500K';
+  if (v === 262_144) return '262K';
+  if (v === 200_000) return '200K';
+  if (v === 131_072 || v === 128_000) return '128K';
+
+  if (v >= 1_000_000) {
+    const m = v / 1_000_000;
+    return `${Math.round(m)}M`;
+  }
+  if (v >= 1000) {
+    if (v % 1024 === 0 && (v / 1024) <= 128) {
+      return `${v / 1024}K`;
+    }
+    const k = v / 1000;
+    return `${Math.round(k)}K`;
+  }
+  return String(v);
+}
+
 // ---- compression toggle (kill switch) ------------------------------------
 
 export function renderToggleFragment(enabled: boolean): string {
@@ -78,114 +107,61 @@ export function renderToggleFragment(enabled: boolean): string {
 
 // ---- compress scope (which models get imaged) ----------------------------
 
-/** Chip catalog — UNION with env scope + active set, so env-var models stay toggleable. Labels are cosmetic. */
-const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'claude-fable-5', label: 'Fable 5' },
-  { id: 'claude-opus-4-8', label: 'Opus 4.8' },
-  { id: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { id: 'claude-opus-4-6', label: 'Opus 4.6' },
-  { id: 'claude-sonnet-5', label: 'Sonnet 5' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
-];
-
-const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol' },
-  { id: 'gpt-5.6', label: 'GPT 5.6' },
-  { id: 'gpt-5.5', label: 'GPT 5.5' },
-  { id: 'gpt-5.4', label: 'GPT 5.4' },
-];
-
-const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'grok-4.5', label: 'Grok 4.5' },
-  { id: 'grok-4', label: 'Grok 4' },
-];
-
-const GEMINI_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash' },
-  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
-  { id: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
-  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
-];
-
-const DEEPSEEK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
-  { id: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
-  { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner' },
-];
-
 export function renderModelsFragment(
   active: string[],
   configured: string[],
   enabled: boolean,
 ): string {
-  const on = new Set(active);
-  const labelOf = new Map(
-    [
-      ...MODEL_CATALOG,
-      ...GPT_MODEL_CATALOG,
-      ...GROK_MODEL_CATALOG,
-      ...GEMINI_MODEL_CATALOG,
-      ...DEEPSEEK_MODEL_CATALOG,
-    ].map((m) => [m.id, m.label]),
-  );
-  // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // families always show as toggles, then split by family for the sections.
-  const ids: string[] = [];
-  const seen = new Set<string>();
-  for (const id of [
-    ...MODEL_CATALOG.map((m) => m.id),
-    ...GPT_MODEL_CATALOG.map((m) => m.id),
-    ...GROK_MODEL_CATALOG.map((m) => m.id),
-    ...GEMINI_MODEL_CATALOG.map((m) => m.id),
-    ...DEEPSEEK_MODEL_CATALOG.map((m) => m.id),
-    ...configured,
-    ...active,
-  ]) {
-    if (id && !seen.has(id)) {
-      seen.add(id);
-      ids.push(id);
+  const on = new Set(active.map((a) => a.toLowerCase()));
+  const registeredProfiles = getAllModelProfiles();
+
+  const profiles: PxpipeModelProfile[] = [...registeredProfiles];
+  const seen = new Set<string>(registeredProfiles.map((p) => p.canonicalId.toLowerCase()));
+
+  for (const id of [...configured, ...active]) {
+    if (!id) continue;
+    const lower = id.toLowerCase();
+    if (!seen.has(lower)) {
+      const resolved = resolveModelProfile(id);
+      if (resolved && !seen.has(resolved.canonicalId.toLowerCase())) {
+        seen.add(resolved.canonicalId.toLowerCase());
+        profiles.push(resolved);
+      }
     }
   }
-  const chipFor = (id: string): string => {
-    const lit = on.has(id);
-    const label = labelOf.get(id) ?? id;
-    // OFF is always clickable; an ON button only exists for validated
-    // imaged-readers or PXPIPE_MODELS env opt-ins. Weak readers turn
-    // compression into confident confabulation (FINDINGS.md), so the enable
-    // button is locked, not merely discouraged. Server-side twin:
-    // Dashboard.handleModelsToggle refuses the same enables.
+
+  const chipFor = (p: PxpipeModelProfile): string => {
+    const id = p.canonicalId;
+    const lowerId = id.toLowerCase();
+    const lit = on.has(lowerId);
+    const label = p.displayName || id;
+    const badge = formatContextBadge(p.contextWindowTokens);
+    const badgeHtml = badge ? `<span class="badge-ctx">${badge}</span>` : '';
+
     if (!lit && !canEnableFromDashboard(id)) {
       const v = readerValidation(id);
       return (
         `<button class="chip locked" type="button" disabled ` +
         `title="${escapeHtml(`${v.status}: ${v.note} — set PXPIPE_MODELS to override`)}">` +
-        `${escapeHtml(label)} 🔒</button>`
+        `${escapeHtml(label)}${badgeHtml} 🔒</button>`
       );
     }
     return (
       `<button class="chip${lit ? ' on' : ''}" type="button" ` +
       `hx-post="/fragments/models" hx-target="#frag-models" ` +
-      `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
+      `hx-vals='{"model":"${escapeHtml(id)}","on":${!lit}}'>` +
+      `${escapeHtml(label)}${badgeHtml}${lit ? ' ✓' : ''}</button>`
     );
   };
-  const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
-  const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
-  const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
-  const geminiChips = ids.filter((id) => id.startsWith('gemini')).map(chipFor).join('');
-  const deepseekChips = ids.filter((id) => id.startsWith('deepseek')).map(chipFor).join('');
-  const otherChips = ids
-    .filter(
-      (id) =>
-        !id.startsWith('claude') &&
-        !id.startsWith('gpt') &&
-        !id.startsWith('grok') &&
-        !id.startsWith('gemini') &&
-        !id.startsWith('deepseek'),
-    )
-    .map(chipFor)
-    .join('');
+
+  const claudeChips = profiles.filter((p) => p.family === 'claude').map(chipFor).join('');
+  const gptChips = profiles.filter((p) => p.family === 'openai').map(chipFor).join('');
+  const grokChips = profiles.filter((p) => p.family === 'grok').map(chipFor).join('');
+  const agyChips = profiles.filter((p) => p.family === 'agy' || p.family === 'gemini').map(chipFor).join('');
+  const nvidiaChips = profiles.filter((p) => p.family === 'nvidia').map(chipFor).join('');
+
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
+
   return (
     `<div class="models">` +
     `<span class="models-label">Image Claude models</span>` +
@@ -193,24 +169,23 @@ export function renderModelsFragment(
     `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS · 🔒 = weak/unvalidated imaged-reader (FINDINGS.md), env opt-in only</span>${moot}` +
     `</div>` +
     `<div class="models">` +
+    `<span class="models-label">Image OpenAI / Codex models</span>` +
+    gptChips +
+    `<span class="hint">imaging only, no Anthropic cache_control · set PXPIPE_MODELS to persist</span>${moot}` +
+    `</div>` +
+    `<div class="models">` +
     `<span class="models-label">Image Grok models</span>` +
     grokChips +
     `<span class="hint">opt-in only · OpenAI Responses path · set PXPIPE_MODELS to persist</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image GPT models</span>` +
-    gptChips +
-    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
-    `</div>` +
-    `<div class="models">` +
-    `<span class="models-label">Image Gemini models</span>` +
-    geminiChips +
+    `<span class="models-label">Image AGY Proxy models</span>` +
+    agyChips +
     `<span class="hint">imaging only · set PXPIPE_MODELS to persist</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image DeepSeek models</span>` +
-    deepseekChips +
-    otherChips +
+    `<span class="models-label">Image NVIDIA NIM Flagships</span>` +
+    nvidiaChips +
     `<span class="hint">imaging only · set PXPIPE_MODELS to persist</span>${moot}` +
     `</div>`
   );
@@ -1025,6 +1000,35 @@ const CSS = `
     font-weight: 600; }
   .chip.locked { opacity: .45; cursor: not-allowed; }
   .chip.locked:hover { border-color: var(--border-strong); color: var(--ink-2); }
+  /* context badges inside model chips */
+  .badge-ctx {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: var(--mono);
+    line-height: 1.2;
+    padding: 1px 5px;
+    margin-left: 2px;
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--ink-2);
+    border: 1px solid var(--border-strong);
+    vertical-align: 1px;
+    font-variant-numeric: tabular-nums;
+  }
+  .chip.on .badge-ctx {
+    background: var(--surface);
+    color: var(--flame-ink);
+    border-color: var(--flame);
+  }
+  .chip:hover .badge-ctx {
+    border-color: var(--flame);
+  }
+  .chip.locked .badge-ctx {
+    background: var(--surface-2);
+    color: var(--muted);
+    border-color: var(--border);
+  }
 
   /* session hero */
   #frag-session { display: block; margin-bottom: 16px; }

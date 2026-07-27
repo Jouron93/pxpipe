@@ -47,7 +47,14 @@ let runtimeModelBases: readonly string[] | null = null;
  *  - Grok 4.5 — 82/100 arithmetic, 83/98 gist, and 13/18 state tracking.
  *  Both profiles remain available for explicit opt-in.
  *  Silently imaging weak or unvalidated readers is the wrong default. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5'];
+import { resolveModelProfile, getAllModelProfiles } from './model-registry.js';
+
+function getDefaultModelBases(): string[] {
+  const enabled = getAllModelProfiles()
+    .filter((p) => p.enabledByDefault)
+    .map((p) => p.canonicalId);
+  return enabled.length > 0 ? enabled : ['claude-fable-5'];
+}
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
@@ -61,9 +68,9 @@ function falsey(v: string): boolean {
 function envOrDefaultBases(): string[] {
   // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
   const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
-  if (raw === undefined) return [...DEFAULT_MODEL_BASES];
+  if (raw === undefined) return getDefaultModelBases();
   const trimmed = raw.trim();
-  if (!trimmed) return [...DEFAULT_MODEL_BASES];
+  if (!trimmed) return getDefaultModelBases();
   if (falsey(trimmed)) return [];
   return trimmed.split(',').map((s) => s.trim()).filter(Boolean);
 }
@@ -100,31 +107,31 @@ export type PxpipeReaderValidation = {
   readonly note: string;
 };
 
-const READER_VALIDATION: Readonly<Record<string, PxpipeReaderValidation>> = {
-  'claude-fable-5': { status: 'validated', note: '100/100 novel arithmetic, 13/15 verbatim, 98/98 gist parity (FINDINGS.md 2026-06-10/11)' },
-  'claude-opus-4-8': { status: 'degraded', note: '6/15 dense-hex; confident confabulation on imaged detail (FINDINGS.md 2026-06-12/16)' },
-  'claude-opus-4-7': { status: 'degraded', note: 'Opus imaged-reading failure family; disabled alongside 4.8 (FINDINGS.md)' },
-  'claude-opus-4-6': { status: 'degraded', note: 'Opus imaged-reading failure family; disabled alongside 4.8 (FINDINGS.md)' },
-  'claude-sonnet-5': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'claude-sonnet-4-6': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'claude-haiku-4-5': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'gpt-5.6-sol': { status: 'degraded', note: '98/100 arithmetic but 0/15 dense-hex and 4/15 confabulation guard (FINDINGS.md 2026-07-09)' },
-  'gpt-5.6': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'gpt-5.5': { status: 'degraded', note: 'degrades on imaged history/context (FINDINGS.md)' },
-  'gpt-5.4': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'grok-4.5': { status: 'degraded', note: '82/100 arithmetic, 83/98 gist, 13/18 state tracking (FINDINGS.md)' },
-  'grok-4': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'gemini-3.5-flash': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'gemini-3.1-pro': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'gemini-3.1-flash-lite': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'deepseek-v4-pro': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'deepseek-v4-flash': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-  'deepseek-reasoner': { status: 'unvalidated', note: 'no imaged-reading benchmark yet' },
-};
-
 /** Verdict for a model base; unknown ids fail closed as 'unvalidated'. */
 export function readerValidation(base: string): PxpipeReaderValidation {
-  return READER_VALIDATION[base] ?? { status: 'unvalidated', note: 'no imaged-reading benchmark for this model' };
+  const profile = resolveModelProfile(base);
+  let note = `no imaged-reading benchmark for ${profile.displayName}`;
+  if (profile.canonicalId === 'claude-fable-5') {
+    note = '100/100 novel arithmetic, 13/15 verbatim, 98/98 gist parity (FINDINGS.md 2026-06-10/11)';
+  } else if (profile.canonicalId === 'claude-opus-4-8') {
+    note = '6/15 dense-hex; confident confabulation on imaged detail (FINDINGS.md 2026-06-12/16)';
+  } else if (profile.canonicalId.startsWith('claude-opus-4-')) {
+    note = 'Opus imaged-reading failure family; disabled alongside 4.8 (FINDINGS.md)';
+  } else if (profile.canonicalId === 'gpt-5.6-sol') {
+    note = '98/100 arithmetic but 0/15 dense-hex and 4/15 confabulation guard (FINDINGS.md 2026-07-09)';
+  } else if (profile.canonicalId === 'gpt-5.5') {
+    note = 'degrades on imaged history/context (FINDINGS.md)';
+  } else if (profile.canonicalId === 'grok-4.5') {
+    note = '82/100 arithmetic, 83/98 gist, 13/18 state tracking (FINDINGS.md)';
+  } else if (profile.status === 'validated') {
+    note = `${profile.displayName} is validated for imaged reading.`;
+  } else if (profile.status === 'degraded') {
+    note = `${profile.displayName} degrades on imaged history/context.`;
+  }
+  return {
+    status: profile.status,
+    note,
+  };
 }
 
 /** True when the dashboard may turn this base ON at runtime: validated readers
@@ -140,7 +147,8 @@ export function canEnableFromDashboard(base: string): boolean {
 function isAllowed(model: string | null | undefined): boolean {
   if (typeof model !== 'string') return false;
   const base = baseModelId(model);
-  return allowedModelBases().some((b) => base === b || base.startsWith(`${b}-`));
+  const allowed = allowedModelBases();
+  return allowed.some((b) => base === b || base.startsWith(`${b}-`));
 }
 
 /** True when pxpipe may transform this Anthropic model. */

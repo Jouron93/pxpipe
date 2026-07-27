@@ -15,7 +15,7 @@ import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicab
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
-import { renderPage } from '../src/dashboard/fragments.js';
+import { renderPage, formatContextBadge } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -188,15 +188,15 @@ describe('serveFragment', () => {
       delete process.env.PXPIPE_MODELS;
       setAllowedModelBases(null); // reset to built-in Fable-only default
       const off = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(off).toContain('Image GPT models');
+      expect(off).toContain('Image OpenAI / Codex models');
       expect(off).not.toContain('<div class="models" style="display:none">');
       // Weak/unvalidated readers render locked: disabled, no hx-post, 🔒 marker.
-      expect(off).toContain('GPT 5.6 Sol 🔒</button>');
-      expect(off).toContain('GPT 5.5 🔒</button>');
+      expect(off).toContain('GPT 5.6 Sol<span class="badge-ctx">262K</span> 🔒</button>');
+      expect(off).toContain('GPT 5.5<span class="badge-ctx">1M</span> 🔒</button>');
       // Sol remains visible and ordered before GPT 5.5.
       expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
       // Validated Fable 5 stays a live, lit toggle.
-      expect(off).toContain('Fable 5 ✓');
+      expect(off).toContain('Claude 5 Fable<span class="badge-ctx">1M</span> ✓');
       expect(getAllowedModelBases()).toContain('claude-fable-5');
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
 
@@ -210,8 +210,8 @@ describe('serveFragment', () => {
       process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.5';
       setAllowedModelBases(null); // drop runtime override so env scope is read
       const envScoped = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(envScoped).toContain('GPT 5.5 ✓');
-      expect(envScoped).toContain('GPT 5.6 Sol 🔒</button>');
+      expect(envScoped).toContain('GPT 5.5<span class="badge-ctx">1M</span> ✓');
+      expect(envScoped).toContain('GPT 5.6 Sol<span class="badge-ctx">262K</span> 🔒</button>');
       dash.handleModelsToggle('gpt-5.5', false); // OFF is never gated
       expect(getAllowedModelBases()).not.toContain('gpt-5.5');
       dash.handleModelsToggle('gpt-5.5', true); // env-configured → ON allowed
@@ -221,6 +221,21 @@ describe('serveFragment', () => {
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
       else process.env.PXPIPE_MODELS = prev;
     }
+  });
+
+  it('renders per-family toggle chip sections with context badges across all 5 model families', async () => {
+    const html = await (await dash.serveFragment('models', url, 1234)).text();
+    expect(html).toContain('Image Claude models');
+    expect(html).toContain('Image OpenAI / Codex models');
+    expect(html).toContain('Image Grok models');
+    expect(html).toContain('Image AGY Proxy models');
+    expect(html).toContain('Image NVIDIA NIM Flagships');
+
+    // Context badges check
+    expect(html).toContain('<span class="badge-ctx">1M</span>');
+    expect(html).toContain('<span class="badge-ctx">2M</span>');
+    expect(html).toContain('<span class="badge-ctx">262K</span>');
+    expect(html).toContain('<span class="badge-ctx">128K</span>');
   });
 
   it('renders header + recent + stats fragments from the same payloads as JSON', async () => {
@@ -756,5 +771,23 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     expect(row.baseline_input).toBe(12000);
     expect(row.baseline_input).not.toBe(35000); // the inflated cold-priced bug value
     expect(row.session_saved_so_far_delta).toBe(9900);
+  });
+});
+
+describe('formatContextBadge', () => {
+  it('formats context window token counts into compact UI badges', () => {
+    expect(formatContextBadge(2_097_152)).toBe('2M');
+    expect(formatContextBadge(1_048_576)).toBe('1M');
+    expect(formatContextBadge(1_050_000)).toBe('1M');
+    expect(formatContextBadge(1_000_000)).toBe('1M');
+    expect(formatContextBadge(524_288)).toBe('524K');
+    expect(formatContextBadge(500_000)).toBe('500K');
+    expect(formatContextBadge(262_144)).toBe('262K');
+    expect(formatContextBadge(200_000)).toBe('200K');
+    expect(formatContextBadge(131_072)).toBe('128K');
+    expect(formatContextBadge(128_000)).toBe('128K');
+    expect(formatContextBadge(null)).toBe('');
+    expect(formatContextBadge(undefined)).toBe('');
+    expect(formatContextBadge(0)).toBe('');
   });
 });

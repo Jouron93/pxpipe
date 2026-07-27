@@ -283,6 +283,8 @@ function envProfiles(): Map<string, GptModelProfile> {
   return envMap;
 }
 
+import { resolveModelProfile } from './model-registry.js';
+
 export function resolveGptProfile(model: string | null | undefined): GptModelProfile {
   // Match applicability.ts: bracketed transport variants (for example [1m])
   // do not define a different visual reader profile.
@@ -299,7 +301,14 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
     }
     if (best) return best;
   }
-  return resolveBuiltin(m);
+  const builtin = resolveBuiltin(m);
+  const registryProfile = resolveModelProfile(model ?? '');
+  return {
+    vision: builtin.vision,
+    stripCols: registryProfile.renderProfile.stripCols,
+    maxHeightPx: registryProfile.renderProfile.maxHeightPx,
+    style: registryProfile.renderProfile.style,
+  };
 }
 
 /**

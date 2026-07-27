@@ -1236,6 +1236,41 @@ export function createProxy(config: ProxyConfig = {}) {
       ),
     );
 
+    const isModelsReq = url.pathname === '/v1/models'
+      || url.pathname.startsWith('/v1/models/')
+      || url.pathname === '/openai/v1/models'
+      || url.pathname.startsWith('/openai/v1/models/');
+
+    if (isModelsReq && upstreamRes.status === 200) {
+      try {
+        const text = await teed.text();
+        const json = JSON.parse(text) as Record<string, unknown>;
+        if (json && typeof json === 'object') {
+          let modified = false;
+          if (Array.isArray(json.data) && !Array.isArray(json.models)) {
+            json.models = json.data;
+            modified = true;
+          } else if (Array.isArray(json.models) && !Array.isArray(json.data)) {
+            json.data = json.models;
+            modified = true;
+          }
+          if (modified) {
+            const outText = JSON.stringify(json);
+            const resHeaders = filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS);
+            resHeaders.set('content-type', 'application/json; charset=utf-8');
+            resHeaders.set('content-length', String(Buffer.byteLength(outText)));
+            return new Response(outText, {
+              status: upstreamRes.status,
+              statusText: upstreamRes.statusText,
+              headers: resHeaders,
+            });
+          }
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+
     return new Response(teed.body, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,

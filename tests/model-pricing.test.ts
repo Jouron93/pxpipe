@@ -213,4 +213,30 @@ describe('provider-aware model pricing', () => {
       outputPerMtok: 30,
     });
   });
+
+  describe('model-registry integration in rate resolution', () => {
+    it('propagates exact context window sizes from model-registry profiles', () => {
+      expect(resolveModelRate('claude-opus-4-8').contextWindowTokens).toBe(1_048_576);
+      expect(resolveModelRate('agy-gemini-3.6-flash-high').contextWindowTokens).toBe(2_097_152);
+      expect(resolveModelRate('nvidia/nemotron-3-ultra-550b-a55b', 0, {
+        billingLaneSource: 'configured_route',
+        billingLane: 'nvidia_build_free',
+      }).contextWindowTokens).toBe(1_048_576);
+      expect(resolveModelRate('nvidia/nemotron-3-super-120b-a12b', 0, {
+        billingLaneSource: 'configured_route',
+        billingLane: 'nvidia_build_free',
+      }).contextWindowTokens).toBe(262_144);
+    });
+
+    it('resolves model aliases through model-registry for rate cards', () => {
+      const rateOpus = resolveModelRate('claude-opus-4-8');
+      expect(rateOpus.canonicalModel).toBe('claude-opus-5');
+      expect(rateOpus.inputPerMtok).toBe(5);
+      expect(rateOpus.outputPerMtok).toBe(25);
+
+      const rateFable = resolveModelRate('fable-5');
+      expect(rateFable.canonicalModel).toBe('claude-fable-5');
+      expect(rateFable.inputPerMtok).toBe(10);
+    });
+  });
 });

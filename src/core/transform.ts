@@ -38,6 +38,7 @@ import {
 } from './render.js';
 import { envStyleOverride } from './gpt-model-profiles.js';
 import { factSheetText } from './factsheet.js';
+import { resolveModelProfile } from './model-registry.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
@@ -657,6 +658,10 @@ export interface TransformInfo {
    *  didn't (exclude from rollup — cacheable=0 fallback is dishonest). 'failed': no
    *  baseline. undefined: no probe attempted. */
   baselineProbeStatus?: 'ok' | 'partial' | 'failed';
+  modelId?: string;
+  modelCanonicalId?: string;
+  contextWindowTokens?: number;
+  maxOutputTokens?: number;
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1540,6 +1545,14 @@ export async function transformRequest(
   } catch (e) {
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
+  }
+  if ((req as { model?: string }).model) {
+    const modelStr = (req as { model?: string }).model!;
+    const profile = resolveModelProfile(modelStr);
+    info.modelId = modelStr;
+    info.modelCanonicalId = profile.canonicalId;
+    info.contextWindowTokens = profile.contextWindowTokens;
+    info.maxOutputTokens = profile.maxOutputTokens;
   }
   // Per-model density override from the same PXPIPE_GPT_PROFILES env map the GPT
   // path uses. undefined for models with no explicit entry → every render below

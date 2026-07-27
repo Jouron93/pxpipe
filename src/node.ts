@@ -37,6 +37,7 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+import { applyRuntimeConfigOverrides } from './core/model-registry.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -75,16 +76,28 @@ function normalizeModelsConfig(value: unknown): string | undefined {
 
 function applyConfigFileDefaults(): void {
   const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
-  if (!fs.existsSync(file)) return;
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
-  } catch (e) {
-    console.warn(`[pxpipe] ignored invalid config ${file}: ${(e as Error).message}`);
+  if (fs.existsSync(file)) {
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
+    } catch (e) {
+      console.warn(`[pxpipe] ignored invalid config ${file}: ${(e as Error).message}`);
+      return;
+    }
+  } else if (process.env.PXPIPE_CONFIG && process.env.PXPIPE_CONFIG.trim().startsWith('{')) {
+    try {
+      parsed = JSON.parse(process.env.PXPIPE_CONFIG) as unknown;
+    } catch {
+      // Ignore invalid JSON string
+    }
+  } else {
     return;
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
   const cfg = parsed as Record<string, unknown>;
+
+  // Apply per-model configuration overrides to model-registry
+  applyRuntimeConfigOverrides(cfg);
 
   // Env wins over file config. The dashboard can still override the scope at
   // runtime (in-memory) for an emergency live flip.

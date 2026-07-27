@@ -22,6 +22,7 @@ import {
   resolveGptProfile,
   type GptVisionCost,
 } from './gpt-model-profiles.js';
+import { resolveModelProfile } from './model-registry.js';
 import { bytesToBase64 } from './png.js';
 import {
   compactSlabWhitespace,
@@ -809,6 +810,13 @@ export async function transformOpenAIChatCompletions(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  if (req.model) {
+    const profile = resolveModelProfile(req.model);
+    info.modelId = req.model;
+    info.modelCanonicalId = profile.canonicalId;
+    info.contextWindowTokens = profile.contextWindowTokens;
+    info.maxOutputTokens = profile.maxOutputTokens;
+  }
   if (!Array.isArray(req.messages)) {
     info.reason = 'parse_error: messages must be an array';
     return { body, info };
@@ -1002,6 +1010,13 @@ export async function transformOpenAIResponses(
   } catch (e) {
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
+  }
+  if (req.model) {
+    const profile = resolveModelProfile(req.model);
+    info.modelId = req.model;
+    info.modelCanonicalId = profile.canonicalId;
+    info.contextWindowTokens = profile.contextWindowTokens;
+    info.maxOutputTokens = profile.maxOutputTokens;
   }
 
   // Normalize input to an array; preserve original string for wrap-back if needed.

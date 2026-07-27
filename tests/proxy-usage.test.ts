@@ -1660,4 +1660,31 @@ describe('proxy usage extraction', () => {
     expect(captured).toBeDefined();
     expect(captured!.stopReason).toBeUndefined();
   });
+
+  it('augments /v1/models response to include both data and models keys', async () => {
+    const mockData = [
+      { id: 'gpt-5.6-sol', object: 'model', created: 1782228018, owned_by: 'system' },
+    ];
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          JSON.stringify({ object: 'list', data: mockData }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    );
+
+    const proxy = createProxy({ transform: {} });
+    const res = await proxy(
+      new Request('http://127.0.0.1/v1/models', {
+        method: 'GET',
+        headers: { authorization: 'Bearer test' },
+      }),
+    );
+    const json = await res.json() as { data?: unknown[]; models?: unknown[] };
+    restore();
+
+    expect(res.status).toBe(200);
+    expect(json.data).toEqual(mockData);
+    expect(json.models).toEqual(mockData);
+  });
 });

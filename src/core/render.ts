@@ -146,6 +146,7 @@ function grayGlyph(codepoint: number, font: RenderFont | undefined): { atlas: Gr
  *  encoder at ~2.8×4.4 px. New page shape 1568×728 = 1,141,504 px fits both bounds →
  *  WYSIWYG for the vision encoder (also satisfies ≤2000 px/side for >20-image requests). */
 export const MAX_HEIGHT_PX = 728;
+export const ABSOLUTE_MAX_HEIGHT_PX = 1932;
 /** Char budget for the static slab (system + tools + CLAUDE.md). Matches physical page
  *  capacity at 312 cols × 90 rows so image-count estimates track real pagination. */
 export const READABLE_CHARS_PER_IMAGE = 28080;
@@ -794,7 +795,8 @@ export async function renderChunkToPng(
       ? wrapLines(slotText, cols, markerScale, style.font)
       : null;
 
-  const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
+  const effectiveMaxH = Math.min(maxHeightPx, ABSOLUTE_MAX_HEIGHT_PX);
+  const maxLines = Math.max(1, Math.floor((effectiveMaxH - 2 * PAD_Y) / cellH));
   const fitLines = lines.slice(0, maxLines);
   const fitSlotLines = slotLines ? slotLines.slice(0, maxLines) : null;
 
