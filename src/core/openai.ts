@@ -1089,7 +1089,16 @@ export async function transformOpenAIResponses(
     req, inputWasString, originalInputString, inputItems,
   );
 
-  const selectiveSolContext = req.model === 'gpt-5.6-sol';
+  // The whole gpt-5.6 family shares this Responses wire shape and is either
+  // 'degraded' (sol: 0/15 dense-hex) or 'unvalidated' (terra, luna) as an imaged
+  // reader, so all of them need the selective path: precision-sensitive source
+  // blocks are lifted out of the rendered slab and carried in bounded native
+  // parts. Restricting it to sol left terra/luna imaging via the legacy single
+  // manifest, which both fails closed above 32,768 chars and gives them no
+  // precision protection at all.
+  const selectiveExactContext = /^gpt-5[.-]6(\b|[-_])/.test(
+    (req.model ?? '').trim().toLowerCase(),
+  );
 
   // Collect static context: instructions + system/developer items + flat tools.
   const authorityDocs: string[] = [];
@@ -1114,13 +1123,13 @@ export async function transformOpenAIResponses(
 
   // Keep Sol tools native until source-span accounting can distinguish stripped
   // tool-description tokens from structure that remains in the native JSON.
-  const { tools: rewrittenTools, docs: toolDocs } = o.compressTools && !selectiveSolContext
+  const { tools: rewrittenTools, docs: toolDocs } = o.compressTools && !selectiveExactContext
     ? rewriteFlatToolsForGpt(req.tools)
     : { tools: req.tools, docs: '' };
 
   // Sol's selective baseline is original authority text only. Synthetic role
   // headings and tool-doc renderings must not inflate claimed token savings.
-  const combinedRaw = selectiveSolContext
+  const combinedRaw = selectiveExactContext
     ? systemTexts.join('\n\n')
     : [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
@@ -1133,10 +1142,10 @@ export async function transformOpenAIResponses(
   // precision-sensitive source blocks from the rendered slab and carry them in
   // independently bounded native parts. Other Responses models retain the legacy
   // manifest behavior until they have model-specific reader validation.
-  const exactContextPlan = selectiveSolContext
+  const exactContextPlan = selectiveExactContext
     ? buildExactContextPlanFromDocuments(systemTexts)
     : undefined;
-  const exactContextManifest = selectiveSolContext
+  const exactContextManifest = selectiveExactContext
     ? undefined
     : buildExactContextManifest(combinedRaw);
   const exactContextComplete = exactContextPlan?.complete ?? exactContextManifest!.complete;
@@ -1301,7 +1310,7 @@ export async function transformOpenAIResponses(
       if (typeof content === 'string') {
         if (content.length > 0) it.content = RESPONSES_POINTER;
       } else if (Array.isArray(content) && responsesContentText(content).length > 0) {
-        it.content = selectiveSolContext
+        it.content = selectiveExactContext
           ? replaceResponsesTextWithPointer(content, RESPONSES_POINTER)
           : [{ type: 'input_text', text: RESPONSES_POINTER }];
       }
