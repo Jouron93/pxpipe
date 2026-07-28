@@ -45,7 +45,10 @@ import {
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { factSheetText } from './factsheet.js';
-import { buildExactContextManifest, buildExactContextPlan } from './exact-context.js';
+import {
+  buildExactContextManifest,
+  buildExactContextPlanFromDocuments,
+} from './exact-context.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
@@ -1131,7 +1134,7 @@ export async function transformOpenAIResponses(
   // independently bounded native parts. Other Responses models retain the legacy
   // manifest behavior until they have model-specific reader validation.
   const exactContextPlan = selectiveSolContext
-    ? buildExactContextPlan(combinedRaw)
+    ? buildExactContextPlanFromDocuments(systemTexts)
     : undefined;
   const exactContextManifest = selectiveSolContext
     ? undefined
@@ -1148,7 +1151,10 @@ export async function transformOpenAIResponses(
 
   const imageSourceRaw = exactContextPlan?.imageSource ?? combinedRaw;
   const imageableChars = exactContextPlan?.imageableChars ?? combinedRaw.length;
-  const combined = compactSlabWhitespace(imageSourceRaw).trimEnd();
+  const renderSourceRaw = exactContextPlan
+    ? imageSourceRaw.replace(/\r\n?/g, '\n')
+    : imageSourceRaw;
+  const combined = compactSlabWhitespace(renderSourceRaw).trimEnd();
   if (imageableChars < o.minCompressChars) {
     info.reason = `below_min_chars (${imageableChars} < ${o.minCompressChars})`;
     return { body, info };

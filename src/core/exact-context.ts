@@ -103,17 +103,76 @@ function isPrecisionSensitiveLine(line: string): boolean {
 }
 
 interface ClassifiedExactContext {
-  readonly lines: readonly string[];
+  readonly lines: readonly SourceLine[];
   readonly sharpLines: ReadonlySet<number>;
   readonly headingLines: ReadonlySet<number>;
 }
 
-function classifyExactContext(source: string): ClassifiedExactContext {
-  const lines = source.split(/\r\n|\n|\r/);
+interface SourceLine {
+  readonly text: string;
+  readonly ending: '\r\n' | '\n' | '\r' | '';
+  readonly documentIndex: number;
+  readonly synthetic: boolean;
+}
+
+function splitSourceLines(source: string, documentIndex = 0): SourceLine[] {
+  const lines: SourceLine[] = [];
+  let start = 0;
+  let cursor = 0;
+
+  while (cursor < source.length) {
+    const char = source[cursor]!;
+    if (char !== '\r' && char !== '\n') {
+      cursor++;
+      continue;
+    }
+
+    const ending = char === '\r' && source[cursor + 1] === '\n'
+      ? '\r\n'
+      : char;
+    lines.push({
+      text: source.slice(start, cursor),
+      ending: ending as SourceLine['ending'],
+      documentIndex,
+      synthetic: false,
+    });
+    cursor += ending.length;
+    start = cursor;
+  }
+
+  lines.push({
+    text: source.slice(start),
+    ending: '',
+    documentIndex,
+    synthetic: false,
+  });
+  return lines;
+}
+
+function sourceDocumentLines(documents: readonly string[]): SourceLine[] {
+  const lines: SourceLine[] = [];
+  for (let documentIndex = 0; documentIndex < documents.length; documentIndex++) {
+    lines.push(...splitSourceLines(documents[documentIndex]!, documentIndex));
+    if (documentIndex === documents.length - 1) continue;
+
+    // Responses combines separate authority documents with two synthetic LFs for
+    // rendering and accounting. Keep them independent from either document's
+    // source endings so an unterminated or lone-CR protected line remains exact.
+    lines.push(
+      { text: '', ending: '\n', documentIndex: -1, synthetic: true },
+      { text: '', ending: '\n', documentIndex: -1, synthetic: true },
+    );
+  }
+  return lines;
+}
+
+function classifyExactContextDocuments(documents: readonly string[]): ClassifiedExactContext {
+  const lines = sourceDocumentLines(documents);
   const sharpLines = new Set<number>();
   const headingLines = new Set<number>();
   const activeHeadings = new Map<number, number>();
   let openFence: MarkdownFence | undefined;
+  let activeDocumentIndex = -1;
 
   const preserveWithHeadings = (lineIndex: number): void => {
     sharpLines.add(lineIndex);
@@ -121,7 +180,20 @@ function classifyExactContext(source: string): ClassifiedExactContext {
   };
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!;
+    const sourceLine = lines[i]!;
+    if (sourceLine.synthetic) {
+      activeHeadings.clear();
+      openFence = undefined;
+      activeDocumentIndex = -1;
+      continue;
+    }
+    if (sourceLine.documentIndex !== activeDocumentIndex) {
+      activeHeadings.clear();
+      openFence = undefined;
+      activeDocumentIndex = sourceLine.documentIndex;
+    }
+
+    const line = sourceLine.text;
     const heading = /^ {0,3}(#{1,6})\s/.exec(line);
     if (heading) {
       const level = heading[1]!.length;
@@ -156,10 +228,16 @@ function classifyExactContext(source: string): ClassifiedExactContext {
   return { lines, sharpLines, headingLines };
 }
 
+function classifyExactContext(source: string): ClassifiedExactContext {
+  return classifyExactContextDocuments([source]);
+}
+
 interface ProtectedLine {
   readonly blockId: number;
   readonly lineIndex: number;
   readonly text: string;
+  readonly ending: SourceLine['ending'];
+  readonly documentIndex: number;
 }
 
 interface ProtectedBlock {
@@ -183,7 +261,7 @@ function nativeBlockMarker(blockId: number, startLineIndex: number, endLineIndex
 }
 
 function renderNativePart(lines: readonly ProtectedLine[]): string {
-  const body: string[] = [NATIVE_PART_OPEN];
+  let body = `${NATIVE_PART_OPEN}\n`;
   let start = 0;
   while (start < lines.length) {
     const first = lines[start]!;
@@ -196,12 +274,15 @@ function renderNativePart(lines: readonly ProtectedLine[]): string {
       end++;
     }
     const last = lines[end - 1]!;
-    body.push(nativeBlockMarker(first.blockId, first.lineIndex, last.lineIndex));
-    for (let i = start; i < end; i++) body.push(lines[i]!.text);
+    body += `${nativeBlockMarker(first.blockId, first.lineIndex, last.lineIndex)}\n`;
+    for (let i = start; i < end; i++) {
+      const line = lines[i]!;
+      body += line.text + line.ending;
+    }
     start = end;
   }
-  body.push(NATIVE_PART_CLOSE);
-  return body.join('\n');
+  if (lines[lines.length - 1]!.ending === '') body += '\n';
+  return body + NATIVE_PART_CLOSE;
 }
 
 function failedPlan(
@@ -239,10 +320,11 @@ function failedPlan(
  * A long individual source line or exhaustion of the explicit part bound is the
  * only reason to fail closed.
  */
-export function buildExactContextPlan(
-  source: string,
+function buildExactContextPlanInternal(
+  documents: readonly string[],
   limits: ExactContextPlanLimits = {},
 ): ExactContextPlan {
+  const source = documents.join('\n\n');
   if (!source) {
     return {
       imageSource: '',
@@ -261,18 +343,11 @@ export function buildExactContextPlan(
     };
   }
 
-  // The selective planner currently emits independently wrapped LF-delimited
-  // native parts. Fail closed instead of silently normalizing CRLF or lone-CR
-  // source that is promised to remain verbatim.
-  if (source.includes('\r')) {
-    return failedPlan(source.length, 0, 0, 0, 'unsupported_line_endings');
-  }
-
   const maxLines = positiveLimit(limits.maxLines, DEFAULT_MAX_LINES);
   const maxChars = positiveLimit(limits.maxChars, DEFAULT_MAX_CHARS);
   const maxLineChars = positiveLimit(limits.maxLineChars, DEFAULT_MAX_LINE_CHARS);
   const maxParts = positiveLimit(limits.maxParts, DEFAULT_MAX_PARTS);
-  const { lines, sharpLines, headingLines } = classifyExactContext(source);
+  const { lines, sharpLines, headingLines } = classifyExactContextDocuments(documents);
 
   if (sharpLines.size === 0) {
     return {
@@ -311,42 +386,58 @@ export function buildExactContextPlan(
   };
 
   let previousSharp = -2;
+  let previousDocumentIndex = -1;
   for (const lineIndex of [...protectedLineIndexes].sort((a, b) => a - b)) {
-    if (lineIndex !== previousSharp + 1) {
+    const line = lines[lineIndex]!;
+    if (
+      lineIndex !== previousSharp + 1
+      || line.documentIndex !== previousDocumentIndex
+    ) {
       finishBlock();
       blockId++;
     }
-    const line = lines[lineIndex]!;
-    if (line.length > maxLineChars) {
+    if (line.text.length > maxLineChars) {
       finishBlock();
       return failedPlan(
         source.length, protectedLineIndexes.size, blocks.length + 1, 0, 'line_too_long',
       );
     }
-    current.push({ blockId, lineIndex, text: line });
+    current.push({
+      blockId,
+      lineIndex,
+      text: line.text,
+      ending: line.ending,
+      documentIndex: line.documentIndex,
+    });
     previousSharp = lineIndex;
+    previousDocumentIndex = line.documentIndex;
   }
   finishBlock();
 
-  const imageLines: string[] = [];
-  const imageableLines: string[] = [];
+  const imageChunks: string[] = [];
+  const imageableChunks: string[] = [];
   const blockByStart = new Map(blocks.map((block) => [block.startLineIndex, block]));
   for (let i = 0; i < lines.length; i++) {
     const block = blockByStart.get(i);
     if (block) {
-      imageLines.push(nativeBlockMarker(block.id, block.startLineIndex, block.endLineIndex));
+      imageChunks.push(
+        nativeBlockMarker(block.id, block.startLineIndex, block.endLineIndex),
+        lines[block.endLineIndex]!.ending,
+      );
       i = block.endLineIndex;
       continue;
     }
     if (protectedLineIndexes.has(i)) continue;
-    imageLines.push(lines[i]!);
-    imageableLines.push(lines[i]!);
+    const line = lines[i]!;
+    const sourceLine = line.text + line.ending;
+    imageChunks.push(sourceLine);
+    imageableChunks.push(sourceLine);
   }
 
   const protectedLines = blocks.flatMap((block) => block.lines);
-  const protectedText = blocks
-    .map((block) => block.lines.map((line) => line.text).join('\n'))
-    .join('\n');
+  const protectedText = protectedLines
+    .map((line) => line.text + line.ending)
+    .join('');
   const nativeParts: string[] = [];
   let partLines: ProtectedLine[] = [];
 
@@ -359,6 +450,16 @@ export function buildExactContextPlan(
   };
 
   for (const line of protectedLines) {
+    if (
+      partLines.length > 0
+      && partLines[partLines.length - 1]!.documentIndex !== line.documentIndex
+      && !finishPart()
+    ) {
+      return failedPlan(
+        source.length, protectedLineIndexes.size, blocks.length, protectedText.length, 'too_many_parts',
+      );
+    }
+
     const candidate = [...partLines, line];
     const candidateText = renderNativePart(candidate);
     if (candidate.length <= maxLines && candidateText.length <= maxChars) {
@@ -387,8 +488,8 @@ export function buildExactContextPlan(
     );
   }
 
-  const imageSource = imageLines.join('\n');
-  const imageableText = imageableLines.join('\n');
+  const imageSource = imageChunks.join('');
+  const imageableText = imageableChunks.join('');
   const text = nativeParts.join('\n');
   return {
     imageSource,
@@ -405,6 +506,25 @@ export function buildExactContextPlan(
     nativeWrapperChars: text.length - protectedText.length,
     complete: true,
   };
+}
+
+export function buildExactContextPlan(
+  source: string,
+  limits: ExactContextPlanLimits = {},
+): ExactContextPlan {
+  return buildExactContextPlanInternal([source], limits);
+}
+
+/**
+ * Build one exact-context plan from distinct Responses authority documents.
+ * The synthetic two-LF separator remains imageable and is never attributed to
+ * either document's protected source bytes.
+ */
+export function buildExactContextPlanFromDocuments(
+  documents: readonly string[],
+  limits: ExactContextPlanLimits = {},
+): ExactContextPlan {
+  return buildExactContextPlanInternal(documents, limits);
 }
 
 /**
@@ -440,7 +560,7 @@ export function buildExactContextManifest(
 
   for (let i = 0; i < lines.length; i++) {
     if (sharpLines.has(i) || headingLines.has(i)) {
-      const line = lines[i]!;
+      const line = lines[i]!.text;
       if (line.length > maxLineChars) {
         return {
           text: '', lineCount: selected.length, sourceChars: source.length,

@@ -4,6 +4,7 @@ import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
 import {
   buildExactContextManifest,
   buildExactContextPlan,
+  buildExactContextPlanFromDocuments,
 } from '../src/core/exact-context.js';
 import {
   transformOpenAIChatCompletions,
@@ -53,6 +54,58 @@ function mixedAuthorityContext(targetChars: number): string {
   }
   return lines.join('\n');
 }
+
+type TestLineEnding = '\r\n' | '\n' | '\r';
+
+function joinSourceLines(
+  lines: readonly string[],
+  endings: readonly TestLineEnding[],
+): string {
+  return lines.map((line, index) =>
+    index === lines.length - 1
+      ? line
+      : line + endings[index % endings.length]!).join('');
+}
+
+function nativeLineEndingContext(
+  targetChars: number,
+  endings: readonly TestLineEnding[],
+): {
+  instructions: string;
+  protectedBlock: string;
+  protectedEnding: TestLineEnding;
+  protectedLine: string;
+} {
+  const protectedLine = 'trace_id=a1b2c3d4e5f6 lane=x7';
+  const lines = [
+    'This native Windows authority preface uses only ordinary descriptive prose.',
+    '# Runtime assignment',
+    protectedLine,
+    '',
+  ];
+  const prose = 'This authority paragraph explains normal behavior using ordinary language without structured identifiers.';
+  let chars = joinSourceLines(lines, endings).length;
+  while (chars < targetChars) {
+    const separator = endings[(lines.length - 1) % endings.length]!;
+    lines.push(prose);
+    chars += separator.length + prose.length;
+  }
+
+  const headingEnding = endings[1 % endings.length]!;
+  const protectedEnding = endings[2 % endings.length]!;
+  return {
+    instructions: joinSourceLines(lines, endings),
+    protectedBlock: `# Runtime assignment${headingEnding}${protectedLine}${protectedEnding}`,
+    protectedEnding,
+    protectedLine,
+  };
+}
+
+const nativeLineEndingCases = [
+  ['CRLF', ['\r\n']],
+  ['lone CR', ['\r']],
+  ['mixed line endings', ['\r\n', '\r', '\n']],
+] as const satisfies ReadonlyArray<readonly [string, readonly TestLineEnding[]]>;
 
 function chatText(body: Uint8Array): string {
   const parsed = JSON.parse(dec.decode(body)) as {
@@ -288,7 +341,10 @@ describe('safe Codex static-context compression', () => {
       return `dur_ms=${10_000 + i} id=${id}`;
     });
     const prose = 'ordinary explanatory context with no structured identifiers '.repeat(900);
-    const instructions = [prose, '## Exact timing table', ...associations].join('\n');
+    const sourceLines = [prose, '## Exact timing table', ...associations];
+    const sourceEndings = ['\r\n', '\r', '\n'] as const;
+    const instructions = joinSourceLines(sourceLines, sourceEndings);
+    const protectedBlock = instructions.slice(instructions.indexOf('## Exact timing table'));
     const plan = buildExactContextPlan(instructions);
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
@@ -304,15 +360,71 @@ describe('safe Codex static-context compression', () => {
     expect(plan.nativeParts).toHaveLength(2);
     expect(plan.text).toBe(plan.nativeParts.join('\n'));
     expect(plan.nativeParts.every((part) => part.length <= 32_768)).toBe(true);
+    expect(enc.encode(plan.protectedText)).toEqual(enc.encode(protectedBlock));
     expect(result.info.compressed).toBe(true);
     expect(nativeParts).toHaveLength(2);
     expect(nativeParts).toEqual(plan.nativeParts);
+    for (let index = 1; index < sourceLines.length; index++) {
+      const line = sourceLines[index]!;
+      const ending = index === sourceLines.length - 1
+        ? ''
+        : sourceEndings[index % sourceEndings.length]!;
+      const exactSpan = line + ending;
+      const nativeOccurrences = nativeParts.reduce(
+        (count, part) => count + occurrenceCount(part, exactSpan),
+        0,
+      );
+      expect(nativeOccurrences).toBe(1);
+    }
     for (const association of associations) {
-      expect(occurrenceCount(nativeParts.join('\n'), association)).toBe(1);
       expect(plan.imageSource).not.toContain(association);
       expect(plan.imageableText).not.toContain(association);
       expect(result.info.imageSourceText).not.toContain(association);
     }
+  });
+
+  it.each([
+    ['without a trailing terminator', ''],
+    ['with a trailing CRLF terminator', '\r\n'],
+  ] as const)(
+    'preserves protected first and final blocks %s',
+    (_label, trailingEnding) => {
+      const firstBlock = '# First assignment\r\ntrace_id=a1b2c3d4e5f6 lane=x7\r';
+      const imageableMiddle = 'ordinary explanatory prose between exact blocks\n';
+      const finalBlock = `# Final assignment\nfinal_id=z9c8b7a6${trailingEnding}`;
+      const source = firstBlock + imageableMiddle + finalBlock;
+      const plan = buildExactContextPlan(source);
+      const markers = [...plan.imageSource.matchAll(
+        /\[Exact native block B\d+: source lines \d+(?:-\d+)?\.\]/g,
+      )].map((match) => match[0]);
+
+      expect(plan.complete).toBe(true);
+      expect(plan.blockCount).toBe(2);
+      expect(enc.encode(plan.protectedText)).toEqual(enc.encode(firstBlock + finalBlock));
+      expect(plan.imageableText).toBe(imageableMiddle);
+      expect(markers).toHaveLength(2);
+      expect(plan.imageSource).toBe(
+        `${markers[0]}\r${imageableMiddle}${markers[1]}${trailingEnding}`,
+      );
+      expect(plan.nativeParts).toHaveLength(1);
+      expect(occurrenceCount(plan.nativeParts[0]!, firstBlock)).toBe(1);
+      expect(occurrenceCount(plan.nativeParts[0]!, finalBlock)).toBe(1);
+    },
+  );
+
+  it.each([
+    ['LF', '\n'],
+    ['CRLF', '\r\n'],
+    ['lone CR', '\r'],
+  ] as const)('charges the exact rendered %s terminator against maxChars', (_label, ending) => {
+    const source = `relation_id=x7${ending}`;
+    const initial = buildExactContextPlan(source);
+    const exactChars = initial.nativeParts[0]!.length;
+
+    expect(buildExactContextPlan(source, { maxChars: exactChars }).complete).toBe(true);
+    const oneOver = buildExactContextPlan(source, { maxChars: exactChars - 1 });
+    expect(oneOver.complete).toBe(false);
+    expect(oneOver.reason).toBe('too_many_chars');
   });
 
   it('rejects a structured slab when preservation cost makes an image-only peer unprofitable', async () => {
@@ -377,52 +489,208 @@ describe('safe Codex static-context compression', () => {
     expect(plan.text).toBe('');
   });
 
-  it.each([
-    ['CRLF', 'ordinary prose\r\ntrace_id=a1b2c3d4e5f6 lane=x7\r\n'],
-    ['lone CR', 'ordinary prose\rtrace_id=a1b2c3d4e5f6 lane=x7\r'],
-  ])('fails the selective plan closed for %s source instead of normalizing it', (_label, instructions) => {
-    const plan = buildExactContextPlan(instructions);
+  it.each(nativeLineEndingCases)(
+    'compresses %s authority while preserving native and image-safe source exactly',
+    async (_label, endings) => {
+      const {
+        instructions,
+        protectedBlock,
+        protectedEnding,
+        protectedLine,
+      } = nativeLineEndingContext(65_000, endings);
+      const plan = buildExactContextPlan(instructions);
+      const body = enc.encode(JSON.stringify({
+        model: 'gpt-5.6-sol',
+        instructions,
+        input: [{ role: 'user', content: 'Inspect the runtime assignment.' }],
+      }));
 
-    expect(plan.complete).toBe(false);
-    expect(plan.reason).toBe('unsupported_line_endings');
-    expect(plan.imageSource).toBe('');
-    expect(plan.imageableText).toBe('');
-    expect(plan.protectedText).toBe('');
-    expect(plan.nativeParts).toEqual([]);
-    expect(plan.text).toBe('');
-  });
+      const result = await transformOpenAIResponses(body, {
+        charsPerToken: 1,
+        minCompressChars: 1,
+      });
+      const nativeParts = responseInputTextParts(result.body).filter((part) =>
+        part.startsWith('[Exact native source removed from the rendered context.]'));
+      const marker = plan.imageSource.match(
+        /\[Exact native block B\d+: source lines \d+(?:-\d+)?\.\]/,
+      )?.[0];
 
-  it.each([
-    ['CRLF', 'ordinary prose\r\ntrace_id=a1b2c3d4e5f6 lane=x7\r\n'],
-    ['lone CR', 'ordinary prose\rtrace_id=a1b2c3d4e5f6 lane=x7\r'],
-  ])('returns byte-identical SOL input for unsupported %s source', async (_label, instructions) => {
+      expect(plan.complete).toBe(true);
+      expect(plan.protectedText).toBe(protectedBlock);
+      expect(plan.sourceChars).toBe(instructions.length);
+      expect(plan.imageableChars).toBe(plan.imageableText.length);
+      expect(plan.preservedChars).toBe(plan.protectedText.length);
+      expect(plan.imageChars).toBe(plan.imageSource.length);
+      expect(plan.sourceChars).toBe(plan.imageableChars + plan.preservedChars);
+      expect(occurrenceCount(plan.nativeParts.join('\n'), protectedBlock)).toBe(1);
+      expect(plan.imageableText).toBe(instructions.replace(protectedBlock, ''));
+      expect(marker).toBeDefined();
+      expect(plan.imageSource).toBe(
+        instructions.replace(protectedBlock, `${marker!}${protectedEnding}`),
+      );
+      expect(plan.imageSource).not.toContain(protectedLine);
+      expect(result.info.compressed).toBe(true);
+      expect(nativeParts).toEqual(plan.nativeParts);
+      expect(occurrenceCount(nativeParts.join('\n'), protectedBlock)).toBe(1);
+      expect(result.info.imageSourceText).not.toContain(protectedLine);
+    },
+  );
+
+  it('preserves exact endings across separate instructions and developer authority documents', async () => {
+    const instructionNeedle = 'trace_id=crlf-a1b2 lane=sol';
+    const developerNeedle = 'route_id=lone-cr-c3d4 mode=native';
+    const instructionProtected = `# Instruction assignment\r\n${instructionNeedle}\r\n`;
+    const developerProtected = `# Developer assignment\r${developerNeedle}\r`;
+    const instructionProse = 'This instruction paragraph contains ordinary descriptive authority text only.';
+    const developerProse = 'This developer paragraph contains ordinary descriptive authority text only.';
+    const instructionTail = 'Final ordinary instruction paragraph.';
+    const developerPrefix = 'Opening ordinary developer paragraph.';
+    const instructions = [
+      instructionProse,
+      '# Instruction assignment',
+      instructionNeedle,
+      '',
+      ...Array.from({ length: 450 }, () => instructionProse),
+      instructionTail,
+    ].join('\r\n');
+    const developer = [
+      developerPrefix,
+      '# Developer assignment',
+      developerNeedle,
+      '',
+      ...Array.from({ length: 450 }, () => developerProse),
+    ].join('\r');
+    const combinedAuthority = `${instructions}\n\n${developer}`;
+    const plan = buildExactContextPlanFromDocuments([instructions, developer]);
+    const userText = 'Return both authority assignments exactly.';
     const body = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       instructions,
-      input: [{ role: 'user', content: 'Inspect the runtime assignment.' }],
+      input: [
+        { role: 'developer', content: developer },
+        { role: 'user', content: userText },
+      ],
     }));
 
-    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
+    const result = await transformOpenAIResponses(body, {
+      charsPerToken: 1,
+      minCompressChars: 1,
+    });
+    const transformed = JSON.parse(dec.decode(result.body)) as {
+      instructions?: string;
+      input?: Array<{ role?: string; content?: unknown }>;
+    };
+    const nativeParts = responseInputTextParts(result.body).filter((part) =>
+      part.startsWith('[Exact native source removed from the rendered context.]'));
+    const developerItem = transformed.input?.find((item) => item.role === 'developer');
+    const userItems = transformed.input?.filter((item) => item.role === 'user') ?? [];
 
-    expect(result.info.compressed).toBe(false);
-    expect(result.info.reason).toBe('exact_context_unsupported_line_endings');
-    expect(result.body).toEqual(body);
+    expect(combinedAuthority.length).toBeGreaterThan(65_000);
+    expect(occurrenceCount(combinedAuthority, '\n\n')).toBe(1);
+    expect(plan.complete).toBe(true);
+    expect(enc.encode(plan.protectedText)).toEqual(
+      enc.encode(instructionProtected + developerProtected),
+    );
+    expect(plan.imageableText).toBe(
+      combinedAuthority
+        .replace(instructionProtected, '')
+        .replace(developerProtected, ''),
+    );
+    expect(plan.imageableText).toContain(`${instructionTail}\n\n${developerPrefix}\r`);
+    expect(occurrenceCount(plan.imageableText, '\n\n')).toBe(1);
+    expect(plan.sourceChars).toBe(combinedAuthority.length);
+    expect(plan.sourceChars).toBe(plan.imageableChars + plan.preservedChars);
+    expect(result.info.compressed).toBe(true);
+    expect(nativeParts).toEqual(plan.nativeParts);
+    expect(nativeParts.reduce(
+      (count, part) => count + occurrenceCount(part, instructionProtected),
+      0,
+    )).toBe(1);
+    expect(nativeParts.reduce(
+      (count, part) => count + occurrenceCount(part, developerProtected),
+      0,
+    )).toBe(1);
+    expect(result.info.imageSourceText).not.toContain(instructionNeedle);
+    expect(result.info.imageSourceText).not.toContain(developerNeedle);
+    expect(typeof transformed.instructions).toBe('string');
+    expect(developerItem?.content).toBe(transformed.instructions);
+    expect(transformed.instructions).not.toContain(instructionNeedle);
+    expect(developerItem?.content).not.toContain(developerNeedle);
+    expect(userItems.at(-1)?.content).toBe(userText);
   });
 
-  it('returns byte-identical input for an overlong protected line', async () => {
-    const instructions = `relation=${'x'.repeat(4_100)}`;
-    const body = enc.encode(JSON.stringify({
-      model: 'gpt-5.6-sol',
-      instructions,
-      input: [{ role: 'user', content: 'Inspect the relations.' }],
-    }));
+  it.each([
+    ['unterminated protected instructions', ''],
+    ['lone-CR protected instructions', '\r'],
+  ] as const)(
+    'preserves a protected authority boundary with %s',
+    async (_label, trailingEnding) => {
+      const instructionNeedle = 'trace_id=boundary-a1b2 lane=sol';
+      const instructions = `# Instruction assignment\r\n${instructionNeedle}${trailingEnding}`;
+      const developer = 'This developer authority contains ordinary descriptive prose only. '.repeat(1_100);
+      const plan = buildExactContextPlanFromDocuments([instructions, developer]);
+      const body = enc.encode(JSON.stringify({
+        model: 'gpt-5.6-sol',
+        instructions,
+        input: [
+          { role: 'developer', content: developer },
+          { role: 'user', content: 'Return the protected assignment exactly.' },
+        ],
+      }));
 
-    const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
+      const result = await transformOpenAIResponses(body, {
+        charsPerToken: 1,
+        minCompressChars: 1,
+      });
+      const nativeParts = responseInputTextParts(result.body).filter((part) =>
+        part.startsWith('[Exact native source removed from the rendered context.]'));
 
-    expect(result.info.compressed).toBe(false);
-    expect(result.info.reason).toBe('exact_context_line_too_long');
-    expect(result.body).toEqual(body);
-  });
+      expect(plan.complete).toBe(true);
+      expect(enc.encode(plan.protectedText)).toEqual(enc.encode(instructions));
+      expect(plan.imageableText).toBe(`\n\n${developer}`);
+      expect(plan.imageableText.slice(0, 2)).toBe('\n\n');
+      expect(plan.sourceChars).toBe(instructions.length + 2 + developer.length);
+      expect(plan.sourceChars).toBe(plan.imageableChars + plan.preservedChars);
+      for (const protectedValue of ['# Instruction assignment', instructionNeedle]) {
+        expect(plan.imageSource).not.toContain(protectedValue);
+        expect(plan.imageableText).not.toContain(protectedValue);
+        expect(result.info.imageSourceText).not.toContain(protectedValue);
+      }
+      expect(nativeParts).toEqual(plan.nativeParts);
+      expect(nativeParts.reduce(
+        (count, part) => count + occurrenceCount(part, instructions),
+        0,
+      )).toBe(1);
+      expect(result.info.compressed).toBe(true);
+      expect(result.info.imageSourceText).not.toContain('\r');
+      expect(result.info.droppedCodepointsTop?.['U+000D']).toBeUndefined();
+    },
+  );
+
+  it.each(nativeLineEndingCases)(
+    'fails closed byte-identically for an impossible overlong %s plan',
+    async (_label, endings) => {
+      const instructions = joinSourceLines([
+        'ordinary descriptive prose',
+        `relation=${'x'.repeat(4_100)}`,
+        'ordinary closing prose',
+      ], endings);
+      const plan = buildExactContextPlan(instructions);
+      const body = enc.encode(JSON.stringify({
+        model: 'gpt-5.6-sol',
+        instructions,
+        input: [{ role: 'user', content: 'Inspect the relations.' }],
+      }));
+
+      const result = await transformOpenAIResponses(body, { minCompressChars: 1 });
+
+      expect(plan.complete).toBe(false);
+      expect(plan.reason).toBe('line_too_long');
+      expect(result.info.compressed).toBe(false);
+      expect(result.info.reason).toBe('exact_context_line_too_long');
+      expect(result.body).toEqual(body);
+    },
+  );
 
   it('leaves the existing Chat/Fable fact-sheet path unchanged', async () => {
     const exactId = 'c3d4e5f60001';
