@@ -121,7 +121,7 @@ describe('public library API', () => {
       expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5']);
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-3-7-sonnet', 'claude-3-5-sonnet', 'claude-haiku-4-5']);
 
       process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
       expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);

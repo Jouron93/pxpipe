@@ -72,6 +72,9 @@ function envOrDefaultBases(): string[] {
   const trimmed = raw.trim();
   if (!trimmed) return getDefaultModelBases();
   if (falsey(trimmed)) return [];
+  if (trimmed.toLowerCase() === 'all' || trimmed === '*') {
+    return getAllModelProfiles().map((p) => p.canonicalId);
+  }
   return trimmed.split(',').map((s) => s.trim()).filter(Boolean);
 }
 

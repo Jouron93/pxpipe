@@ -732,6 +732,22 @@ export function renderRecentFragment(p: RecentPayload): string {
               : `<span class="muted">${notApplicable}</span>`;
             const usageCell = (value: number | undefined, missing: string): string =>
               value != null ? numFmt(value) : (inference ? missing : notApplicable);
+            const rowSummary = [
+              `#${i + 1}`,
+              `Result: ${e.status}`,
+              `Endpoint: ${shortPath(e.path)}`,
+              `Model: ${nameFallback || 'N/A'}`,
+              `Sent as: ${!inference ? notApplicable : (e.cc_added ? 'image' : 'text')}`,
+              `Cache Hits: ${e.cache_read != null ? numFmt(e.cache_read) : 'N/A'}`,
+              `As Text: ${e.baseline_input != null ? numFmt(e.baseline_input) : 'N/A'}`,
+              `Sent: ${e.actual_input != null ? numFmt(e.actual_input) : 'N/A'}`,
+              `Saved: ${saved != null ? numFmt(saved) : 'N/A'}`
+            ].join(' | ');
+            const copyIcon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+            const copyBtn = `<button class="btn-copy" onclick="copyReq(this)" data-row="${escapeHtml(rowSummary)}" title="Copy request row summary">${copyIcon} Copy</button>`;
+            const actionCell = viewId != null
+              ? `<div class="row-actions"><a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</a> ${copyBtn}</div>`
+              : `<div class="row-actions"><span class="muted">${inference ? 'not captured' : notApplicable}</span> ${copyBtn}</div>`;
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
@@ -743,7 +759,7 @@ export function renderRecentFragment(p: RecentPayload): string {
               `<td class="num">${usageCell(e.baseline_input, 'probe unavailable')}</td>` +
               `<td class="num">${usageCell(e.actual_input, 'usage not reported')}</td>` +
               savedCell +
-              `<td class="num">${viewLink}</td>` +
+              `<td class="num">${actionCell}</td>` +
               `</tr>`
             );
           })
@@ -1188,6 +1204,13 @@ const CSS = `
     border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
+  .row-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; white-space: nowrap; }
+  .btn-copy { font-size: 11px; background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
+    border-radius: 5px; padding: 2px 8px; cursor: pointer; font-weight: 600; font-family: var(--sans);
+    transition: all .15s cubic-bezier(0.16, 1, 0.3, 1); outline: none; display: inline-flex; align-items: center; gap: 4px; line-height: 1.2; }
+  .btn-copy:hover { border-color: var(--flame); color: var(--flame-ink); background: var(--surface-2); transform: translateY(-1px); }
+  .btn-copy:active { transform: translateY(0); }
+  .btn-copy.copied { background: var(--good-tint); color: var(--good); border-color: var(--good); font-weight: 700; }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -1242,6 +1265,20 @@ const CSS = `
 // Client glue: window.pp (pin+source state) → hx-vals; preserves <details> open state across swaps; routes htmx errors to toast tray.
 const GLUE_JS = `
   window.pp = { pin: null, src: false };
+  function copyReq(btn) {
+    var txt = btn.getAttribute('data-row') || '';
+    if (navigator.clipboard && txt) {
+      navigator.clipboard.writeText(txt).then(function () {
+        var oldHtml = btn.innerHTML;
+        btn.innerHTML = '✓ Copied!';
+        btn.classList.add('copied');
+        setTimeout(function () {
+          btn.innerHTML = oldHtml;
+          btn.classList.remove('copied');
+        }, 1300);
+      });
+    }
+  }
   function ppPin(id) {
     window.pp.pin = id;
     htmx.trigger('#frag-latest', 'pp-refresh');

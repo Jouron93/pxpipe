@@ -184,7 +184,7 @@ describe('Challenger M2_2: Long-Context Pricing, PXPIPE_CONFIG Overrides, and Ap
     it('uses default scope (claude-fable-5, claude-opus-5) when PXPIPE_MODELS is unset', () => {
       delete process.env.PXPIPE_MODELS;
 
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5']);
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-3-7-sonnet', 'claude-3-5-sonnet', 'claude-haiku-4-5']);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
       expect(isPxpipeSupportedModel('claude-fable-5-20260601')).toBe(true);
       expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
@@ -227,7 +227,7 @@ describe('Challenger M2_2: Long-Context Pricing, PXPIPE_CONFIG Overrides, and Ap
 
       // Reset runtime override
       setAllowedModelBases(null);
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5']);
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-3-7-sonnet', 'claude-3-5-sonnet', 'claude-haiku-4-5']);
       expect(isPxpipeSupportedModel('gpt-5.5')).toBe(false);
     });
 

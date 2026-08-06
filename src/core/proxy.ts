@@ -4,7 +4,7 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
+import { isClaudeModel, isGrokModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel, minCompressBodyBytes } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
@@ -44,8 +44,16 @@ export interface ProxyConfig {
   apiKey?: string;
   /** OpenAI API base for GPT chat completions, no trailing slash. */
   openAIUpstream?: string;
+  /** xAI API base for Grok models on OpenAI-shaped paths. Defaults to api.x.ai.
+   *  Selected per-request when the body model is grok-* so Codex can keep
+   *  OPENAI_UPSTREAM=chatgpt.com/backend-api/codex without stealing Grok traffic. */
+  xaiUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
+  /** xAI API key / OAuth JWT injected for all grok-* models.
+   *  This replaces whatever the client sent so that Codex/ChatGPT tokens
+   *  never reach api.x.ai. The operator must provide a real xAI credential. */
+  xaiApiKey?: string;
   /** Trusted route-level billing attribution. Never derived from model names. */
   billingLanes?: Partial<Record<'anthropic' | 'openai' | 'passthrough', BillingLane>>;
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
@@ -722,6 +730,7 @@ function teeForUsage(res: Response): {
 
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
+const DEFAULT_XAI_UPSTREAM = 'https://api.x.ai';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -1162,38 +1171,19 @@ export function createProxy(config: ProxyConfig = {}) {
       req.headers,
       config.openAIApiKey !== undefined,
     );
-    const upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
-    const routeKey = providerPrefixed ? 'passthrough' : isOpenAIPath ? 'openai' : 'anthropic';
-    const configuredLane = config.billingLanes?.[routeKey];
-    const upstreamOrigin = (() => {
-      try { return new URL(upstreamBase).origin; } catch { return ''; }
-    })();
-    if (configuredLane) {
-      billingLane = configuredLane;
-      billingLaneSource = 'configured_route';
-    } else if (upstreamOrigin === 'http://127.0.0.1:4017') {
-      billingLane = 'agy_ultra_subscription';
-      billingLaneSource = 'agy_bridge_origin';
-    } else if (upstreamOrigin === 'http://127.0.0.1:1234') {
-      billingLane = 'local';
-      billingLaneSource = 'local_origin';
-    } else if (isOpenAIPath && isChatGptCodexUpstream(openAIUpstream)) {
-      billingLane = 'codex_subscription';
-      billingLaneSource = 'chatgpt_codex_origin';
-    } else if (isOpenAIPath && config.openAIApiKey) {
-      billingLane = 'api_key';
-      billingLaneSource = 'api_key';
-    } else if (!isOpenAIPath && (config.apiKey || req.headers.has('x-api-key'))) {
-      billingLane = 'api_key';
-      billingLaneSource = 'api_key';
-    } else if (
-      !isOpenAIPath
-      && req.headers.get('authorization')?.toLowerCase().startsWith('bearer ')
-      && req.headers.get('anthropic-beta')?.toLowerCase().includes('oauth-2025-04-20')
-    ) {
-      billingLane = 'claude_max_subscription';
-      billingLaneSource = 'anthropic_oauth_marker';
-    }
+    // Mutable: Grok models on OpenAI-shaped paths re-route to api.x.ai after
+    // the body model is known (Codex keeps OPENAI_UPSTREAM; Grok must not).
+    let upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
+    let stripOpenAIV1ForRequest = routes.stripOpenAIV1;
+    let isGrokLane = false;
+    let routeKey: 'passthrough' | 'openai' | 'anthropic' = providerPrefixed
+      ? 'passthrough'
+      : isOpenAIPath
+        ? 'openai'
+        : 'anthropic';
+    const xaiUpstream = (config.xaiUpstream
+      ?? (typeof process !== 'undefined' ? process.env?.XAI_UPSTREAM : undefined)
+      ?? DEFAULT_XAI_UPSTREAM).replace(/\/+$/, '');
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
@@ -1215,6 +1205,16 @@ export function createProxy(config: ProxyConfig = {}) {
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         requestModel = model ?? undefined;
+
+        // Grok on /v1/responses|/v1/chat/completions → compress here, forward to
+        // api.x.ai with the client's xAI bearer. Never use Codex/OpenAI upstream.
+        if ((isOpenAIChat || isOpenAIResponses) && isGrokModel(model)) {
+          isGrokLane = true;
+          upstreamBase = xaiUpstream;
+          stripOpenAIV1ForRequest = false;
+          routeKey = 'openai';
+        }
+
         // /v1/messages is only a wire schema: Claude Code can target a non-
         // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
         // renderer or Anthropic count_tokens merely because the route is
@@ -1296,10 +1296,56 @@ export function createProxy(config: ProxyConfig = {}) {
       bodyOut = req.body; // pass through unchanged
     }
 
+    // Billing after model-aware upstream selection (Grok vs Codex vs Claude).
+    {
+      const configuredLane = config.billingLanes?.[routeKey];
+      const upstreamOrigin = (() => {
+        try { return new URL(upstreamBase).origin; } catch { return ''; }
+      })();
+      if (configuredLane) {
+        billingLane = configuredLane;
+        billingLaneSource = 'configured_route';
+      } else if (isGrokLane) {
+        billingLane = 'api_key';
+        billingLaneSource = 'api_key';
+      } else if (upstreamOrigin === 'http://127.0.0.1:4017') {
+        billingLane = 'agy_ultra_subscription';
+        billingLaneSource = 'agy_bridge_origin';
+      } else if (upstreamOrigin === 'http://127.0.0.1:1234') {
+        billingLane = 'local';
+        billingLaneSource = 'local_origin';
+      } else if (isOpenAIPath && isChatGptCodexUpstream(openAIUpstream)) {
+        billingLane = 'codex_subscription';
+        billingLaneSource = 'chatgpt_codex_origin';
+      } else if (isOpenAIPath && config.openAIApiKey) {
+        billingLane = 'api_key';
+        billingLaneSource = 'api_key';
+      } else if (!isOpenAIPath && (config.apiKey || req.headers.has('x-api-key'))) {
+        billingLane = 'api_key';
+        billingLaneSource = 'api_key';
+      } else if (
+        !isOpenAIPath
+        && req.headers.get('authorization')?.toLowerCase().startsWith('bearer ')
+        && req.headers.get('anthropic-beta')?.toLowerCase().includes('oauth-2025-04-20')
+      ) {
+        billingLane = 'claude_max_subscription';
+        billingLaneSource = 'anthropic_oauth_marker';
+      }
+    }
+
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-    if (isOpenAIPath) {
+    // Grok lane: always inject the configured XAI_API_KEY (or xaiApiKey).
+    // This prevents Codex/ChatGPT OAuth tokens from being forwarded to api.x.ai.
+    // Non-Grok lanes keep their normal key injection behavior.
+    if (isGrokLane) {
+      if (config.xaiApiKey) {
+        outHeaders.set('authorization', `Bearer ${config.xaiApiKey}`);
+      }
+      // If no xaiApiKey is configured we still forward the client's header
+      // (may 401, but at least we don't silently break a working setup).
+    } else if (isOpenAIPath) {
       if (config.openAIApiKey) outHeaders.set('authorization', `Bearer ${config.openAIApiKey}`);
-    } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
+    } else if (!isOpenAIPath && config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
       outHeaders.set('x-api-key', config.apiKey);
     }
 
@@ -1308,7 +1354,8 @@ export function createProxy(config: ProxyConfig = {}) {
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
-    const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
+    // Grok → api.x.ai keeps `/v1` (stripOpenAIV1ForRequest=false).
+    const outPath = isOpenAIPath && stripOpenAIV1ForRequest ? path.replace(/^\/v1(?=\/)/, '') : path;
     const upstreamUrl = upstreamBase + outPath;
     // A streamed request body is consumed by the first attempt and cannot be
     // replayed, so those requests are never retried regardless of status.

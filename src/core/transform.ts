@@ -142,7 +142,7 @@ const DEFAULTS: Required<TransformOptions> = {
   cols: ANTHROPIC_SLAB_COLS,
   maxImagesPerToolResult: 10,
   charsPerToken: 4,
-  historyAmortizationHorizon: 1,
+  historyAmortizationHorizon: 5,
   priorWarmTokens: 0,
   priorWarmImageTokens: 0,
   // Multi-col off: single-col slab already holds ~50k chars; extra OCR risk not worth it.

@@ -51,7 +51,9 @@ interface RuntimeConfig {
   host: string;
   upstream: string;
   openAIUpstream: string;
+  xaiUpstream: string;
   openAIApiKey?: string;
+  xaiApiKey?: string;
   provider?: 'cloudflare-ai-gateway';
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
@@ -190,7 +192,9 @@ function parseCli(argv: string[]): RuntimeConfig {
     host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+    xaiUpstream: process.env.XAI_UPSTREAM ?? 'https://api.x.ai',
     openAIApiKey: process.env.OPENAI_API_KEY,
+    xaiApiKey: process.env.XAI_API_KEY,
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
@@ -263,8 +267,13 @@ Environment:
   ANTHROPIC_UPSTREAM      Anthropic API base; overrides PXPIPE_UPSTREAM
                            (default https://api.anthropic.com)
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
-                           (default https://api.openai.com)
+                           (default https://api.openai.com). Codex keeps this;
+                           Grok models re-route per-request to XAI_UPSTREAM.
+  XAI_UPSTREAM            xAI API base for grok-* models on /v1/responses and
+                           /v1/chat/completions (default https://api.x.ai)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
+  XAI_API_KEY             xAI key / OAuth JWT injected for every grok-* request
+                           (required for grok-4.5 to work through the proxy)
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
@@ -298,6 +307,10 @@ Use with Codex/ChatGPT OAuth:
 
 Use with OpenAI-compatible GPT clients:
   OPENAI_BASE_URL=http://127.0.0.1:47821/v1
+
+Use with Grok CLI (compress + forward to api.x.ai; keep xAI auth):
+  PXPIPE_MODELS=...,grok-4.5
+  GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:47821/v1
 `);
 }
 
@@ -448,7 +461,7 @@ async function dispatchDashboard(
   req: IncomingMessage,
   url: URL,
   port: number,
-  healthMeta?: { openAIUpstream: string; anthropicUpstream: string },
+  healthMeta?: { openAIUpstream: string; anthropicUpstream: string; xaiUpstream?: string },
 ): Promise<Response | undefined> {
   const method = req.method ?? 'GET';
   switch (route.kind) {
@@ -468,6 +481,7 @@ async function dispatchDashboard(
         service: 'pxpipe',
         upstream_openai: healthMeta?.openAIUpstream ?? '',
         upstream_anthropic: healthMeta?.anthropicUpstream ?? '',
+        upstream_xai: healthMeta?.xaiUpstream ?? '',
         pid: process.pid,
         uptime_s: Math.round(process.uptime() * 10) / 10,
       });
@@ -1083,6 +1097,7 @@ async function main(): Promise<void> {
     gatewayHeaders: opts.gatewayHeaders,
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
+    xaiUpstream: opts.xaiUpstream,
     openAIApiKey: opts.openAIApiKey,
     billingLanes: opts.billingLanes,
     captureRequestBodiesOn4xx: opts.captureRequestBodiesOn4xx,
@@ -1184,6 +1199,8 @@ async function main(): Promise<void> {
   const healthMeta = {
     openAIUpstream: upstreamRoutes.openai,
     anthropicUpstream: upstreamRoutes.anthropic,
+    xaiUpstream: opts.xaiUpstream,
+    xaiApiKey: opts.xaiApiKey ? 'set' : undefined,
   };
 
   const server = createServer((req, res) => {
