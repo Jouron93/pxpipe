@@ -159,9 +159,11 @@ const ERROR_BODY_MAX = 2048;
  *  Returns null when not found — callers treat null as outside supported scope (fail-closed). */
 function readModelField(body: Uint8Array): string | null {
   try {
-    const head = new TextDecoder().decode(body.subarray(0, 8192));
-    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(head);
-    return m ? m[1]! : null;
+    const text = new TextDecoder().decode(body.subarray(0, 131072));
+    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(text);
+    if (m) return m[1]!;
+    const j = JSON.parse(text) as { model?: unknown };
+    return typeof j?.model === 'string' ? j.model : null;
   } catch {
     return null;
   }
