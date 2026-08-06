@@ -33,6 +33,8 @@ export interface ModelRenderProfile {
 
 export type RenderProfile = ModelRenderProfile;
 
+export type CompressionStrategy = 'ocr_slab' | 'ast_reflow' | 'multimodal_direct' | 'json_fold';
+
 export interface PxpipeModelProfile {
   canonicalId: string;
   displayName: string;
@@ -41,6 +43,7 @@ export interface PxpipeModelProfile {
   enabledByDefault: boolean;
   pricing: ModelPricing;
   renderProfile: ModelRenderProfile;
+  compressionStrategy?: CompressionStrategy;
   contextWindowTokens: number;
   maxOutputTokens: number;
   factsheetEnabled: boolean;
