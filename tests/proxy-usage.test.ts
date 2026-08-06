@@ -598,7 +598,7 @@ describe('proxy usage extraction', () => {
       }),
     );
     await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 250));
     restore();
 
     expect(captured).toBeDefined();
@@ -1456,7 +1456,7 @@ describe('proxy usage extraction', () => {
       }),
     );
     await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 250));
     restore();
 
     expect(captured).toBeDefined();

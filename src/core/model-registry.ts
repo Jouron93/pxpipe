@@ -157,7 +157,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     contextWindowTokens: 200_000,
     maxOutputTokens: 64_000,
     factsheetEnabled: false,
-    aliases: ['claude-haiku-4.5', 'haiku-4-5'],
+    aliases: ['claude-haiku-4.5', 'haiku-4-5', 'claude-haiku-4-5-20251001'],
   },
 
   // --- OPENAI / CODEX FAMILY ---
@@ -335,6 +335,32 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     aliases: ['agy/gemini-3.5-flash-high', 'gemini-3.5-flash-high'],
   },
   {
+    canonicalId: 'agy-gemini-3.5-flash-medium',
+    displayName: 'AGY Gemini 3.5 Flash (Medium)',
+    family: 'agy',
+    status: 'unvalidated',
+    enabledByDefault: false,
+    pricing: { inputPerMtok: 1.5, cacheWritePerMtok: 1.875, cacheReadPerMtok: 0.15, outputPerMtok: 9 },
+    renderProfile: DEFAULT_GPT_RENDER,
+    contextWindowTokens: 2_097_152,
+    maxOutputTokens: 65_536,
+    factsheetEnabled: false,
+    aliases: ['agy/gemini-3.5-flash-medium', 'gemini-3.5-flash-medium'],
+  },
+  {
+    canonicalId: 'agy-gemini-3.5-flash-low',
+    displayName: 'AGY Gemini 3.5 Flash (Low)',
+    family: 'agy',
+    status: 'unvalidated',
+    enabledByDefault: false,
+    pricing: { inputPerMtok: 1.5, cacheWritePerMtok: 1.875, cacheReadPerMtok: 0.15, outputPerMtok: 9 },
+    renderProfile: DEFAULT_GPT_RENDER,
+    contextWindowTokens: 2_097_152,
+    maxOutputTokens: 65_536,
+    factsheetEnabled: false,
+    aliases: ['agy/gemini-3.5-flash-low', 'gemini-3.5-flash-low'],
+  },
+  {
     canonicalId: 'agy-gemini-3.1-pro-high',
     displayName: 'AGY Gemini 3.1 Pro (High)',
     family: 'agy',
@@ -346,6 +372,19 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.1-pro-high', 'gemini-3.1-pro-high', 'gemini-3.1-pro'],
+  },
+  {
+    canonicalId: 'agy-gemini-3.1-pro-low',
+    displayName: 'AGY Gemini 3.1 Pro (Low)',
+    family: 'agy',
+    status: 'unvalidated',
+    enabledByDefault: false,
+    pricing: { inputPerMtok: 2.0, cacheWritePerMtok: 2.5, cacheReadPerMtok: 0.2, outputPerMtok: 12.0 },
+    renderProfile: DEFAULT_GPT_RENDER,
+    contextWindowTokens: 2_097_152,
+    maxOutputTokens: 65_536,
+    factsheetEnabled: false,
+    aliases: ['agy/gemini-3.1-pro-low', 'gemini-3.1-pro-low'],
   },
   {
     canonicalId: 'agy-claude-opus-4.6-thinking',
@@ -759,6 +798,23 @@ export function normalizeModelId(modelId: string | undefined): string {
     .replace(/-(thinking|high|medium|med|low)$/, '');
 }
 
+/** Providers publish dated snapshot IDs alongside the short alias
+ * (`claude-haiku-4-5-20251001`, `gpt-5.4-2026-01-15`). A snapshot is billed at
+ * the rate of the alias it snapshots, so a dated ID must resolve to the same
+ * profile instead of falling through to the zero-priced dynamic fallback.
+ * Matches `-YYYYMMDD` and `-YYYY-MM-DD` for years 2000-2099 only, so version
+ * fragments like `-120b` or `-8k` are never mistaken for a date. */
+const DATED_SNAPSHOT_SUFFIX = /-(?:20\d{2}-\d{2}-\d{2}|20\d{6})$/;
+
+function cloneProfile(profile: PxpipeModelProfile): PxpipeModelProfile {
+  return {
+    ...profile,
+    pricing: { ...profile.pricing },
+    renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } },
+    aliases: [...profile.aliases],
+  };
+}
+
 /** Dynamic fallback resolver for unrecognized vendor models */
 function createDynamicFallbackProfile(modelId: string, norm: string): PxpipeModelProfile {
   let family: ModelFamily = 'nvidia';
@@ -824,6 +880,20 @@ export function resolveModelProfile(modelId: string, _route?: PricingRouteOverri
         renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } },
         aliases: [...profile.aliases],
       };
+    }
+  }
+
+  // 1b. Anthropic dated snapshot ID -> the profile of the alias it snapshots, so
+  //     the NEXT dated Claude release resolves without a registry edit.
+  //     Deliberately scoped to family 'claude': other vendors (moonshot, zhipu)
+  //     must NOT inherit the undated rate — an unconfirmed snapshot stays
+  //     'unavailable' rather than being billed at a guessed rate.
+  const undated = norm.replace(DATED_SNAPSHOT_SUFFIX, '');
+  if (undated !== norm) {
+    const undatedTarget = aliasMap.get(undated) || undated;
+    const undatedProfile = profileRegistry.get(undatedTarget.toLowerCase());
+    if (undatedProfile && undatedProfile.family === 'claude') {
+      return cloneProfile(undatedProfile);
     }
   }
 
