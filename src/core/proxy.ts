@@ -773,13 +773,135 @@ function isOpenAIResponsesPath(pathname: string): boolean {
     || pathname === '/openai/responses';
 }
 
+/** True when the client's Authorization bearer is unambiguously an Anthropic
+ *  credential. `/v1/models` is served by BOTH providers, so the only usable
+ *  routing signal is the credential itself. Treating any bearer as "OpenAI"
+ *  sends `sk-ant-*` keys to the OpenAI upstream, which forwards them verbatim
+ *  (no proxy key to overwrite with) and 401s with
+ *  `Incorrect API key provided: sk-ant-…`. Observed 8× in events.jsonl. */
+function isAnthropicBearer(headers: Headers): boolean {
+  const auth = headers.get('authorization');
+  if (!auth) return false;
+  return /^bearer\s+sk-ant-/i.test(auth.trim());
+}
+
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
-  const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
+  // `hasOpenAIKey` stays an independent signal: in that case the proxy REPLACES
+  // the client's Authorization with its own OpenAI key, so the client's
+  // credential shape is irrelevant. The client-bearer signal is only trusted
+  // when the credential is not visibly Anthropic.
+  const clientBearerLooksOpenAI = headers.has('authorization')
+    && !headers.has('x-api-key')
+    && !isAnthropicBearer(headers);
+  const looksOpenAIAuth = hasOpenAIKey || clientBearerLooksOpenAI;
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
     || (isModelsPath && looksOpenAIAuth);
+}
+
+/** Headers that identify the CALLER and carry no credential material. */
+const CALLER_ID_HEADERS = [
+  'user-agent',
+  'x-app',
+  'x-session-id',
+  'x-request-id',
+  'anthropic-version',
+  'anthropic-beta',
+  'x-stainless-lang',
+  'x-stainless-package-version',
+  'x-stainless-runtime',
+  'x-stainless-os',
+  'x-stainless-arch',
+  'x-stainless-retry-count',
+  'openai-organization',
+  'openai-project',
+  'chatgpt-account-id',
+] as const;
+
+/** Credential headers. Values are NEVER emitted — only fingerprinted. */
+const CREDENTIAL_HEADERS = ['authorization', 'x-api-key', 'cookie', 'proxy-authorization'] as const;
+
+/** 32-bit FNV-1a. Used ONLY to fingerprint credentials so the same key is
+ *  recognisable across events without its value ever being written. Lossy by
+ *  construction (32 bits for an arbitrary-length secret) — deliberately not a
+ *  truncated crypto hash, which would leak materially more about the input. */
+function fnv1a8(input: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+/** Compact, redacted caller identity for auth-denial rows (401/403).
+ *  Before this, `grep -rn "403" src/` returned zero hits — a 2,581-request 403
+ *  burst on gpt-4o had no attributable caller anywhere in the logs. This records
+ *  WHO called and WHICH upstream refused them, using only context the request
+ *  already carries. Credential values are never emitted. */
+function describeAuthDenial(status: number, headers: Headers, upstreamUrl: string): string {
+  const parts: string[] = [`auth_denied status=${status}`];
+  try {
+    parts.push(`upstream=${new URL(upstreamUrl).origin}`);
+  } catch {
+    /* unparseable upstream — omit rather than guess */
+  }
+  for (const name of CREDENTIAL_HEADERS) {
+    const v = headers.get(name);
+    if (v) parts.push(`${name}=<redacted:${fnv1a8(v)}>`);
+  }
+  for (const name of CALLER_ID_HEADERS) {
+    const v = headers.get(name);
+    // Truncated and de-delimited so one hostile header cannot bloat or split the row.
+    if (v) parts.push(`${name}=${v.slice(0, 80).replace(/[\s|]+/g, ' ')}`);
+  }
+  return parts.join(' | ');
+}
+
+/** Bounded backoff shared by the count_tokens probe and the main upstream
+ *  forward. Both replay ONLY requests whose body is a replayable buffer, and
+ *  ONLY for statuses that mean "rejected before processing" — so a replay can
+ *  never duplicate work the upstream already performed. */
+const RETRY_BASE_DELAY_MS = 250;
+/** Longest single sleep for the main forward. A Retry-After longer than this is
+ *  honoured by NOT retrying (see retryDelayMs) rather than by under-waiting. */
+const FORWARD_MAX_DELAY_MS = 8_000;
+/** Main forward: 2 retries = 3 attempts worst case. */
+const FORWARD_MAX_RETRIES = 2;
+/** The probe only gates telemetry and finalize() awaits it — keep it cheap. */
+const PROBE_MAX_RETRIES = 1;
+const PROBE_MAX_DELAY_MS = 1_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Parse Retry-After: either delta-seconds or an HTTP-date. Returns ms, or null
+ *  when the header is absent/unparseable. Never returns a negative delay. */
+function parseRetryAfterMs(value: string | null, nowMs: number): number | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const secs = Number(trimmed);
+    return Number.isFinite(secs) ? secs * 1000 : null;
+  }
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, at - nowMs);
+}
+
+/** Delay before the next attempt, or null meaning "do not retry".
+ *  When the upstream supplies Retry-After we obey it exactly; if it asks for
+ *  longer than our budget we STOP and surface the 429 rather than retrying
+ *  early and hammering a provider that just told us to back off.
+ *  Without Retry-After: exponential with FULL jitter (spreads a thundering herd
+ *  of concurrent agents instead of re-synchronising them). `attempt` is 0-based. */
+function retryDelayMs(attempt: number, retryAfterMs: number | null, maxDelayMs: number): number | null {
+  if (retryAfterMs !== null) return retryAfterMs > maxDelayMs ? null : retryAfterMs;
+  const ceiling = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, maxDelayMs);
+  return Math.random() * ceiling;
 }
 
 /** POST /v1/messages/count_tokens with the given body. Returns the upstream's
@@ -793,17 +915,43 @@ async function countTokensUpstream(
   body: Uint8Array,
   headers: Headers,
 ): Promise<number | null> {
-  try {
-    const res = await fetch(countTokensUrl, {
-      method: 'POST',
-      headers,
-      body: body as unknown as BodyInit,
-    });
-    if (!res.ok) return null;
-    const json = (await res.json()) as { input_tokens?: unknown };
-    return typeof json.input_tokens === 'number' ? json.input_tokens : null;
-  } catch {
-    return null;
+  // The probe body is a replayable buffer and count_tokens is a pure read, so a
+  // retry can never double-charge or double-apply anything. Budget is kept far
+  // tighter than the main forward: the probe only gates telemetry, and
+  // finalize() awaits it, so a slow probe delays event logging.
+  for (let attempt = 0; ; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(countTokensUrl, {
+        method: 'POST',
+        headers,
+        body: body as unknown as BodyInit,
+      });
+    } catch {
+      // Network-level failure (upstream unreachable / socket reset).
+      if (attempt >= PROBE_MAX_RETRIES) return null;
+      await sleep(retryDelayMs(attempt, null, PROBE_MAX_DELAY_MS) ?? 0);
+      continue;
+    }
+    if (!res.ok) {
+      // Retry only "rejected, not processed" statuses. A 400/401/403 here is a
+      // deterministic rejection — replaying it just burns another round trip.
+      const transient = res.status === 429 || res.status >= 500;
+      const delay = transient && attempt < PROBE_MAX_RETRIES
+        ? retryDelayMs(attempt, parseRetryAfterMs(res.headers.get('retry-after'), Date.now()), PROBE_MAX_DELAY_MS)
+        : null;
+      // Drain the discarded body so the socket is released promptly.
+      await res.body?.cancel().catch(() => undefined);
+      if (delay === null) return null;
+      await sleep(delay);
+      continue;
+    }
+    try {
+      const json = (await res.json()) as { input_tokens?: unknown };
+      return typeof json.input_tokens === 'number' ? json.input_tokens : null;
+    } catch {
+      return null; // 200 with an unparseable body is not a transient condition.
+    }
   }
 }
 
@@ -1158,22 +1306,54 @@ export function createProxy(config: ProxyConfig = {}) {
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
     const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
     const upstreamUrl = upstreamBase + outPath;
-    let upstreamRes: Response;
-    try {
-      upstreamRes = await fetch(upstreamUrl, {
-        method: req.method,
-        headers: outHeaders,
-        body: bodyOut,
-        // duplex is required by spec when sending a stream as body
-        ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
-      } as RequestInit);
-    } catch (e) {
-      fire(502, info, `upstream_error: ${(e as Error).message}`);
+    // A streamed request body is consumed by the first attempt and cannot be
+    // replayed, so those requests are never retried regardless of status.
+    const bodyIsReplayable = !(bodyOut instanceof ReadableStream);
+    let attempted: Response | undefined;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        attempted = await fetch(upstreamUrl, {
+          method: req.method,
+          headers: outHeaders,
+          body: bodyOut,
+          // duplex is required by spec when sending a stream as body
+          ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
+        } as RequestInit);
+      } catch (e) {
+        // Deliberately NOT retried. A transport failure is ambiguous: the
+        // request may already have reached the upstream and been applied, and
+        // pxpipe cannot distinguish that from a request that never landed.
+        // Replaying it could duplicate non-idempotent work. Fail loud instead.
+        fire(502, info, `upstream_error: ${(e as Error).message}`);
+        return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
+          status: 502,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      // 429 is the ONLY retried status. It is an explicit statement that the
+      // provider rejected the request before doing any work, so a replay cannot
+      // duplicate anything. Every other 4xx is deterministic — replaying it
+      // just burns a round trip and another rate-limit token.
+      if (attempted.status !== 429 || !bodyIsReplayable || attempt >= FORWARD_MAX_RETRIES) break;
+      const delay = retryDelayMs(
+        attempt,
+        parseRetryAfterMs(attempted.headers.get('retry-after'), Date.now()),
+        FORWARD_MAX_DELAY_MS,
+      );
+      if (delay === null) break; // upstream asked for longer than our budget — surface the 429
+      // Release the socket before sleeping; the discarded body is never read.
+      await attempted.body?.cancel().catch(() => undefined);
+      await sleep(delay);
+    }
+    if (!attempted) {
+      // Unreachable: the loop only exits via break, after a successful assignment.
+      fire(502, info, 'upstream_error: no response');
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
         status: 502,
         headers: { 'content-type': 'application/json' },
       });
     }
+    const upstreamRes: Response = attempted;
 
     const firstByteMs = Date.now() - t0;
 
@@ -1219,7 +1399,13 @@ export function createProxy(config: ProxyConfig = {}) {
       fire(
         upstreamRes.status,
         info,
-        undefined,
+        // 401/403 carry no upstream diagnostic beyond the body, and the caller
+        // was previously unrecoverable from the logs. Attach a redacted
+        // caller fingerprint on exactly those statuses; every other status
+        // keeps `error` unset so existing consumers are unaffected.
+        upstreamRes.status === 401 || upstreamRes.status === 403
+          ? describeAuthDenial(upstreamRes.status, req.headers, upstreamUrl)
+          : undefined,
         firstByteMs,
         usage,
         errorBody,

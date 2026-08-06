@@ -52,7 +52,7 @@ const VARIANTS = [
   { name: '7x10', style: { cellWBonus: 2, cellHBonus: 2, aa: true }, cols: colsFor(2) },
   { name: '9x12', style: { cellWBonus: 4, cellHBonus: 4, aa: true }, cols: colsFor(4) },
 ];
-const MODELS = ['claude-opus-4-8', 'claude-fable-5'];
+const MODELS = ['claude-opus-5', 'claude-opus-4-8', 'claude-fable-5'];
 
 const TEXT_TOKENS = Math.ceil(SESSION.length / 3.5); // rough Claude-Code-dense baseline
 

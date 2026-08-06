@@ -479,6 +479,10 @@ async function dispatchDashboard(
         },
       });
     }
+    case 'models': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      return dashboard.serveModelsJson();
+    }
     case 'png': {
       if (method !== 'GET') return undefined;
       const idRaw = url.searchParams.get('id');

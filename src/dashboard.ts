@@ -1657,6 +1657,34 @@ export class DashboardState {
     else next.delete(model);
     setAllowedModelBases([...next]);
   }
+
+  /** GET /v1/models — serve standard OpenAI-compatible models list. */
+  serveModelsJson(): Response {
+    const modelBases = getAllowedModelBases();
+    const defaultModels = [
+      'claude-fable-5',
+      'claude-opus-5',
+      'claude-sonnet-5',
+      'claude-haiku-4-5',
+      'claude-haiku-4-5-20251001',
+      'claude-opus-4-8',
+      'claude-opus-4-7',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+      'gpt-5.4',
+      'gpt-4o',
+    ];
+    const activeModels = modelBases.length > 0 ? modelBases : defaultModels;
+    const data = activeModels.map((id) => ({
+      id,
+      object: 'model',
+      created: 1700000000,
+      owned_by: id.startsWith('claude') ? 'anthropic' : 'openai',
+    }));
+    return jsonResponse({ object: 'list', data, models: data });
+  }
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -1693,6 +1721,7 @@ export type DashboardRoute =
   | { kind: 'recent' } // /proxy-recent — legacy ring buffer
   | { kind: 'png' } // /proxy-latest-png
   | { kind: 'health' } // /health, /v1/health — liveness probe
+  | { kind: 'models' } // /v1/models, /models — OpenAI-compatible models list
   | { kind: 'api-sessions' } // /api/sessions.json
   | { kind: 'api-stats' } // /api/stats.json
   | { kind: 'current-session' } // /api/current-session.json
@@ -1707,6 +1736,14 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/proxy-recent') return { kind: 'recent' };
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
   if (pathname === '/health' || pathname === '/v1/health') return { kind: 'health' };
+  if (
+    pathname === '/v1/models' ||
+    pathname === '/v1/models/' ||
+    pathname === '/models' ||
+    pathname === '/models/'
+  ) {
+    return { kind: 'models' };
+  }
   if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
   if (pathname === '/api/current-session.json') return { kind: 'current-session' };
