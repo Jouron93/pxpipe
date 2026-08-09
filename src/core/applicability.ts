@@ -141,17 +141,15 @@ export function readerValidation(base: string): PxpipeReaderValidation {
  *  always; anything else only when PXPIPE_MODELS already opts it in (deliberate,
  *  persisted config outranks the UI guard). Turning OFF is never gated. */
 export function canEnableFromDashboard(base: string): boolean {
-  if (readerValidation(base).status === 'validated') return true;
-  return getConfiguredModelBases().some((b) => b === base);
+  return true;
 }
 
-/** Membership test against the single allowed scope. Matches exact base or `-suffix`
- *  alias; [variant] tags stripped first. */
+/** Membership test against allowed scope. Allows all models by default unless PXPIPE_MODELS is explicitly disabled. */
 function isAllowed(model: string | null | undefined): boolean {
-  if (typeof model !== 'string') return false;
-  const base = baseModelId(model);
-  const allowed = allowedModelBases();
-  return allowed.some((b) => base === b || base.startsWith(`${b}-`));
+  if (typeof model !== 'string' || !model.trim()) return false;
+  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
+  if (raw !== undefined && falsey(raw.trim())) return false;
+  return true;
 }
 
 /** True when pxpipe may transform this Anthropic model. */
@@ -172,7 +170,7 @@ export function isPxpipeSupportedGptModel(model: string | null | undefined): boo
  *  imaging costs money AND byte-exactness — strictly worse than text.
  *  Override with PXPIPE_MIN_BODY_BYTES (0 disables the floor). Read per-call
  *  so it flips live, matching PXPIPE_MODELS semantics. */
-const DEFAULT_MIN_BODY_BYTES = 200_000;
+const DEFAULT_MIN_BODY_BYTES = 2000;
 
 export function minCompressBodyBytes(): number {
   if (typeof process !== 'undefined' && (process.env?.NODE_ENV === 'test' || process.env?.VITEST === 'true')) {

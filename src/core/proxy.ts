@@ -769,8 +769,6 @@ const PASSTHROUGH_PREFIXES = [
   '/google-ai-studio/',
   '/compat/',
   '/xai/',
-  '/agy/',
-  '/lmstudio/',
   '/nim/',
 ] as const;
 

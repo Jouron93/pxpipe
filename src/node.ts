@@ -125,6 +125,12 @@ function applyConfigFileDefaults(): void {
       process.env.PXPIPE_CODEX_MONTHLY_USD = String(monthly);
     }
   }
+  if (process.env.PXPIPE_MIN_BODY_BYTES === undefined) {
+    const minBytes = cfg.min_body_bytes ?? cfg.min_compress_body_bytes;
+    if (typeof minBytes === 'number' || typeof minBytes === 'string') {
+      process.env.PXPIPE_MIN_BODY_BYTES = String(minBytes);
+    }
+  }
   const laneKeys = [
     ['PXPIPE_ANTHROPIC_BILLING_LANE', 'anthropic_billing_lane'],
     ['PXPIPE_OPENAI_BILLING_LANE', 'openai_billing_lane'],
