@@ -34,16 +34,40 @@ import {
   DENSE_RENDER_STYLE,
   ANTHROPIC_SLAB_COLS,
   renderTextToPngsWithCharLimit,
+  renderCellWidth,
+  renderCellHeight,
   type RenderStyle,
 } from './render.js';
 import { envStyleOverride } from './gpt-model-profiles.js';
-import { factSheetText } from './factsheet.js';
+import { factSheetText, MAX_TOKENS_OPUS } from './factsheet.js';
 import { resolveModelProfile } from './model-registry.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+
+/**
+ * Cold-path honest-dashboard savings floor (operator target ≈90%).
+ * Gate requires: imageTokens <= textTokens * (1 - fraction)
+ * i.e. imageTokens <= 0.10 * textTokens when fraction=0.90
+ * (matches docs/CACHING_AND_SAVINGS.md cold both-sides-write math).
+ * Empty/unset → 0 (legacy break-even I < T only). Supervisor should set
+ * PXPIPE_MIN_COLD_SAVE_FRACTION=0.90 for live Abyss.
+ */
+export function minColdSaveFraction(): number {
+  if (typeof process === 'undefined') return 0;
+  if (process.env?.NODE_ENV === 'test' || process.env?.VITEST === 'true') {
+    const rawTest = process.env?.PXPIPE_MIN_COLD_SAVE_FRACTION;
+    if (rawTest === undefined || rawTest.trim() === '') return 0;
+    const nTest = Number(rawTest.trim());
+    return Number.isFinite(nTest) && nTest >= 0 && nTest < 1 ? nTest : 0;
+  }
+  const raw = process.env?.PXPIPE_MIN_COLD_SAVE_FRACTION;
+  if (raw === undefined || raw.trim() === '') return 0;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) && n >= 0 && n < 1 ? n : 0;
+}
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
@@ -195,17 +219,26 @@ export const ANTHROPIC_PIXELS_PER_TOKEN = 750;
  *  Exported so the export pipeline reuses the same value. */
 export const IMAGE_COST_SAFETY_MARGIN = 1.10;
 
+/** Resolve effective glyph cell px for gate math. MUST match render.ts
+ *  `renderCellWidth/Height` — Opus ships cellWBonus/cellHBonus=4 (9×12) while
+ *  Fable stays 5×8. Pricing the gate at bare CELL_W/CELL_H under-counted Opus
+ *  image tokens by ~2.7× and let cold losers through (post-cutover p50 ~36%). */
+function gateCellPx(style?: RenderStyle): { cellW: number; cellH: number } {
+  if (!style) return { cellW: CELL_W, cellH: CELL_H };
+  return { cellW: renderCellWidth(style), cellH: renderCellHeight(style) };
+}
+
 /** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
-function singleColWidthPx(cols: number): number {
-  return 2 * PAD_X + cols * CELL_W;
+function singleColWidthPx(cols: number, cellW: number = CELL_W): number {
+  return 2 * PAD_X + cols * cellW;
 }
 
 /** Width in px of a multi-col PNG. Mirrors `multiColWidth()` in render.ts. */
-function multiColWidthPx(cols: number, numCols: number): number {
+function multiColWidthPx(cols: number, numCols: number, cellW: number = CELL_W): number {
   const n = Math.max(1, numCols | 0);
-  if (n === 1) return singleColWidthPx(cols);
+  if (n === 1) return singleColWidthPx(cols, cellW);
   const GUTTER_CELLS = 4; // must match render.ts (not exported)
-  return 2 * PAD_X + n * cols * CELL_W + (n - 1) * GUTTER_CELLS * CELL_W;
+  return 2 * PAD_X + n * cols * cellW + (n - 1) * GUTTER_CELLS * cellW;
 }
 
 /** Exact image-token cost for `visualRows` at given column/multi-col geometry.
@@ -217,11 +250,13 @@ function imageTokensForRows(
   numCols: number = 1,
   imageCountCap?: number,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  cellW: number = CELL_W,
+  cellH: number = CELL_H,
 ): number {
   if (!Number.isFinite(visualRows) || visualRows <= 0) return 0;
   const n = Math.max(1, numCols | 0);
-  const widthPx = multiColWidthPx(cols, n);
-  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const widthPx = multiColWidthPx(cols, n, cellW);
+  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / cellH));
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
   const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerCol);
   const rowsPerImage = linesPerImg; // pixel rows per image (height)
@@ -234,26 +269,29 @@ function imageTokensForRows(
   const linesInLast = visualRows - fullImages * linesPerImage;
   // Column-major layout: pixel rows = min(linesInLast, rowsPerImage).
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
-  const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
-  const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
+  const fullImageHeight = 2 * PAD_Y + rowsPerImage * cellH;
+  const lastImageHeight = 2 * PAD_Y + rowsInLast * cellH;
   const totalPixels = fullImages * widthPx * fullImageHeight + widthPx * lastImageHeight;
   return Math.ceil((totalPixels / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
 }
 
 /** Exact image-token cost for `text`. Uses `countVisualRows` and optionally
  *  `shrinkColsToContent` (default true) so narrow blocks aren't priced at full
- *  canvas width. Pass `shrinkWidth=false` for the system slab (fills full `cols`). */
-function imageTokensCost(
+ *  canvas width. Pass `shrinkWidth=false` for the system slab (fills full `cols`).
+ *  Pass `style` when the renderer will use non-default cell bonuses (Opus 9×12). */
+export function imageTokensCost(
   text: string,
   cols: number,
   numCols: number = 1,
   imageCountCap?: number,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  style?: RenderStyle,
 ): number {
   const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
   const rows = countVisualRows(text, effectiveCols);
-  return imageTokensForRows(rows, effectiveCols, numCols, imageCountCap, maxCharsPerImage);
+  const { cellW, cellH } = gateCellPx(style);
+  return imageTokensForRows(rows, effectiveCols, numCols, imageCountCap, maxCharsPerImage, cellW, cellH);
 }
 
 /** Gate geometry for the single-col dense path (tool_result, reminder, history).
@@ -324,19 +362,21 @@ export function evalCompressionProfitability(
   priorWarmTokens: number = 0,
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
+  style?: RenderStyle,
 ): {
   imageTokens: number;
   textTokens: number;
   burnImageSide: number;
   burnTextSide: number;
   profitable: boolean;
+  minColdSaveFraction: number;
 } | null {
   const n = Math.max(1, numCols | 0);
   if (typeof text !== 'string' || text.length === 0) return null;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
+  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, READABLE_CHARS_PER_IMAGE, style);
   const textTokens = text.length / cpt;
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
     ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
@@ -344,12 +384,21 @@ export function evalCompressionProfitability(
   const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
     ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
+  const floor = minColdSaveFraction();
+  // Cold honest-dashboard floor: same cache state both sides ⇒ save=(T-I)/T.
+  // floor=0.90 ⇒ I <= 0.10*T. (Fulltext-weighted 90% would need I<=0.08*T and
+  // is often physically unreachable at Anthropic vision rates — see OPTIMIZE.md.)
+  const coldFloorOk = floor <= 0 || priorWarmTokens > 0
+    || imageTokens <= textTokens * (1 - floor);
+  const profitable =
+    coldFloorOk && imageTokens + burnImageSide < textTokens + burnTextSide;
   return {
     imageTokens,
     textTokens,
     burnImageSide,
     burnTextSide,
-    profitable: imageTokens + burnImageSide < textTokens + burnTextSide,
+    profitable,
+    minColdSaveFraction: floor,
   };
 }
 
@@ -363,13 +412,14 @@ export function isCompressionProfitable(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  style?: RenderStyle,
 ): boolean {
   const n = Math.max(1, numCols | 0);
   if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage);
+  const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage, style);
   const textTokensEquivalent = text.length / cpt;
   // Symmetric burn penalty (anti-flapping): switching modes invalidates the warm
   // cache on whichever side was warm, paying cache_create. Burn is added to the
@@ -381,6 +431,13 @@ export function isCompressionProfitable(
   const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
     ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
+  const floor = minColdSaveFraction();
+  if (floor > 0 && !(priorWarmTokens > 0)) {
+    // Honest-dashboard cold target: (T - I)/T >= floor ⇒ I <= T*(1-floor)
+    if (imageTokensCost_ > textTokensEquivalent * (1 - floor)) {
+      return false;
+    }
+  }
   return imageTokensCost_ + burnImageSide < textTokensEquivalent + burnTextSide;
 }
 
@@ -404,9 +461,10 @@ export function isCompressionProfitableAmortized(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  style?: RenderStyle,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
-    return isCompressionProfitable(text, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage);
+    return isCompressionProfitable(text, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, style);
   }
   const N = Math.max(2, Math.floor(horizon));
   const n = Math.max(1, numCols | 0);
@@ -414,7 +472,7 @@ export function isCompressionProfitableAmortized(
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
-  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage);
+  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage, style);
   const textTokens = text.length / cpt;
   // Worst-case-for-image vs best-case-for-text (conservative, on purpose).
   const imageLifetime = imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
@@ -433,7 +491,7 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'cache_preserving',
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
   info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
@@ -593,7 +651,12 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number };
+  passthroughReasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    kept_sharp?: number;
+    cache_preserving?: number;
+  };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -637,6 +700,18 @@ export interface TransformInfo {
   /** Approx size (chars) of that cached prefix — pairs with cachePrefixSha8 so a
    *  bust reads as growth (size up) vs pure invalidation (size unchanged). */
   cachePrefixBytes?: number;
+  /**
+   * Warm Anthropic path: caller `cache_control` + assistant history present.
+   * When true, the static tools+system prefix was left byte-stable (not re-imaged);
+   * only post-breakpoint history/tail may have been collapsed into images (P1 partial gate).
+   */
+  cachePreservingPrefix?: boolean;
+  /**
+   * sha8 of tools+system only (no messages). Kill criterion for P1: must stay
+   * identical across warm turns. Distinct from cachePrefixSha8 which may include
+   * growing history images after the system breakpoint.
+   */
+  toolsSystemSha8?: string;
   /** Why the history collapse didn't run (or did). Diagnostic only. */
   historyReason?:
     | 'no_history'
@@ -875,68 +950,47 @@ async function historyImageSha8(
 }
 
 /**
- * After a history collapse, move pxpipe's single relocated cache breakpoint off
- * the slab image and onto the LAST history image.
+ * HISTORICAL: moved the Anthropic cache_control breakpoint from the static slab
+ * image onto a history image so slab+history would share one cached prefix.
  *
- * The history image sits AFTER the slab in prefix order, so one marker on it
- * caches the WHOLE imaged prefix (slab + history) as a single stable segment —
- * created once, then read at the ~0.1x rate every turn. Without this the history
- * image (usually the largest block) only lands in a cached prefix when the
- * caller's roaming downstream marker happens to fall after it; when it doesn't,
- * the entire history image re-creates at the 1.25x rate turn after turn.
+ * Production cache-bleed (2026-08): history image bytes change every turn even
+ * with a "carry-over" ordinal, so the moved marker wrote a new prefix every turn
+ * at ~1.25× and never got stable ~0.1× reads — cache-hit rows went massively
+ * net-negative (AsText ≪ Sent).
  *
- * Pure relocation: it acts only when a slab image already carries the anchor, so
- * the total marker count never increases (pxpipe never *adds* — only moves).
+ * Fix: KEEP the breakpoint on the byte-stable slab. Never delete slab
+ * cache_control. Never attach markers to mutable history images. Retained as a
+ * named no-op so call sites and cachePrefixDigest comments stay stable.
  */
-function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrdinal?: number): void {
-  if (!Array.isArray(messages)) return;
+function relocateAnchorToHistoryImage(_messages: Message[] | undefined, _anchorOrdinal?: number): void {
+  return;
+}
 
-  // The synthetic history message is identified by its banner text block.
-  let historyImg: (ImageBlock & { cache_control?: unknown }) | undefined;
-  for (const m of messages) {
-    if (!Array.isArray(m.content)) continue;
-    const first = m.content[0] as TextBlock | undefined;
-    if (!first || first.type !== 'text' || first.text !== HISTORY_SYNTHETIC_INTRO) continue;
-    // Collect this message's images in order, then pin the carry-over anchor (the last
-    // byte-stable history image) when collapseHistory provided its ordinal; otherwise
-    // fall back to the last image. Pinning the LAST image is the #11 bust: it's the
-    // newest, still-growing chunk and its bytes change on every window advance.
-    const imgsInMsg: Array<ImageBlock & { cache_control?: unknown }> = [];
-    for (const b of m.content) {
-      if (b && (b as ImageBlock).type === 'image') {
-        imgsInMsg.push(b as ImageBlock & { cache_control?: unknown });
-      }
-    }
-    historyImg =
-      anchorOrdinal !== undefined && anchorOrdinal >= 0 && anchorOrdinal < imgsInMsg.length
-        ? imgsInMsg[anchorOrdinal]
-        : imgsInMsg[imgsInMsg.length - 1];
-    break;
-  }
-  if (!historyImg) return;
+/**
+ * P1 partial warm gate (operator-authorized 2026-08-11).
+ * When ON: warm Anthropic turns keep tools+system byte-stable but may collapse
+ * post-breakpoint history into images. When OFF (`0`/`false`/`no`/`off`): full
+ * early-return passthrough (pre-P1 cache_preserving behavior).
+ * Default ON.
+ */
+export function partialWarmGateEnabled(): boolean {
+  if (typeof process === 'undefined') return true;
+  const raw = process.env?.PXPIPE_PARTIAL_WARM_GATE;
+  if (raw === undefined || raw.trim() === '') return true;
+  return !/^(0|false|no|off)$/i.test(raw.trim());
+}
 
-  // The slab anchor is the marked image BEFORE the '[End of rendered context.]'
-  // boundary in the slab-bearing message. Reminder/tool images sit after that
-  // boundary (or in other messages) and keep their own caller markers.
-  let slabAnchor: (ImageBlock & { cache_control?: unknown }) | undefined;
-  for (const m of messages) {
-    if (!Array.isArray(m.content)) continue;
-    const hasBoundary = m.content.some(
-      (b) => b && (b as TextBlock).type === 'text' && (b as TextBlock).text === '[End of rendered context.]',
-    );
-    if (!hasBoundary) continue;
-    for (const b of m.content) {
-      if (b && (b as TextBlock).type === 'text' && (b as TextBlock).text === '[End of rendered context.]') break;
-      if (b && (b as ImageBlock).type === 'image' && (b as { cache_control?: unknown }).cache_control !== undefined) {
-        slabAnchor = b as ImageBlock & { cache_control?: unknown };
-      }
-    }
-    break;
-  }
-  if (!slabAnchor) return; // nothing to relocate → never add a marker
-
-  historyImg.cache_control = slabAnchor.cache_control;
-  delete slabAnchor.cache_control;
+/** sha8 of tools + system only — the Anthropic prompt-cache breakpoint prefix
+ *  that P1 must never rewrite on warm turns. */
+export async function toolsSystemDigest(
+  req: { tools?: unknown; system?: unknown },
+): Promise<string> {
+  const parts: string[] = [];
+  if (Array.isArray(req.tools)) for (const t of req.tools) parts.push(JSON.stringify(t));
+  const sys = req.system;
+  if (typeof sys === 'string') parts.push(sys);
+  else if (Array.isArray(sys)) for (const b of sys) parts.push(JSON.stringify(b));
+  return sha8(parts.join('\x00'));
 }
 
 /**
@@ -1428,12 +1482,29 @@ function approxBlockBytes(blk: ImageBlock): number {
  * Called from both the main path AND early-exit paths (below_min_chars,
  * not_profitable) — history collapse must run even when the slab skips.
  * Tolerant to missing/short message arrays (collapseHistory short-circuits). */
+/** Warm partial-gate history knobs — finer collapseChunk (align freezeChunk=10)
+ *  + shorter keepTail so more post-breakpoint text becomes images while
+ *  tools+system stay byte-stable. Override via env; defaults beat coarse 50/4. */
+function partialWarmHistoryOpts(): { keepTail: number; collapseChunk: number } {
+  const keepRaw = typeof process !== 'undefined' ? process.env?.PXPIPE_PARTIAL_WARM_KEEP_TAIL : undefined;
+  const chunkRaw = typeof process !== 'undefined' ? process.env?.PXPIPE_PARTIAL_WARM_COLLAPSE_CHUNK : undefined;
+  const keepTail = keepRaw !== undefined && keepRaw.trim() !== ''
+    ? Math.max(1, Math.floor(Number(keepRaw)) || 1)
+    : 1;
+  const collapseChunk = chunkRaw !== undefined && chunkRaw.trim() !== ''
+    ? Math.max(0, Math.floor(Number(chunkRaw)))
+    : 0; // 0 = per-turn boundary — maximize imaged history on warm partial path
+  return { keepTail, collapseChunk };
+}
+
 async function runHistoryCollapseAndFinalize(
   req: MessagesRequest,
   info: TransformInfo,
   o: Required<TransformOptions>,
   opts: TransformOptions,
   droppedCodepoints: Map<number, number>,
+  /** When true (P1 warm path): finer history grid to maximize post-breakpoint savings. */
+  warmPartial = false,
 ): Promise<{ body: Uint8Array; info: TransformInfo; collapsed: boolean }> {
   let collapsedFlag = false;
   if (Array.isArray(req.messages) && req.messages.length > 0) {
@@ -1455,15 +1526,23 @@ async function runHistoryCollapseAndFinalize(
       return isCompressionProfitableAmortized(
         text, g.cols, undefined, 1, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
+        envStyleOverride((req as { model?: string }).model),
       );
     };
     // No protectedPrefix here: this path runs only when the slab did NOT image
     // (it stays as text in req.system), so there is no slab message to shield —
     // collapsing from the head is correct.
+    const warmHist = warmPartial ? partialWarmHistoryOpts() : {};
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: 0, reflow: o.reflow, style: envStyleOverride((req as { model?: string }).model) },
+      {
+        cols: o.cols,
+        protectedPrefix: 0,
+        reflow: o.reflow,
+        style: envStyleOverride((req as { model?: string }).model),
+        ...warmHist,
+      },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
@@ -1554,17 +1633,108 @@ export async function transformRequest(
     info.contextWindowTokens = profile.contextWindowTokens;
     info.maxOutputTokens = profile.maxOutputTokens;
   }
+  // Opus's 9×12 cells fit fewer chars/image → compensate with more factsheet sidecar tokens
+  const factSheetBudget: number | undefined =
+    info.modelCanonicalId?.includes('opus') ? MAX_TOKENS_OPUS : undefined;
   // Per-model density override from the same PXPIPE_GPT_PROFILES env map the GPT
-  // path uses. undefined for models with no explicit entry → every render below
-  // keeps DENSE_RENDER_STYLE (the validated Fable 5×8 default). This is what pins
-  // e.g. claude-opus-4-8 to its measured-legible 9×12 while Fable stays 5×8. @jules
-  const denseStyle: RenderStyle | undefined = envStyleOverride((req as { model?: string }).model);
+  // path uses. Falls back to model-registry renderProfile cell bonuses so Opus
+  // 9×12 is priced even when the env map is missing (gate previously assumed 5×8).
+  const denseStyle: RenderStyle | undefined = (() => {
+    const model = (req as { model?: string }).model;
+    const env = envStyleOverride(model);
+    if (env) return env;
+    try {
+      const p = resolveModelProfile(model ?? '');
+      const bonusW = p.renderProfile?.cellWBonus ?? 0;
+      const bonusH = p.renderProfile?.cellHBonus ?? 0;
+      if (!bonusW && !bonusH) return undefined;
+      return {
+        ...(p.renderProfile.style ?? {}),
+        cellWBonus: bonusW,
+        cellHBonus: bonusH,
+      };
+    } catch {
+      return undefined;
+    }
+  })();
 
   // 1. Pull system text out. Split into:
   //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
   //    - dynamicText: <env>/<context>/... blocks (per-turn, kept as text).
   //    - staticText: everything else (cacheable, goes into the image).
   const systemStaticCacheControl = lastStaticSystemCacheControl(req.system);
+  // Cache-preserving path: warm Anthropic turns with caller cache_control.
+  // Imaging the warm TEXT PREFIX (system/tools) destroys ~0.1× cache_read and
+  // was the dominant source of net-negative Saved rows (2026-08-10 bleed).
+  // P1 partial gate (operator go 2026-08-11): keep tools+system byte-stable,
+  // but still collapse post-breakpoint history into images when profitable.
+  // Kill switch: PXPIPE_PARTIAL_WARM_GATE=0 → full early-return (pre-P1).
+  const hasAssistantHistory = (req.messages ?? []).some((m) => m.role === 'assistant');
+  const warmCachePreserve =
+    systemStaticCacheControl !== undefined &&
+    (o.priorWarmTokens > 0 || hasAssistantHistory);
+  if (warmCachePreserve) {
+    info.cachePreservingPrefix = true;
+    bumpPassthrough(info, 'cache_preserving');
+    if (!partialWarmGateEnabled()) {
+      info.reason = 'cache_preserving';
+      return { body, info };
+    }
+    // Snapshot tools+system digest BEFORE any message-side mutation.
+    const toolsSysBefore = await toolsSystemDigest(req);
+    info.toolsSystemSha8 = toolsSysBefore;
+    const finalized = await runHistoryCollapseAndFinalize(
+      req, info, o, opts, droppedCodepoints, /* warmPartial */ true,
+    );
+    const toolsSysAfter = await toolsSystemDigest(req);
+    if (toolsSysAfter !== toolsSysBefore) {
+      // Kill criterion: tools+system must never change on the warm path.
+      // Revert to full passthrough with original bytes.
+      info.reason = 'cache_preserving';
+      info.compressed = false;
+      info.imageCount = 0;
+      info.collapsedTurns = undefined;
+      info.collapsedChars = undefined;
+      info.collapsedImages = undefined;
+      info.historyReason = undefined;
+      info.historyImageSha = undefined;
+      info.imagePngs = undefined;
+      info.imageDims = undefined;
+      return { body, info };
+    }
+    if (!finalized.collapsed) {
+      info.reason = 'cache_preserving';
+      // Body may equal original if collapse no-op'd; prefer original bytes.
+      return { body, info };
+    }
+    // History imaged; prefix preserved. Mark compressed + keep cache_preserving
+    // reason so dashboards still show why the slab was not rewritten.
+    info.compressed = true;
+    info.reason = 'cache_preserving_partial';
+    info.origChars = info.collapsedChars ?? 0;
+    info.compressedChars = info.collapsedChars ?? 0;
+    {
+      const pfx = await cachePrefixDigest(req);
+      if (pfx) {
+        info.cachePrefixSha8 = pfx.sha8;
+        info.cachePrefixBytes = pfx.bytes;
+      }
+    }
+    if (droppedCodepoints.size > 0) {
+      const TOP_N = 20;
+      const sorted = [...droppedCodepoints.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, TOP_N);
+      const out: Record<string, number> = {};
+      for (const [cp, count] of sorted) {
+        const hex = cp.toString(16).toUpperCase().padStart(4, '0');
+        out[`U+${hex}`] = count;
+      }
+      info.droppedCodepointsTop = out;
+      info.droppedChars = [...droppedCodepoints.values()].reduce((a, b) => a + b, 0);
+    }
+    return { body: finalized.body, info };
+  }
   const { text: rawSysText, kept: sysRemainder } = extractSystemText(req.system);
   const { kept: billingLine, body: sysBodyWithEnv } = stripBillingLine(rawSysText);
   // Pull the volatile `# Environment` markdown section out BEFORE the
@@ -1746,6 +1916,7 @@ export async function transformRequest(
   const slabGateEval = evalCompressionProfitability(
     combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
     false, // already shrunk — don't double-shrink
+    denseStyle,
   );
   if (slabGateEval) {
     info.gateEval = {
@@ -1757,7 +1928,7 @@ export async function transformRequest(
       profitable: slabGateEval.profitable,
     };
   }
-  if (!isCompressionProfitable(combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, false)) {
+  if (!isCompressionProfitable(combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, false, READABLE_CHARS_PER_IMAGE, denseStyle)) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab not profitable but history may still be collapsable — try before returning.
@@ -1884,7 +2055,7 @@ export async function transformRequest(
           // model reads.
           const reminderRaw = (blk as TextBlock).text;
           const reminderText = maybeReflow(compactSlabWhitespace(reminderRaw), o.reflow);
-          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseStyle)) {
             bumpPassthrough(info, 'not_profitable');
             processedExisting.push(blk);
             continue;
@@ -1903,7 +2074,7 @@ export async function transformRequest(
             processedExisting.push(out as ImageBlock);
             info.imageBytes += approxBlockBytes(img);
           }
-          const reminderFactSheet = factSheetText(reminderRaw);
+          const reminderFactSheet = factSheetText(reminderRaw, factSheetBudget);
           if (reminderFactSheet) processedExisting.push({ type: 'text', text: reminderFactSheet });
           info.imagePixels = (info.imagePixels ?? 0) + pixels;
           info.reminderImgs = (info.reminderImgs ?? 0) + imgs.length;
@@ -1924,7 +2095,7 @@ export async function transformRequest(
         processedExisting.push(...existing);
       }
 
-      const slabFactSheet = factSheetText(combinedRaw);
+      const slabFactSheet = factSheetText(combinedRaw, factSheetBudget);
       m.content = [
         ...imageBlocks,
         ...(slabFactSheet ? [{ type: 'text' as const, text: slabFactSheet }] : []),
@@ -1962,7 +2133,7 @@ export async function transformRequest(
               if (innerR.length < o.minToolResultChars) {
                 bumpPassthrough(info, 'below_threshold');
                 rewritten.push(blk);
-              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseStyle)) {
                 bumpPassthrough(info, 'not_profitable');
                 rewritten.push(blk);
               } else {
@@ -1991,7 +2162,7 @@ export async function transformRequest(
                 for (const [cp, n] of dcp) {
                   droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
                 }
-                const trFactSheet = factSheetText(innerRaw);
+                const trFactSheet = factSheetText(innerRaw, factSheetBudget);
                 rewritten.push({
                   ...tr,
                   content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
@@ -2028,7 +2199,7 @@ export async function transformRequest(
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
-                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
+                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseStyle)) {
                   bumpPassthrough(info, 'not_profitable');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
@@ -2052,7 +2223,7 @@ export async function transformRequest(
                   newInner.push(out as ImageBlock);
                   info.imageBytes += approxBlockBytes(img);
                 }
-                const partFactSheet = factSheetText(innerTextRaw);
+                const partFactSheet = factSheetText(innerTextRaw, factSheetBudget);
                 if (partFactSheet) newInner.push({ type: 'text', text: partFactSheet });
                 info.imagePixels = (info.imagePixels ?? 0) + pixels;
                 info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
@@ -2106,6 +2277,7 @@ export async function transformRequest(
       return isCompressionProfitableAmortized(
         text, g.cols, undefined, 1, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
+        envStyleOverride((req as { model?: string }).model),
       );
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
