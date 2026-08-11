@@ -18,6 +18,7 @@ import { HISTORY_SYNTHETIC_INTRO } from '../src/core/history.js';
 afterEach(() => {
   delete process.env.PXPIPE_PARTIAL_WARM_GATE;
   delete process.env.PXPIPE_MIN_COLD_SAVE_FRACTION;
+  delete process.env.PXPIPE_GPT_PROFILES;
 });
 
 const CACHE = { type: 'ephemeral' as const };
@@ -144,17 +145,17 @@ describe('P1 partial warm gate', () => {
     expect(info.collapsedImages ?? 0).toBeGreaterThan(0);
     expect(info.passthroughReasons?.cache_preserving).toBeGreaterThan(0);
 
-    // History synthetic banner present; no cache_control on history images
+    // History synthetic banner present; at most one cache_control on the
+    // byte-frozen carry-over history image (P2); never on growing chunks.
     const histMsg = (after.messages as Array<{ content: unknown[] }>).find((m) => {
       const c0 = m.content?.[0] as { type?: string; text?: string } | undefined;
       return c0?.type === 'text' && c0.text === HISTORY_SYNTHETIC_INTRO;
     });
     expect(histMsg).toBeTruthy();
-    for (const b of histMsg!.content) {
-      if ((b as { type?: string }).type === 'image') {
-        expect((b as { cache_control?: unknown }).cache_control).toBeUndefined();
-      }
-    }
+    const markedImgs = histMsg!.content.filter(
+      (b) => (b as { type?: string }).type === 'image' && (b as { cache_control?: unknown }).cache_control,
+    );
+    expect(markedImgs.length).toBeLessThanOrEqual(1);
   });
 
   it('warm + markers, short history → cache_preserving passthrough (no collapse)', async () => {
@@ -177,6 +178,58 @@ describe('P1 partial warm gate', () => {
     expect(info.reason).toBe('cache_preserving');
     expect(info.compressed).toBe(false);
     expect(info.collapsedImages ?? 0).toBe(0);
+  });
+
+  it('Opus + live-like 9×12 GPT_PROFILES still collapses history at 5×8 (not not_profitable)', async () => {
+    // Regression: envStyleOverride Opus bonuses used to price history at 9×12 while
+    // renderer stayed dense → gate said not_profitable → silent CP passthrough.
+    process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
+      'claude-opus-5': { style: { cellWBonus: 4, cellHBonus: 4, aa: true, grid: false } },
+      'claude-fable-5': { style: { cellWBonus: 0, cellHBonus: 0, aa: true, grid: false } },
+    });
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        ...JSON.parse(new TextDecoder().decode(warmLargeHistoryBody())),
+        model: 'claude-opus-5',
+      }),
+    );
+    const { info } = await transformRequest(body, {
+      charsPerToken: HISTORY_CHARS_PER_TOKEN,
+      historyAmortizationHorizon: 5,
+    });
+    expect(info.reason).toBe('cache_preserving_partial');
+    expect(info.compressed).toBe(true);
+    expect(info.collapsedImages ?? 0).toBeGreaterThan(0);
+    expect(info.toolsSystemSha8).toBeTruthy();
+  });
+
+  it('warm partial may mark frozen carry-over history image; tools+system unchanged', async () => {
+    const body = warmLargeHistoryBody({ turns: 18 });
+    const before = JSON.parse(new TextDecoder().decode(body));
+    const digestBefore = await toolsSystemDigest(before);
+    const { body: out, info } = await transformRequest(body, {
+      charsPerToken: HISTORY_CHARS_PER_TOKEN,
+      historyAmortizationHorizon: 5,
+    });
+    expect(info.compressed).toBe(true);
+    const after = JSON.parse(new TextDecoder().decode(out));
+    expect(await toolsSystemDigest(after)).toBe(digestBefore);
+    expect(JSON.stringify(after.system)).toBe(JSON.stringify(before.system));
+    // System slab marker still present
+    const sysCc = (after.system as Array<{ cache_control?: unknown }>).some((b) => b.cache_control);
+    expect(sysCc).toBe(true);
+    // If a history image carries cache_control, it must be an image (not text) and
+    // tools/system digest must still match (already asserted).
+    const hist = (after.messages as Array<{ content: unknown[] }>).find((m) => {
+      const c0 = m.content?.[0] as { type?: string; text?: string } | undefined;
+      return c0?.type === 'text' && c0.text === HISTORY_SYNTHETIC_INTRO;
+    });
+    expect(hist).toBeTruthy();
+    const markedImgs = (hist!.content as Array<{ type?: string; cache_control?: unknown }>).filter(
+      (b) => b.type === 'image' && b.cache_control,
+    );
+    // carry-over may be absent on tiny collapses; with 18 turns expect ≥0 (ok if 0 or 1+)
+    expect(markedImgs.length).toBeLessThanOrEqual(1);
   });
 
   it('two consecutive warm collapses keep toolsSystemSha8 identical', async () => {

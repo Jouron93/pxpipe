@@ -1497,6 +1497,34 @@ function partialWarmHistoryOpts(): { keepTail: number; collapseChunk: number } {
   return { keepTail, collapseChunk };
 }
 
+/**
+ * Attach cache_control to the byte-frozen carry-over history IMAGE only.
+ * Keeps the caller's system slab marker (does not relocate — bleed-safe).
+ * Never marks the newest still-growing chunk.
+ */
+function markFrozenHistoryCarryOverCache(
+  messages: Message[] | undefined,
+  carryOverImageOrdinal: number,
+): boolean {
+  if (!messages || carryOverImageOrdinal < 0) return false;
+  for (const m of messages) {
+    if (!Array.isArray(m.content) || m.content.length === 0) continue;
+    const first = m.content[0] as { type?: string; text?: string };
+    if (first?.type !== 'text' || first.text !== HISTORY_SYNTHETIC_INTRO) continue;
+    const images: Array<{ type?: string; cache_control?: { type: string } }> = [];
+    for (const b of m.content) {
+      if (b && (b as { type?: string }).type === 'image') {
+        images.push(b as { type?: string; cache_control?: { type: string } });
+      }
+    }
+    if (carryOverImageOrdinal >= images.length) return false;
+    const target = images[carryOverImageOrdinal]!;
+    if (!target.cache_control) target.cache_control = { type: 'ephemeral' };
+    return true;
+  }
+  return false;
+}
+
 async function runHistoryCollapseAndFinalize(
   req: MessagesRequest,
   info: TransformInfo,
@@ -1522,11 +1550,15 @@ async function runHistoryCollapseAndFinalize(
       // History always renders single-col at the dense 384-col / 240-row page
       // (history.ts → renderTextToPngsWithCharLimit with DENSE_CONTENT_COLS /
       // DENSE_CONTENT_CHARS_PER_IMAGE), so gate at THAT geometry, not o.cols.
+      // CRITICAL: do NOT pass Opus 9×12 envStyleOverride here — that under/over
+      // prices history vs the 5×8 renderer (DENSE_RENDER_STYLE) and with live
+      // PXPIPE_GPT_PROFILES made warm partial collapse not_profitable → silent
+      // fall-back to text CP (measured 2026-08-11). History stays 5×8 forever.
       const g = denseGateGeometry(cols, 1);
       return isCompressionProfitableAmortized(
         text, g.cols, undefined, 1, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
-        envStyleOverride((req as { model?: string }).model),
+        DENSE_RENDER_STYLE,
       );
     };
     // No protectedPrefix here: this path runs only when the slab did NOT image
@@ -1540,7 +1572,7 @@ async function runHistoryCollapseAndFinalize(
         cols: o.cols,
         protectedPrefix: 0,
         reflow: o.reflow,
-        style: envStyleOverride((req as { model?: string }).model),
+        style: DENSE_RENDER_STYLE,
         ...warmHist,
       },
     );
@@ -1566,6 +1598,11 @@ async function runHistoryCollapseAndFinalize(
       info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
       collapsedFlag = true;
+      // Warm P2: extra breakpoint on frozen carry-over history image so later
+      // turns cache_read tools+system+frozen-history. System marker stays put.
+      if (warmPartial && histInfo.carryOverImageOrdinal !== undefined) {
+        markFrozenHistoryCarryOverCache(req.messages, histInfo.carryOverImageOrdinal);
+      }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
     }
@@ -2273,18 +2310,20 @@ export async function transformRequest(
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     const historyProfitable = (text: string, cols: number): boolean => {
       // Gate at dense 384-col/240-row geometry (matches history.ts renderer).
+      // Price at DENSE_RENDER_STYLE (5×8) — never Opus 9×12 bonuses (see warm
+      // partial path comment). Renderer uses DENSE_RENDER_STYLE (5×8).
       const g = denseGateGeometry(cols, 1);
       return isCompressionProfitableAmortized(
         text, g.cols, undefined, 1, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
-        envStyleOverride((req as { model?: string }).model),
+        DENSE_RENDER_STYLE,
       );
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
-      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow, style: denseStyle },
+      { cols: o.cols, protectedPrefix: slabAnchorIdx >= 0 ? slabAnchorIdx + 1 : 0, reflow: o.reflow, style: DENSE_RENDER_STYLE },
     );
     if (histInfo.collapsedTurns > 0) {
       req.messages = newMessages;
