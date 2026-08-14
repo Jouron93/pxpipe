@@ -123,7 +123,8 @@ export function isClaudeModel(model: string | null | undefined): boolean {
 }
 
 export function isGrokModel(model: string | null | undefined): boolean {
-  return (model ?? '').toLowerCase().startsWith('grok-');
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('grok') || m.startsWith('xai/');
 }
 
 /** Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel

@@ -131,6 +131,9 @@ function applyConfigFileDefaults(): void {
       process.env.PXPIPE_MIN_BODY_BYTES = String(minBytes);
     }
   }
+  if (process.env.XAI_API_KEY === undefined && typeof cfg.xai_api_key === 'string') {
+    process.env.XAI_API_KEY = cfg.xai_api_key;
+  }
   const laneKeys = [
     ['PXPIPE_ANTHROPIC_BILLING_LANE', 'anthropic_billing_lane'],
     ['PXPIPE_OPENAI_BILLING_LANE', 'openai_billing_lane'],
@@ -1105,6 +1108,7 @@ async function main(): Promise<void> {
     openAIUpstream: opts.openAIUpstream,
     xaiUpstream: opts.xaiUpstream,
     openAIApiKey: opts.openAIApiKey,
+    xaiApiKey: opts.xaiApiKey,
     billingLanes: opts.billingLanes,
     captureRequestBodiesOn4xx: opts.captureRequestBodiesOn4xx,
     // Per-request transform options:
