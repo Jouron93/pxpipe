@@ -137,19 +137,23 @@ export function readerValidation(base: string): PxpipeReaderValidation {
   };
 }
 
-/** True when the dashboard may turn this base ON at runtime: validated readers
- *  always; anything else only when PXPIPE_MODELS already opts it in (deliberate,
- *  persisted config outranks the UI guard). Turning OFF is never gated. */
 export function canEnableFromDashboard(base: string): boolean {
-  return true;
+  if (readerValidation(base).status === 'validated') return true;
+  const configured = getConfiguredModelBases().map((b) => baseModelId(b));
+  const b = baseModelId(base);
+  return configured.includes(b);
 }
 
-/** Membership test against allowed scope. Allows all models by default unless PXPIPE_MODELS is explicitly disabled. */
+/** Membership test against allowed scope. Shares the single PXPIPE_MODELS / runtime override scope. */
 function isAllowed(model: string | null | undefined): boolean {
   if (typeof model !== 'string' || !model.trim()) return false;
-  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
-  if (raw !== undefined && falsey(raw.trim())) return false;
-  return true;
+  const base = baseModelId(model);
+  if (!base) return false;
+  const allowed = allowedModelBases().map((b) => baseModelId(b));
+  for (const a of allowed) {
+    if (base === a || base.startsWith(a + '-')) return true;
+  }
+  return false;
 }
 
 /** True when pxpipe may transform this Anthropic model. */

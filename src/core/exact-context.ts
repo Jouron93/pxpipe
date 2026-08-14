@@ -5,6 +5,10 @@ const DEFAULT_MAX_CHARS = 32_768;
 const DEFAULT_MAX_LINE_CHARS = 4_096;
 const DEFAULT_MAX_PARTS = 64;
 
+const DEFAULT_MANIFEST_MAX_LINES = 1024;
+const DEFAULT_MANIFEST_MAX_CHARS = 128_000;
+const DEFAULT_MANIFEST_MAX_LINE_CHARS = 4_096;
+
 export interface ExactContextLimits {
   readonly maxLines?: number;
   readonly maxChars?: number;
@@ -546,9 +550,9 @@ export function buildExactContextManifest(
     return { text: '', lineCount: 0, sourceChars: 0, preservedChars: 0, complete: true };
   }
 
-  const maxLines = positiveLimit(limits.maxLines, DEFAULT_MAX_LINES);
-  const maxChars = positiveLimit(limits.maxChars, DEFAULT_MAX_CHARS);
-  const maxLineChars = positiveLimit(limits.maxLineChars, DEFAULT_MAX_LINE_CHARS);
+  const maxLines = positiveLimit(limits.maxLines, DEFAULT_MANIFEST_MAX_LINES);
+  const maxChars = positiveLimit(limits.maxChars, DEFAULT_MANIFEST_MAX_CHARS);
+  const maxLineChars = positiveLimit(limits.maxLineChars, DEFAULT_MANIFEST_MAX_LINE_CHARS);
   const { lines, sharpLines, headingLines } = classifyExactContext(source);
 
   if (sharpLines.size === 0) {
