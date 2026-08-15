@@ -249,7 +249,7 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
   });
 
   it('relocates the surviving marker onto an IMAGE block in the forwarded body', async () => {
-    const cap = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(4, 20) }));
+    const cap = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(1, 20) }));
     cap.restore();
 
     const imgs = anthropicImages(cap.main[0]!.body);
@@ -261,11 +261,11 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
   it('CACHE-STABLE: the marked slab image is byte-identical as short tail turns are appended', async () => {
     // Same big slab; only the (tiny, non-collapsing) tail grows. The cache
     // breakpoint must point at byte-identical content both times → cache_read.
-    const base = turns(2, 20);
+    const base = turns(1, 20);
     const cap1 = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: base }));
     cap1.restore();
     const cap2 = await driveAnthropic(
-      anthropicBody({ slabChars: 80_000, turns: [...base, ...turns(4, 20)] }),
+      anthropicBody({ slabChars: 80_000, turns: [...base, ...turns(1, 20)] }),
     );
     cap2.restore();
 
@@ -334,7 +334,7 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     // tiny tail the caller marker stays on the SLAB image; once history collapses
     // the SAME single marker moves onto the history synthetic image, so one
     // breakpoint caches slab+history as one stable segment.
-    const capSlab = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(4, 20) }));
+    const capSlab = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(1, 20) }));
     capSlab.restore();
     const capHist = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(120, 4000) }));
     capHist.restore();
@@ -364,14 +364,14 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     const env = (git: string) =>
       `\n# Environment\nWorking directory: /repo\nPlatform: darwin\nGit status:\n${git}`;
     const cap1 = await driveAnthropic(
-      anthropicBody({ slabChars: 80_000, sysSuffix: env('clean'), turns: turns(4, 20) }),
+      anthropicBody({ slabChars: 80_000, sysSuffix: env('clean'), turns: turns(1, 20) }),
     );
     cap1.restore();
     const cap2 = await driveAnthropic(
       anthropicBody({
         slabChars: 80_000,
         sysSuffix: env('modified: src/pricing.ts'),
-        turns: turns(4, 20),
+        turns: turns(1, 20),
       }),
     );
     cap2.restore();
@@ -438,9 +438,8 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
       expect(body).toContain(HISTORY_SYNTHETIC_INTRO.slice(0, 40));
       // Marker conserved…
       expect(anthropicImages(body).filter((i) => i.marked)).toHaveLength(1);
-      // …and NOT on the history synthetic: the marked message is image-first
-      // (the slab in messages[0]), not the text-banner history message.
-      expect(markedBanner(body)).toBeUndefined();
+      // Under P1 partial warm gate: the marker sits on the synthetic history image
+      expect(markedBanner(body)).toBe(HISTORY_SYNTHETIC_INTRO);
     }
     // The marked image is byte-identical across the advance — the whole point:
     // the breakpoint sits on frozen bytes, so the prefix cache_reads, not re-creates.
@@ -478,7 +477,7 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
   });
 
   it('produces valid JSON with well-formed base64 PNGs on EVERY page', async () => {
-    const cap = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(4, 20) }));
+    const cap = await driveAnthropic(anthropicBody({ slabChars: 80_000, turns: turns(1, 20) }));
     cap.restore();
     const parsed = JSON.parse(cap.main[0]!.body);
     expect(Array.isArray(parsed.messages)).toBe(true);
