@@ -46,6 +46,7 @@ import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+import { clampCacheControlMarkers } from './measurement.js';
 
 /**
  * Cold-path honest-dashboard savings floor (operator target ≈90%).
@@ -1607,6 +1608,7 @@ async function runHistoryCollapseAndFinalize(
       info.historyReason = histInfo.reason;
     }
   }
+  clampCacheControlMarkers(req, 4);
   info.outgoingTextChars = countOutgoingTextChars(req);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info, collapsed: collapsedFlag };
@@ -2420,6 +2422,7 @@ export async function transformRequest(
     }
     info.droppedCodepointsTop = out;
   }
+  clampCacheControlMarkers(req, 4);
   info.outgoingTextChars = countOutgoingTextChars(req);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info };

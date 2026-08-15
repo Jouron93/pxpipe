@@ -9,6 +9,8 @@ import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedMo
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
+  clampCacheControlMarkers,
+  countCacheControlMarkers,
 } from './measurement.js';
 import type { Usage } from './types.js';
 
@@ -1240,6 +1242,13 @@ export function createProxy(config: ProxyConfig = {}) {
             : await transformOpenAIResponses(bodyIn, effectiveOpts);
         if (!modelOk) r.info.reason = 'unsupported_model';
         else if (!floorOk) r.info.reason = 'below_min_size';
+        if (isMessages && messagesAnthropic && countCacheControlMarkers(r.body) > 4) {
+          try {
+            const parsed = JSON.parse(new TextDecoder().decode(r.body));
+            clampCacheControlMarkers(parsed, 4);
+            r.body = new TextEncoder().encode(JSON.stringify(parsed));
+          } catch {}
+        }
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;

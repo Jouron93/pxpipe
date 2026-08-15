@@ -151,4 +151,36 @@ describe('Anthropic cache contract — gate never produces negative savings', ()
     expect(info.reason).toBeUndefined();
     expect(info.collapsedImages ?? 0).toBeGreaterThanOrEqual(1);
   });
+
+  it('HARD CAP: strictly clamps cache_control markers to <= 4 when caller sends 5+ markers', async () => {
+    // Anthropic API error: "A maximum of 4 blocks with cache_control may be provided. Found 5."
+    // Construct a request with 6 markers across tools, system, and multiple turns.
+    const msgs = convo(15, 3500);
+    // Add markers on turns 2, 4, 6, 8
+    for (const idx of [2, 4, 6, 8]) {
+      (msgs[idx] as any).content = [
+        { type: 'text', text: msgs[idx].content as string, cache_control: { type: 'ephemeral' } },
+      ];
+    }
+    const body = enc({
+      model: 'claude-3-5-sonnet',
+      tools: [
+        {
+          name: 'tool1',
+          description: 'test',
+          input_schema: { type: 'object' },
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      system: [{ type: 'text', text: big(80_000), cache_control: { type: 'ephemeral' } }],
+      messages: msgs,
+    });
+    // Caller sent 1 (tool) + 1 (system) + 4 (messages) = 6 markers
+    expect(countCacheControlMarkers(body)).toBe(6);
+
+    const { body: out } = await transformRequest(body);
+    const outMarks = countCacheControlMarkers(out);
+    expect(outMarks).toBeLessThanOrEqual(4);
+    expect(outMarks).toBeGreaterThanOrEqual(1);
+  });
 });
