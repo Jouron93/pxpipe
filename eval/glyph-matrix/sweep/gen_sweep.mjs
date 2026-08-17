@@ -1,57 +1,86 @@
-// Root-cause sweep: SAME content rendered at increasing glyph-cell sizes.
-// Isolates ONE variable — pixels-per-glyph (cell size) — from density/search.
-// Short lines so every cell size fits one <=1568px page. Same content across
-// sizes => only resolution changes. Reader accuracy vs cell size = the curve.
+// Local glyph-integrity fixture renderer. This is intentionally offline: it
+// proves the built renderer still emits the checked-in printable-ASCII corpus;
+// it does not measure a daemon, an upstream API, or VLM/OCR behavior.
 import { renderTextToPngs } from '../../../dist/core/render.js';
-import { writeFileSync, mkdirSync } from 'node:fs';
-const OUT = '/tmp/sweep'; mkdirSync(OUT, { recursive: true });
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { parseArgs } from 'node:util';
 
-const PAGES = 4;
-// (cellWBonus, cellHBonus) -> cell = (5+wb) x (8+hb). prod is (0,0)=5x8.
-const SIZES = [
-  ['s0', 0, 0],   // 5x8   prod
-  ['s1', 2, 2],   // 7x10
-  ['s2', 5, 8],   // 10x16  (2x linear)
-  ['s3', 9, 14],  // 14x22  (~2.8x)
-  ['s4', 15, 24], // 20x32  (4x)
-];
+const REFERENCE_PATH = new URL('./glyph_integrity_reference.json', import.meta.url);
+const { values: args } = parseArgs({
+  options: {
+    dir: { type: 'string', default: 'C:/tmp/sweep' },
+  },
+});
 
-function mulberry32(a){return function(){a|=0;a=(a+0x6D2B79F5)|0;let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296;};}
-const rnd = mulberry32(20260616);
-const hex = (n)=>Array.from({length:n},()=>'0123456789abcdef'[(rnd()*16)|0]).join('');
-const ri = (lo,hi)=>lo+Math.floor(rnd()*(hi-lo+1));
+const reference = JSON.parse(readFileSync(REFERENCE_PATH, 'utf8'));
+const fixture = reference.fixture;
 
-// short line (~45 chars) so large cells still fit one page
-function line(label){
-  const id = hex(12);
-  const rec = label ? {label, id, dur: ri(100,9999)} : {lvl:['info','warn','dbg'][ri(0,2)], id, dur: ri(100,9999)};
-  return { text: JSON.stringify(rec), id };
+function fail(message) {
+  throw new Error(`GLYPH_FIXTURE_INVALID: ${message}`);
 }
 
-const golds = {}; SIZES.forEach(([k])=>golds[k]=[]);
-const pageTexts = [];
-for (let p=0; p<PAGES; p++){
-  const pos = new Set(); while(pos.size<5) pos.add(ri(0,7));
-  const labelAt=[...pos]; const labels=['A','B','C','D','E']; const gold={}; const rows=[];
-  for (let r=0; r<8; r++){
-    const idx=labelAt.indexOf(r);
-    if(idx>=0){ const {text,id}=line(labels[idx]); gold[labels[idx]]=id; rows.push(text);}
-    else rows.push(line(null).text);
+function validateFixture() {
+  if (!fixture || typeof fixture !== 'object') fail('fixture is missing');
+  if (!Number.isInteger(fixture.columns) || fixture.columns <= 0) fail('columns must be a positive integer');
+  if (typeof fixture.ascii_corpus_text !== 'string' || fixture.ascii_corpus_text.length === 0) {
+    fail('printable-ASCII corpus is empty');
   }
-  pageTexts.push(rows.join('\n'));
-  SIZES.forEach(([k])=>golds[k].push(gold)); // identical content across sizes
-}
-
-for (const [k, wb, hb] of SIZES){
-  for (let p=0; p<PAGES; p++){
-    // cols=72: even the 20px cell -> 72*20=1440px < 1568, so NO downscale.
-    // Lines are ~45 chars so they fit one row at every size. Glyph px now
-    // genuinely varies at the encoder (the whole point).
-    const pngs = await renderTextToPngs(pageTexts[p], 72, {aa:true, cellWBonus:wb, cellHBonus:hb});
-    if (pngs.length!==1) console.error(`WARN ${k}_${p}: ${pngs.length} pages`);
-    writeFileSync(`${OUT}/${k}_${p}.png`, pngs[0].png);
-    if (p===0) console.log(`${k} cell=${5+wb}x${8+hb}px  page0=${pngs[0].width}x${pngs[0].height}px  img_tokens~${Math.round(pngs[0].width*pngs[0].height/750)}`);
+  const corpus = Array.from(fixture.ascii_corpus_text.replaceAll('\n', ''));
+  if (corpus.length !== 95 || corpus.some((ch, index) => ch.codePointAt(0) !== 0x20 + index)) {
+    fail('corpus must contain U+0020 through U+007E exactly once and in order');
+  }
+  if (!Array.isArray(fixture.pages) || fixture.pages.length === 0) fail('pages must be non-empty');
+  for (const [index, page] of fixture.pages.entries()) {
+    if (!page || typeof page.text !== 'string' || page.text.length === 0) fail(`page ${index} is empty`);
+    if (!page.text.startsWith(`${fixture.ascii_corpus_text}\n`)) {
+      fail(`page ${index} does not begin with the printable-ASCII corpus`);
+    }
+    const rows = page.text.split('\n');
+    if (rows.some((row) => row.length === 0 || row.length > fixture.columns)) {
+      fail(`page ${index} has an empty or over-wide row`);
+    }
+  }
+  if (!Array.isArray(fixture.geometries) || fixture.geometries.length === 0) fail('geometries must be non-empty');
+  const ids = new Set();
+  for (const geometry of fixture.geometries) {
+    if (!geometry || typeof geometry.id !== 'string' || geometry.id.length === 0 || ids.has(geometry.id)) {
+      fail('geometry ids must be non-empty and unique');
+    }
+    ids.add(geometry.id);
+    if (!Number.isInteger(geometry.cell_width) || geometry.cell_width <= 0 ||
+        !Number.isInteger(geometry.cell_height) || geometry.cell_height <= 0) {
+      fail(`geometry ${geometry.id} has an invalid cell size`);
+    }
   }
 }
-writeFileSync(`${OUT}/golds.json`, JSON.stringify(golds));
-console.log(`done: ${SIZES.length} sizes x ${PAGES} pages`);
+
+validateFixture();
+mkdirSync(args.dir, { recursive: true });
+
+for (const geometry of fixture.geometries) {
+  for (const [pageIndex, page] of fixture.pages.entries()) {
+    const pngs = await renderTextToPngs(page.text, fixture.columns, {
+      aa: true,
+      cellWBonus: geometry.cell_width - 5,
+      cellHBonus: geometry.cell_height - 8,
+    });
+    if (pngs.length !== 1) {
+      fail(`${geometry.id}_${pageIndex} rendered ${pngs.length} PNG pages; expected exactly one`);
+    }
+    const rendered = pngs[0];
+    if (!rendered?.png?.length || rendered.width <= 0 || rendered.height <= 0 || rendered.droppedChars !== 0) {
+      fail(`${geometry.id}_${pageIndex} produced an invalid or truncated PNG`);
+    }
+    writeFileSync(join(args.dir, `${geometry.id}_${pageIndex}.png`), rendered.png);
+    console.log(
+      `${geometry.id} cell=${geometry.cell_width}x${geometry.cell_height}px ` +
+      `page=${pageIndex} ${rendered.width}x${rendered.height}px chars=${Array.from(page.text).length}`,
+    );
+  }
+}
+
+// Diagnostic only. The decoder always reads the checked-in reference, never this
+// generated copy, so generated output cannot become its own source of truth.
+writeFileSync(join(args.dir, 'glyph_integrity_fixture.json'), JSON.stringify(reference, null, 2) + '\n');
+console.log(`GLYPH_FIXTURE_RENDERED geometries=${fixture.geometries.length} pages=${fixture.pages.length}`);

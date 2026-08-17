@@ -1,147 +1,325 @@
 #!/usr/bin/env node
 /**
- * decode_atlas.mjs — deterministic surrogate reader (NOT a VLM).
+ * Deterministic local renderer-integrity check (NOT a VLM/OCR benchmark).
  *
- * FINDINGS.md says the reason imaged text misreads silently is that
- * "model vision is not OCR": no glyph segmentation, no per-character
- * confidence, no way to return "unreadable". Every surrogate candidate
- * evaluated so far has been a VLM, which structurally cannot supply the one
- * signal the surrogate needs.
- *
- * But pxpipe renders from a KNOWN 1-bit atlas onto a KNOWN cell grid. The
- * bitmasks that produced the image are in src/core/atlas.ts. So the surrogate
- * does not need to LEARN to read - it can template-decode:
- *
- *   crop cell -> compare against all 95 Spleen ASCII glyphs -> best match
- *   margin(best, runner-up) IS the per-character confidence
- *   no unique match  ->  "unreadable", cleanly, by construction
- *
- * Atlas format, read from scripts/gen-atlas.ts (NOT guessed):
- *   ATLAS_OFFSETS[rank] is a BIT offset (gen-atlas.ts:7,336 - the GRAY atlas
- *   uses byte offsets, the production 1-bit atlas does not).
- *   bit index = off + gy*W + gx, row-major, MSB-first within each byte.
- *   40 bits per narrow 5x8 glyph. Verified by rendering 'A','0','H' to ASCII.
- *
- * Usage:
- *   node decode_atlas.mjs --dir C:/tmp/sweep --tag decoder
- *   python grade_sweep.py decoder
+ * It decodes the built Spleen atlas from its cells and compares every expected
+ * cell against a checked-in printable-ASCII fixture. The fixture also pins the
+ * exact atlas artifacts it authorizes, so generated PNG output is never used
+ * as its own oracle.
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import * as A from '../../../dist/core/atlas.js';
 
-const { values: a } = parseArgs({
+const AUTHORIZED_SOURCE_COMMIT = 'baaa3b37fd9c950896279ea7bd63481d91bdd044';
+const REQUIRED_ARTIFACTS = {
+  'dist/core/atlas.js': '9609F45F35820528A32BC9D985735FD1CBA5F3D5D89ABBC12E42F38AFFB5D29F',
+  'dist/core/atlas-gray.js': 'EAB751727E4FAB632AEBC53997C6539E037DD0FD225ACC4406F7D06E5B14C6DD',
+};
+const REFERENCE_PATH = new URL('./glyph_integrity_reference.json', import.meta.url);
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+
+const { values: args } = parseArgs({
   options: {
     dir: { type: 'string', default: 'C:/tmp/sweep' },
     tag: { type: 'string', default: 'decoder' },
-    sizes: { type: 'string', default: 's0,s1,s2,s3,s4' },
+    sizes: { type: 'string' },
     pad: { type: 'string', default: '4' },
     verbose: { type: 'boolean', default: false },
+    'assert-exact': { type: 'boolean', default: false },
   },
 });
 
-const AW = A.ATLAS_CELL_W;   // 5
-const AH = A.ATLAS_CELL_H;   // 8
-const PAD = Number(a.pad);
-const CELL = { s0: [5, 8], s1: [7, 10], s2: [10, 16], s3: [14, 22], s4: [20, 32] };
-const LABEL = { s0: '5x8', s1: '7x10', s2: '10x16', s3: '14x22', s4: '20x32' };
+const PAD = Number(args.pad);
+const AW = A.ATLAS_CELL_W;
+const AH = A.ATLAS_CELL_H;
 
-/** bit at (gx,gy) of the glyph whose atlas bit-offset is `off`. MSB-first. */
-function atlasBit(off, gx, gy) {
-  const i = off + gy * AW + gx;
-  return (A.ATLAS_PIXELS[i >> 3] >> (7 - (i & 7))) & 1;
+function fail(message) {
+  throw new Error(`GLYPH_INTEGRITY_INVALID: ${message}`);
 }
 
-// Template set: printable ASCII only. That is the alphabet these pages use,
-// and restricting it is what makes "no match" meaningful rather than a
-// reach into 35k CJK codepoints.
-const TEMPLATES = [];
-for (let cp = 0x20; cp <= 0x7e; cp++) {
-  const r = A.atlasRank(cp);
-  if (r < 0) continue;
-  const off = A.ATLAS_OFFSETS[r];
-  const bits = new Uint8Array(AW * AH);
-  for (let y = 0; y < AH; y++) for (let x = 0; x < AW; x++) bits[y * AW + x] = atlasBit(off, x, y);
-  TEMPLATES.push({ ch: String.fromCodePoint(cp), bits, ink: bits.reduce((s, v) => s + v, 0) });
-}
-
-/** Nearest-neighbour decode of one cell. Returns {ch, d, margin}. */
-function matchCell(cellBits) {
-  let b1 = 1e9, b2 = 1e9, ch = '\uFFFD';
-  for (const t of TEMPLATES) {
-    let d = 0;
-    for (let i = 0; i < cellBits.length; i++) if (cellBits[i] !== t.bits[i]) { d++; if (d >= b2) break; }
-    if (d < b1) { b2 = b1; b1 = d; ch = t.ch; }
-    else if (d < b2) b2 = d;
+function readReference() {
+  const reference = JSON.parse(readFileSync(REFERENCE_PATH, 'utf8'));
+  if (!Number.isInteger(reference.schema_version) || reference.schema_version < 1) {
+    fail('reference schema_version is invalid');
   }
-  return { ch, d: b1, margin: b2 - b1 };
+  if (reference.scope !== 'local-build-render-integrity-only') {
+    fail('reference scope must be local-build-render-integrity-only');
+  }
+  if (reference.authorized_source_commit !== AUTHORIZED_SOURCE_COMMIT) {
+    fail('reference authorized_source_commit does not match the approved source commit');
+  }
+  for (const [artifact, expectedHash] of Object.entries(REQUIRED_ARTIFACTS)) {
+    if (reference.artifacts?.[artifact]?.sha256 !== expectedHash) {
+      fail(`reference does not pin ${artifact}`);
+    }
+  }
+  return reference;
 }
 
-async function decodePage(png, cw, chh) {
-  const img = await loadImage(png);
-  const cv = createCanvas(img.width, img.height);
-  const cx = cv.getContext('2d');
-  cx.drawImage(img, 0, 0);
-  const px = cx.getImageData(0, 0, img.width, img.height).data;
+function assertArtifactHashes(reference) {
+  for (const [artifact, expectedHash] of Object.entries(REQUIRED_ARTIFACTS)) {
+    const path = resolve(REPO_ROOT, artifact);
+    if (!existsSync(path)) fail(`required built artifact is missing: ${artifact}`);
+    const actualHash = createHash('sha256').update(readFileSync(path)).digest('hex').toUpperCase();
+    if (actualHash !== expectedHash || actualHash !== reference.artifacts[artifact].sha256) {
+      fail(`${artifact} SHA256=${actualHash}; expected ${expectedHash}`);
+    }
+  }
+}
 
-  const cols = Math.floor((img.width - 2 * PAD) / cw);
-  const rows = Math.floor((img.height - 2 * PAD) / chh);
-  const lines = [];
-  const conf = [];
-  for (let r = 0; r < rows; r++) {
-    let line = '';
-    for (let c = 0; c < cols; c++) {
+function validateFixture(reference) {
+  const fixture = reference.fixture;
+  if (!fixture || typeof fixture !== 'object') fail('fixture is missing');
+  if (!Number.isInteger(fixture.columns) || fixture.columns <= 0) fail('fixture columns must be a positive integer');
+  if (typeof fixture.ascii_corpus_text !== 'string' || fixture.ascii_corpus_text.length === 0) {
+    fail('printable-ASCII corpus is empty');
+  }
+  const corpus = Array.from(fixture.ascii_corpus_text.replaceAll('\n', ''));
+  if (corpus.length !== 95 || corpus.some((ch, index) => ch.codePointAt(0) !== 0x20 + index)) {
+    fail('corpus must contain U+0020 through U+007E exactly once and in order');
+  }
+  if (!Array.isArray(fixture.pages) || fixture.pages.length === 0) fail('fixture pages are empty');
+  for (const [pageIndex, page] of fixture.pages.entries()) {
+    if (!page || typeof page.text !== 'string' || page.text.length === 0) fail(`page ${pageIndex} is empty`);
+    if (!page.text.startsWith(`${fixture.ascii_corpus_text}\n`)) {
+      fail(`page ${pageIndex} does not begin with the printable-ASCII corpus`);
+    }
+    const rows = page.text.split('\n');
+    if (rows.some((row) => row.length === 0 || row.length > fixture.columns)) {
+      fail(`page ${pageIndex} has an empty or over-wide row`);
+    }
+    if (!Array.isArray(page.labels) || page.labels.length === 0 ||
+        page.labels.some((label) => !label?.label || !label?.id)) {
+      fail(`page ${pageIndex} has invalid label/id assertions`);
+    }
+  }
+  if (!Array.isArray(fixture.geometries) || fixture.geometries.length === 0) fail('fixture geometries are empty');
+  const ids = new Set();
+  for (const geometry of fixture.geometries) {
+    if (!geometry || typeof geometry.id !== 'string' || geometry.id.length === 0 || ids.has(geometry.id)) {
+      fail('geometry ids must be non-empty and unique');
+    }
+    ids.add(geometry.id);
+    if (!Number.isInteger(geometry.cell_width) || geometry.cell_width <= 0 ||
+        !Number.isInteger(geometry.cell_height) || geometry.cell_height <= 0) {
+      fail(`geometry ${geometry.id} has an invalid cell size`);
+    }
+  }
+  if (!Number.isInteger(PAD) || PAD < 0) fail('pad must be a non-negative integer');
+  return fixture;
+}
+
+/** Bit at (gx, gy) for a glyph whose atlas offset is in bits, MSB-first. */
+function atlasBit(offset, gx, gy) {
+  const bitIndex = offset + gy * AW + gx;
+  return (A.ATLAS_PIXELS[bitIndex >> 3] >> (7 - (bitIndex & 7))) & 1;
+}
+
+const TEMPLATES = [];
+for (let codepoint = 0x20; codepoint <= 0x7e; codepoint++) {
+  const rank = A.atlasRank(codepoint);
+  if (rank < 0) fail(`built atlas is missing U+${codepoint.toString(16).padStart(4, '0')}`);
+  const bits = new Uint8Array(AW * AH);
+  for (let y = 0; y < AH; y++) {
+    for (let x = 0; x < AW; x++) bits[y * AW + x] = atlasBit(A.ATLAS_OFFSETS[rank], x, y);
+  }
+  TEMPLATES.push({ ch: String.fromCodePoint(codepoint), bits });
+}
+if (TEMPLATES.length !== 95) fail(`expected 95 ASCII templates, found ${TEMPLATES.length}`);
+
+function matchCell(bits) {
+  let bestDistance = Number.POSITIVE_INFINITY;
+  let runnerUp = Number.POSITIVE_INFINITY;
+  let character = '\uFFFD';
+  for (const template of TEMPLATES) {
+    let distance = 0;
+    for (let index = 0; index < bits.length; index++) {
+      if (bits[index] !== template.bits[index]) {
+        distance++;
+        if (distance >= runnerUp) break;
+      }
+    }
+    if (distance < bestDistance) {
+      runnerUp = bestDistance;
+      bestDistance = distance;
+      character = template.ch;
+    } else if (distance < runnerUp) {
+      runnerUp = distance;
+    }
+  }
+  return { character, distance: bestDistance, margin: runnerUp - bestDistance };
+}
+
+async function decodePage(png, geometry) {
+  const image = await loadImage(png);
+  if (!image.width || !image.height) fail(`${png} decoded to an empty image`);
+  const usableWidth = image.width - 2 * PAD;
+  const usableHeight = image.height - 2 * PAD;
+  if (usableWidth <= 0 || usableHeight <= 0 ||
+      usableWidth % geometry.cell_width !== 0 || usableHeight % geometry.cell_height !== 0) {
+    fail(`${png} has invalid dimensions ${image.width}x${image.height} for ${geometry.id}`);
+  }
+  const canvas = createCanvas(image.width, image.height);
+  const context = canvas.getContext('2d');
+  context.drawImage(image, 0, 0);
+  const pixels = context.getImageData(0, 0, image.width, image.height).data;
+  const cols = usableWidth / geometry.cell_width;
+  const rows = usableHeight / geometry.cell_height;
+  const decodedRows = [];
+  for (let row = 0; row < rows; row++) {
+    const cells = [];
+    for (let col = 0; col < cols; col++) {
       const bits = new Uint8Array(AW * AH);
-      let ink = 0;
+      let rawInk = 0;
       for (let gy = 0; gy < AH; gy++) {
         for (let gx = 0; gx < AW; gx++) {
-          const X = PAD + c * cw + gx;
-          const Y = PAD + r * chh + gy;
-          if (X >= img.width || Y >= img.height) continue;
-          const o = (Y * img.width + X) * 4;
-          // Renderer draws DARK text on a LIGHT background (measured: corner
-          // pixel = 255, ink = 0). Ink is therefore the LOW values.
-          const v = (px[o] + px[o + 1] + px[o + 2]) / 3;
-          const b = v < 128 ? 1 : 0;
-          bits[gy * AW + gx] = b;
-          ink += b;
+          const x = PAD + col * geometry.cell_width + gx;
+          const y = PAD + row * geometry.cell_height + gy;
+          const pixelOffset = (y * image.width + x) * 4;
+          const value = (pixels[pixelOffset] + pixels[pixelOffset + 1] + pixels[pixelOffset + 2]) / 3;
+          const bit = value < 128 ? 1 : 0;
+          bits[gy * AW + gx] = bit;
+          rawInk += bit;
         }
       }
-      if (ink === 0) { line += ' '; conf.push({ ch: ' ', d: 0, margin: 99 }); continue; }
-      const m = matchCell(bits);
-      line += m.ch;
-      conf.push(m);
+      cells.push(rawInk === 0
+        ? { character: ' ', distance: 0, margin: Number.POSITIVE_INFINITY, rawInk }
+        : { ...matchCell(bits), rawInk });
     }
-    lines.push(line.replace(/\s+$/, ''));
+    decodedRows.push(cells);
   }
-  return { text: lines.join('\n'), conf };
+  return { cols, rows, decodedRows };
 }
 
-const golds = JSON.parse(readFileSync(join(a.dir, 'golds.json'), 'utf8'));
-const SIZES = a.sizes.split(',').map((s) => s.trim());
+function comparePage(decoded, page, geometry) {
+  const expectedRows = page.text.split('\n');
+  const actualRows = decoded.decodedRows;
+  const result = {
+    expectedCells: expectedRows.reduce((total, row) => total + row.length, 0),
+    exactCells: 0,
+    characterMismatches: 0,
+    templateMismatches: 0,
+    missingInkCells: 0,
+    spaceInkCells: 0,
+    extraInkCells: 0,
+    rawInkCells: 0,
+    labelHits: 0,
+    expectedLabels: page.labels.length,
+  };
+  if (decoded.rows !== expectedRows.length) result.characterMismatches += Math.abs(decoded.rows - expectedRows.length) || 1;
+  for (let row = 0; row < decoded.rows; row++) {
+    const expected = expectedRows[row] ?? '';
+    for (let col = 0; col < decoded.cols; col++) {
+      const cell = actualRows[row][col];
+      const expectedCharacter = col < expected.length ? expected[col] : null;
+      if (cell.rawInk > 0) result.rawInkCells++;
+      if (expectedCharacter === null) {
+        if (cell.rawInk > 0) result.extraInkCells++;
+        continue;
+      }
+      if (cell.character !== expectedCharacter) result.characterMismatches++;
+      if (expectedCharacter === ' ') {
+        if (cell.rawInk !== 0) result.spaceInkCells++;
+        else if (cell.character === ' ') result.exactCells++;
+      } else {
+        if (cell.rawInk === 0) result.missingInkCells++;
+        if (cell.distance !== 0) result.templateMismatches++;
+        if (cell.character === expectedCharacter && cell.rawInk > 0 && cell.distance === 0) result.exactCells++;
+      }
+    }
+  }
+  const actualText = expectedRows.map((expected, row) =>
+    (actualRows[row] ?? []).slice(0, expected.length).map((cell) => cell.character).join(''),
+  ).join('\n');
+  result.labelHits = page.labels.filter(({ label, id }) =>
+    actualText.includes(`\"label\":\"${label}\",\"id\":\"${id}\"`),
+  ).length;
+  const failed = result.exactCells !== result.expectedCells ||
+    result.characterMismatches !== 0 || result.templateMismatches !== 0 ||
+    result.missingInkCells !== 0 || result.spaceInkCells !== 0 || result.extraInkCells !== 0 ||
+    result.labelHits !== result.expectedLabels;
+  return { actualText, result, failed };
+}
 
-console.log(`templates=${TEMPLATES.length} printable-ASCII glyphs (atlas ${AW}x${AH}, MSB-first row-major)`);
-console.log(`${'cell'.padEnd(8)}${'page'.padStart(5)}${'cells'.padStart(7)}${'exact'.padStart(7)}${'ambig'.padStart(7)}${'unread'.padStart(8)}  ms`);
-console.log('-'.repeat(56));
+const reference = readReference();
+const fixture = validateFixture(reference);
+assertArtifactHashes(reference);
+const allGeometryIds = fixture.geometries.map((geometry) => geometry.id);
+const requestedSizeText = args.sizes ?? allGeometryIds.join(',');
+const selectedIds = requestedSizeText.split(',').map((id) => id.trim()).filter(Boolean);
+if (selectedIds.length === 0 || new Set(selectedIds).size !== selectedIds.length) fail('sizes must be a non-empty, unique list');
+const geometryById = new Map(fixture.geometries.map((geometry) => [geometry.id, geometry]));
+const selectedGeometries = selectedIds.map((id) => {
+  const geometry = geometryById.get(id);
+  if (!geometry) fail(`unknown geometry size: ${id}`);
+  return geometry;
+});
+if (args['assert-exact'] &&
+    (selectedGeometries.length !== allGeometryIds.length || selectedGeometries.some((geometry) => !allGeometryIds.includes(geometry.id)))) {
+  fail('--assert-exact requires every checked-in geometry');
+}
 
-for (const k of SIZES) {
-  const [cw, chh] = CELL[k] || [5, 8];
-  for (let i = 0; i < (golds[k]?.length ?? 0); i++) {
-    const png = join(a.dir, `${k}_${i}.png`);
-    if (!existsSync(png)) { console.log(`${LABEL[k].padEnd(8)}${String(i).padStart(5)}   MISSING`); continue; }
-    const t0 = Date.now();
-    const { text, conf } = await decodePage(png, cw, chh);
-    const ms = Date.now() - t0;
-    const nonblank = conf.filter((c) => c.ch !== ' ');
-    const exact = nonblank.filter((c) => c.d === 0).length;
-    const ambig = nonblank.filter((c) => c.d > 0 && c.margin <= 1).length;
-    const unread = nonblank.filter((c) => c.d > 6).length;
-    writeFileSync(join(a.dir, `out_${a.tag}_${k}_${i}.txt`), text, 'utf8');
-    console.log(`${LABEL[k].padEnd(8)}${String(i).padStart(5)}${String(nonblank.length).padStart(7)}${String(exact).padStart(7)}${String(ambig).padStart(7)}${String(unread).padStart(8)}  ${ms}`);
-    if (a.verbose && i === 0) console.log(text.split('\n').slice(0, 3).map((l) => '    ' + l).join('\n'));
+console.log(`scope=${reference.scope}; source=${reference.authorized_source_commit}`);
+console.log(`templates=${TEMPLATES.length}; corpus=U+0020..U+007E; fixture-pages=${fixture.pages.length}`);
+console.log(
+  `${'cell'.padEnd(8)}${'page'.padStart(5)}${'expect'.padStart(8)}${'exact'.padStart(8)}` +
+  `${'raw-ink'.padStart(9)}${'char'.padStart(6)}${'bits'.padStart(6)}` +
+  `${'space'.padStart(7)}${'extra'.padStart(7)}${'labels'.padStart(8)}  ms`,
+);
+console.log('-'.repeat(90));
+
+let integrityFailed = false;
+const totals = {
+  expectedCells: 0, exactCells: 0, rawInkCells: 0, characterMismatches: 0,
+  templateMismatches: 0, missingInkCells: 0, spaceInkCells: 0, extraInkCells: 0,
+  labelHits: 0, expectedLabels: 0,
+};
+for (const geometry of selectedGeometries) {
+  for (const [pageIndex, page] of fixture.pages.entries()) {
+    const png = join(args.dir, `${geometry.id}_${pageIndex}.png`);
+    if (!existsSync(png)) {
+      console.log(`${geometry.id.padEnd(8)}${String(pageIndex).padStart(5)}   MISSING`);
+      integrityFailed = true;
+      continue;
+    }
+    const start = Date.now();
+    const decoded = await decodePage(png, geometry);
+    const { actualText, result, failed } = comparePage(decoded, page, geometry);
+    const elapsed = Date.now() - start;
+    for (const [key, value] of Object.entries(result)) totals[key] += value;
+    if (failed) integrityFailed = true;
+    writeFileSync(join(args.dir, `out_${args.tag}_${geometry.id}_${pageIndex}.txt`), actualText, 'utf8');
+    console.log(
+      `${geometry.id.padEnd(8)}${String(pageIndex).padStart(5)}` +
+      `${String(result.expectedCells).padStart(8)}${String(result.exactCells).padStart(8)}` +
+      `${String(result.rawInkCells).padStart(9)}${String(result.characterMismatches).padStart(6)}` +
+      `${String(result.templateMismatches + result.missingInkCells).padStart(6)}` +
+      `${String(result.spaceInkCells).padStart(7)}${String(result.extraInkCells).padStart(7)}` +
+      `${`${result.labelHits}/${result.expectedLabels}`.padStart(8)}  ${elapsed}`,
+    );
+    if (args.verbose) console.log(actualText.split('\n').map((line) => `    ${line}`).join('\n'));
   }
 }
+
 console.log();
-console.log(`next: python grade_sweep.py ${a.tag}`);
+const summary =
+  `cells=${totals.exactCells}/${totals.expectedCells} raw-ink=${totals.rawInkCells} ` +
+  `char=${totals.characterMismatches} bits=${totals.templateMismatches + totals.missingInkCells} ` +
+  `space-ink=${totals.spaceInkCells} extra-ink=${totals.extraInkCells} ` +
+  `labels=${totals.labelHits}/${totals.expectedLabels}`;
+if (args['assert-exact']) {
+  if (integrityFailed) {
+    console.error(`GLYPH_INTEGRITY_FAIL ${summary}`);
+    process.exitCode = 1;
+  } else {
+    console.log(`GLYPH_INTEGRITY_OK ${summary}`);
+  }
+} else {
+  console.log(`GLYPH_INTEGRITY_DIAGNOSTIC ${summary}`);
+}
+console.log('scope note: this validates only the local built renderer and atlas artifacts, not daemon routing or VLM/OCR parity.');
