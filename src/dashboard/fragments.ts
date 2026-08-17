@@ -893,7 +893,7 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
   const hitRateEv =
     s.eventsWithBaseline > 0 ? ((s.cacheHitEvents / s.eventsWithBaseline) * 100).toFixed(1) + '%' : '-';
   const charRatio =
-    s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
+    s.origCharsTotal > 0 ? (s.imageBytesTotal / s.origCharsTotal).toFixed(3) + 'x' : '-';
 
   // NOTE: the literal word "requests" is asserted by tests.
   const tr = (k: string, v: string) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`;

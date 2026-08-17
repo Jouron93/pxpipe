@@ -50,6 +50,7 @@ import {
   buildExactContextPlanFromDocuments,
 } from './exact-context.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { estimateAdmission } from './admission-estimator.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -860,6 +861,12 @@ export async function transformOpenAIChatCompletions(
     info.contextWindowTokens = profile.contextWindowTokens;
     info.maxOutputTokens = profile.maxOutputTokens;
   }
+  info.shadowAdmission = estimateAdmission({
+    model: req.model,
+    payloadSizeBytes: body.byteLength,
+    payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
+    transformFamily: 'openai_chat',
+  });
   if (!Array.isArray(req.messages)) {
     info.reason = 'parse_error: messages must be an array';
     return { body, info };
@@ -1061,6 +1068,12 @@ export async function transformOpenAIResponses(
     info.contextWindowTokens = profile.contextWindowTokens;
     info.maxOutputTokens = profile.maxOutputTokens;
   }
+  info.shadowAdmission = estimateAdmission({
+    model: req.model,
+    payloadSizeBytes: body.byteLength,
+    payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
+    transformFamily: 'openai_responses',
+  });
 
   // Normalize input to an array; preserve original string for wrap-back if needed.
   const inputWasString = typeof req.input === 'string';

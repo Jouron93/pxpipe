@@ -46,7 +46,8 @@ import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
-import { clampCacheControlMarkers } from './measurement.js';
+import { clampCacheControlMarkers, normalizeCacheControlTtlOrder } from './measurement.js';
+import { estimateAdmission, type AdmissionEstimatorResult } from './admission-estimator.js';
 
 /**
  * Cold-path honest-dashboard savings floor (operator target ≈90%).
@@ -351,7 +352,151 @@ function maybeReflow(text: string, enabled: boolean): string {
   return reflow(safe) ?? safe;
 }
 
-/** Decompose the break-even gate into components for telemetry. Returns the
+export interface CandidateBlockInstrumentation {
+  kind: 'static_slab' | 'history' | 'tool_result' | 'reminder' | 'developer_slab' | 'openai_history';
+  sourceChars: number;
+  sourceTextTokens: number;
+  imageCount: number;
+  imageDims: Array<{ width: number; height: number }>;
+  providerImageTokens: number;
+  cacheStateBeforeTransform: 'warm' | 'cold' | 'unknown';
+  predictedCacheAwareBaselineTokens: number;
+  predictedCacheAwareActualTokens: number;
+  decision: 'IMAGE' | 'TEXT';
+  reason?: string;
+}
+
+export interface AdmissionEvaluation {
+  sourceChars: number;
+  sourceTextTokens: number;
+  imageCount: number;
+  imageDims: Array<{ width: number; height: number }>;
+  providerImageTokens: number;
+  cacheStateBeforeTransform: 'warm' | 'cold';
+  predictedCacheAwareBaselineTokens: number;
+  predictedCacheAwareActualTokens: number;
+  decision: 'IMAGE' | 'TEXT';
+  profitable: boolean;
+  reason?: string;
+}
+
+/**
+ * Cache-aware admission rule for candidate blocks.
+ * IMAGE only when predicted_cache_aware_actual < predicted_cache_aware_text_baseline.
+ * DEFAULT TEXT when unpredictable - optimize cache-aware provider input cost, NOT raw char reduction.
+ */
+export function evaluateCandidateBlockAdmission(
+  kind: CandidateBlockInstrumentation['kind'],
+  text: string,
+  cols: number = DEFAULTS.cols,
+  imageCountCap?: number,
+  numCols: number = 1,
+  charsPerToken: number = CHARS_PER_TOKEN,
+  priorWarmTokens: number = 0,
+  priorWarmImageTokens: number = 0,
+  shrinkWidth: boolean = true,
+  maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  style?: RenderStyle,
+  horizon?: number,
+): AdmissionEvaluation {
+  const n = Math.max(1, numCols | 0);
+  const sourceChars = typeof text === 'string' ? text.length : 0;
+  const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0 ? charsPerToken : CHARS_PER_TOKEN;
+  const sourceTextTokens = sourceChars / cpt;
+  const isWarm = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0;
+  const cacheStateBeforeTransform = isWarm ? 'warm' : 'cold';
+
+  if (!text || sourceChars === 0) {
+    return {
+      sourceChars: 0,
+      sourceTextTokens: 0,
+      imageCount: 0,
+      imageDims: [],
+      providerImageTokens: 0,
+      cacheStateBeforeTransform,
+      predictedCacheAwareBaselineTokens: 0,
+      predictedCacheAwareActualTokens: 0,
+      decision: 'TEXT',
+      profitable: false,
+      reason: 'empty_text',
+    };
+  }
+
+  const providerImageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage, style);
+  const estImageCount = Math.max(1, Math.ceil(providerImageTokens / 1600));
+  const imageDims: Array<{ width: number; height: number }> = [{ width: cols * (style?.cellWBonus ? 5 + style.cellWBonus : 5), height: 800 }];
+
+  const burnImageSide = isWarm ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE) : 0;
+  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
+    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    : 0;
+
+  let predictedCacheAwareBaselineTokens: number;
+  let predictedCacheAwareActualTokens: number;
+  let profitable: boolean;
+  let coldFloorOk = true;
+
+  if (Number.isFinite(horizon) && (horizon as number) > 1) {
+    const N = Math.max(2, Math.floor(horizon as number));
+    const imageLifetime = providerImageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
+    const textLifetime = sourceTextTokens * CACHE_READ_RATE * N;
+    predictedCacheAwareActualTokens = imageLifetime + burnImageSide;
+    predictedCacheAwareBaselineTokens = textLifetime + burnTextSide;
+    profitable = predictedCacheAwareActualTokens < predictedCacheAwareBaselineTokens;
+  } else {
+    predictedCacheAwareActualTokens = providerImageTokens + burnImageSide;
+    predictedCacheAwareBaselineTokens = sourceTextTokens + burnTextSide;
+    const floor = minColdSaveFraction();
+    coldFloorOk = floor <= 0 || priorWarmTokens > 0 || (providerImageTokens <= sourceTextTokens * (1 - floor));
+    profitable = coldFloorOk && (predictedCacheAwareActualTokens < predictedCacheAwareBaselineTokens);
+  }
+
+  const decision = profitable ? 'IMAGE' : 'TEXT';
+  const reason = !coldFloorOk
+    ? 'below_cold_save_floor'
+    : (predictedCacheAwareActualTokens >= predictedCacheAwareBaselineTokens
+        ? 'cache_cost_exceeds_text'
+        : undefined);
+
+  return {
+    sourceChars,
+    sourceTextTokens,
+    imageCount: estImageCount,
+    imageDims,
+    providerImageTokens,
+    cacheStateBeforeTransform,
+    predictedCacheAwareBaselineTokens,
+    predictedCacheAwareActualTokens,
+    decision,
+    profitable,
+    reason,
+  };
+}
+
+export function recordCandidateBlockInstrumentation(
+  info: TransformInfo,
+  evalResult: AdmissionEvaluation,
+  kind: CandidateBlockInstrumentation['kind'],
+  realDims?: Array<{ width: number; height: number }>,
+  realCount?: number,
+): void {
+  if (!info.candidateBlocks) info.candidateBlocks = [];
+  info.candidateBlocks.push({
+    kind,
+    sourceChars: evalResult.sourceChars,
+    sourceTextTokens: evalResult.sourceTextTokens,
+    imageCount: realCount ?? evalResult.imageCount,
+    imageDims: realDims ?? evalResult.imageDims,
+    providerImageTokens: evalResult.providerImageTokens,
+    cacheStateBeforeTransform: evalResult.cacheStateBeforeTransform,
+    predictedCacheAwareBaselineTokens: evalResult.predictedCacheAwareBaselineTokens,
+    predictedCacheAwareActualTokens: evalResult.predictedCacheAwareActualTokens,
+    decision: evalResult.decision,
+    reason: evalResult.reason,
+  });
+}
+
+/** Diagnostic snapshot for the static-slab gate. Returns the exact
  *  imageTokens, textTokens, and symmetric burn terms the gate uses internally,
  *  or `null` for empty/non-finite input. */
 export function evalCompressionProfitability(
@@ -386,9 +531,6 @@ export function evalCompressionProfitability(
     ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
   const floor = minColdSaveFraction();
-  // Cold honest-dashboard floor: same cache state both sides ⇒ save=(T-I)/T.
-  // floor=0.90 ⇒ I <= 0.10*T. (Fulltext-weighted 90% would need I<=0.08*T and
-  // is often physically unreachable at Anthropic vision rates — see OPTIMIZE.md.)
   const coldFloorOk = floor <= 0 || priorWarmTokens > 0
     || imageTokens <= textTokens * (1 - floor);
   const profitable =
@@ -415,41 +557,25 @@ export function isCompressionProfitable(
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   style?: RenderStyle,
 ): boolean {
-  const n = Math.max(1, numCols | 0);
-  if (typeof text !== 'string' || text.length === 0) return false;
-  const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
-    ? charsPerToken
-    : CHARS_PER_TOKEN;
-  const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage, style);
-  const textTokensEquivalent = text.length / cpt;
-  // Symmetric burn penalty (anti-flapping): switching modes invalidates the warm
-  // cache on whichever side was warm, paying cache_create. Burn is added to the
-  // side that would flip — pinning the session in its current mode until
-  // per-turn savings exceed the burn cost.
-  const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
-    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
-    : 0;
-  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
-    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
-    : 0;
-  const floor = minColdSaveFraction();
-  if (floor > 0 && !(priorWarmTokens > 0)) {
-    // Honest-dashboard cold target: (T - I)/T >= floor ⇒ I <= T*(1-floor)
-    if (imageTokensCost_ > textTokensEquivalent * (1 - floor)) {
-      return false;
-    }
-  }
-  return imageTokensCost_ + burnImageSide < textTokensEquivalent + burnTextSide;
+  return evaluateCandidateBlockAdmission(
+    'static_slab',
+    text,
+    cols,
+    imageCountCap,
+    numCols,
+    charsPerToken,
+    priorWarmTokens,
+    priorWarmImageTokens,
+    shrinkWidth,
+    maxCharsPerImage,
+    style,
+    undefined,
+  ).profitable;
 }
 
 /**
  * Horizon-aware variant of `isCompressionProfitable` for history-collapse.
- *
- * Evaluates expected lifetime cost over N turns: worst-case-warm for image
- * (cache_create turn 1, cache_read turns 2..N) vs best-case-warm for text
- * (cache_read all N). Gate condition: I×(CC + CR×(N-1)) < T×CR×N.
- * Examples: N=5 → I < 0.30×T; N=10 → I < 0.47×T.
- * Falls back to cold per-turn gate when `horizon <= 1`. See docs/HISTORY_CACHE_MODEL.md.
+ * Evaluates expected lifetime cost over N turns.
  */
 export function isCompressionProfitableAmortized(
   text: string,
@@ -464,28 +590,20 @@ export function isCompressionProfitableAmortized(
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   style?: RenderStyle,
 ): boolean {
-  if (!Number.isFinite(horizon) || horizon <= 1) {
-    return isCompressionProfitable(text, cols, imageCountCap, numCols, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, style);
-  }
-  const N = Math.max(2, Math.floor(horizon));
-  const n = Math.max(1, numCols | 0);
-  if (typeof text !== 'string' || text.length === 0) return false;
-  const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
-    ? charsPerToken
-    : CHARS_PER_TOKEN;
-  const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage, style);
-  const textTokens = text.length / cpt;
-  // Worst-case-for-image vs best-case-for-text (conservative, on purpose).
-  const imageLifetime = imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
-  const textLifetime = textTokens * CACHE_READ_RATE * N;
-  // Symmetric burn — see isCompressionProfitable for anti-flapping rationale.
-  const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
-    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
-    : 0;
-  const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
-    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
-    : 0;
-  return imageLifetime + burnImageSide < textLifetime + burnTextSide;
+  return evaluateCandidateBlockAdmission(
+    'history',
+    text,
+    cols,
+    imageCountCap,
+    numCols,
+    charsPerToken,
+    priorWarmTokens,
+    priorWarmImageTokens,
+    shrinkWidth,
+    maxCharsPerImage,
+    style,
+    horizon,
+  ).profitable;
 }
 
 
@@ -738,6 +856,8 @@ export interface TransformInfo {
   modelCanonicalId?: string;
   contextWindowTokens?: number;
   maxOutputTokens?: number;
+  candidateBlocks?: CandidateBlockInstrumentation[];
+  shadowAdmission?: AdmissionEstimatorResult;
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1548,19 +1668,23 @@ async function runHistoryCollapseAndFinalize(
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
     const historyProfitable = (text: string, cols: number): boolean => {
-      // History always renders single-col at the dense 384-col / 240-row page
-      // (history.ts → renderTextToPngsWithCharLimit with DENSE_CONTENT_COLS /
-      // DENSE_CONTENT_CHARS_PER_IMAGE), so gate at THAT geometry, not o.cols.
-      // CRITICAL: do NOT pass Opus 9×12 envStyleOverride here — that under/over
-      // prices history vs the 5×8 renderer (DENSE_RENDER_STYLE) and with live
-      // PXPIPE_GPT_PROFILES made warm partial collapse not_profitable → silent
-      // fall-back to text CP (measured 2026-08-11). History stays 5×8 forever.
       const g = denseGateGeometry(cols, 1);
-      return isCompressionProfitableAmortized(
-        text, g.cols, undefined, 1, historyCpt, horizon,
-        o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
+      const histAdmission = evaluateCandidateBlockAdmission(
+        'history',
+        text,
+        g.cols,
+        undefined,
+        1,
+        historyCpt,
+        o.priorWarmTokens,
+        o.priorWarmImageTokens,
+        true,
+        g.maxChars,
         DENSE_RENDER_STYLE,
+        horizon,
       );
+      recordCandidateBlockInstrumentation(info, histAdmission, 'history');
+      return histAdmission.profitable;
     };
     // No protectedPrefix here: this path runs only when the slab did NOT image
     // (it stays as text in req.system), so there is no slab message to shield —
@@ -1609,6 +1733,11 @@ async function runHistoryCollapseAndFinalize(
     }
   }
   clampCacheControlMarkers(req, 4);
+  // Must run AFTER the clamp: clamping deletes markers, which can change which
+  // ttl values remain and in what order. Relocating a caller breakpoint onto a
+  // history image can otherwise emit a 1h marker after a 5m one, which the API
+  // rejects with 400 and which no retry can escape.
+  normalizeCacheControlTtlOrder(req);
   info.outgoingTextChars = countOutgoingTextChars(req);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info, collapsed: collapsedFlag };
@@ -1672,6 +1801,12 @@ export async function transformRequest(
     info.contextWindowTokens = profile.contextWindowTokens;
     info.maxOutputTokens = profile.maxOutputTokens;
   }
+  info.shadowAdmission = estimateAdmission({
+    model: (req as { model?: string }).model,
+    payloadSizeBytes: body.byteLength,
+    payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
+    transformFamily: 'anthropic_messages',
+  });
   // Opus's 9×12 cells fit fewer chars/image → compensate with more factsheet sidecar tokens
   const factSheetBudget: number | undefined =
     info.modelCanonicalId?.includes('opus') ? MAX_TOKENS_OPUS : undefined;
@@ -1952,6 +2087,19 @@ export async function transformRequest(
   // legible width. The banner above sets the natural floor — no separate
   // minWidth knob needed. Multi-col packing still gets numCols × this width.
   const slabCols = shrinkColsToContent(combinedWithHeader, o.cols);
+  const slabAdmission = evaluateCandidateBlockAdmission(
+    'static_slab',
+    combinedWithHeader,
+    slabCols,
+    undefined,
+    numCols,
+    slabCpt,
+    o.priorWarmTokens,
+    o.priorWarmImageTokens,
+    false,
+    READABLE_CHARS_PER_IMAGE,
+    denseStyle,
+  );
   const slabGateEval = evalCompressionProfitability(
     combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
     false, // already shrunk — don't double-shrink
@@ -1967,7 +2115,8 @@ export async function transformRequest(
       profitable: slabGateEval.profitable,
     };
   }
-  if (!isCompressionProfitable(combinedWithHeader, slabCols, undefined, numCols, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens, false, READABLE_CHARS_PER_IMAGE, denseStyle)) {
+  if (!slabAdmission.profitable) {
+    recordCandidateBlockInstrumentation(info, slabAdmission, 'static_slab');
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab not profitable but history may still be collapsable — try before returning.
@@ -2005,6 +2154,13 @@ export async function transformRequest(
     );
   }
   info.imageCount = imageBlocks.length;
+  recordCandidateBlockInstrumentation(
+    info,
+    slabAdmission,
+    'static_slab',
+    images.map((im) => ({ width: im.width, height: im.height })),
+    images.length,
+  );
   // Credit raw (pre-compaction) length — what Anthropic would have billed.
   info.compressedChars += combinedRaw.length;
   bumpBucket(info, 'static_slab', combinedRaw.length);
@@ -2094,13 +2250,28 @@ export async function transformRequest(
           // model reads.
           const reminderRaw = (blk as TextBlock).text;
           const reminderText = maybeReflow(compactSlabWhitespace(reminderRaw), o.reflow);
-          if (!isCompressionProfitable(reminderText, denseGeo.cols, undefined, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseStyle)) {
+          const reminderAdmission = evaluateCandidateBlockAdmission(
+            'reminder',
+            reminderText,
+            denseGeo.cols,
+            undefined,
+            numCols,
+            o.charsPerToken,
+            0,
+            0,
+            true,
+            denseGeo.maxChars,
+            denseStyle,
+          );
+          if (!reminderAdmission.profitable) {
+            recordCandidateBlockInstrumentation(info, reminderAdmission, 'reminder');
             bumpPassthrough(info, 'not_profitable');
             processedExisting.push(blk);
             continue;
           }
           const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
             await textToImageBlocks(reminderText, o.cols, numCols, undefined, denseStyle);
+          recordCandidateBlockInstrumentation(info, reminderAdmission, 'reminder', rawDims, imgs.length);
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
           const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
@@ -2169,10 +2340,24 @@ export async function transformRequest(
               const inner = compactSlabWhitespace(innerRaw);
               // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
               const innerR = maybeReflow(inner, o.reflow);
+              const toolAdmission = evaluateCandidateBlockAdmission(
+                'tool_result',
+                innerR,
+                denseGeo.cols,
+                o.maxImagesPerToolResult,
+                numCols,
+                o.charsPerToken,
+                0,
+                0,
+                true,
+                denseGeo.maxChars,
+                denseStyle,
+              );
               if (innerR.length < o.minToolResultChars) {
                 bumpPassthrough(info, 'below_threshold');
                 rewritten.push(blk);
-              } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseStyle)) {
+              } else if (!toolAdmission.profitable) {
+                recordCandidateBlockInstrumentation(info, toolAdmission, 'tool_result');
                 bumpPassthrough(info, 'not_profitable');
                 rewritten.push(blk);
               } else {
@@ -2184,6 +2369,7 @@ export async function transformRequest(
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                   await textToImageBlocks(paged.text, o.cols, numCols, undefined, denseStyle);
+                recordCandidateBlockInstrumentation(info, toolAdmission, 'tool_result', rawDims, imgs.length);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 for (const img of imgs) info.imageBytes += approxBlockBytes(img);
@@ -2233,12 +2419,26 @@ export async function transformRequest(
                 const innerText = compactSlabWhitespace(innerTextRaw);
                 // R3: gate/page/render on reflowed text; classify pre-reflow.
                 const innerTextR = maybeReflow(innerText, o.reflow);
+                const partAdmission = evaluateCandidateBlockAdmission(
+                  'tool_result',
+                  innerTextR,
+                  denseGeo.cols,
+                  o.maxImagesPerToolResult,
+                  numCols,
+                  o.charsPerToken,
+                  0,
+                  0,
+                  true,
+                  denseGeo.maxChars,
+                  denseStyle,
+                );
                 if (innerTextR.length < o.minToolResultChars) {
                   bumpPassthrough(info, 'below_threshold');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
                 }
-                if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseStyle)) {
+                if (!partAdmission.profitable) {
+                  recordCandidateBlockInstrumentation(info, partAdmission, 'tool_result');
                   bumpPassthrough(info, 'not_profitable');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
@@ -2250,6 +2450,7 @@ export async function transformRequest(
                 }
                 const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                   await textToImageBlocks(paged.text, o.cols, numCols, undefined, denseStyle);
+                recordCandidateBlockInstrumentation(info, partAdmission, 'tool_result', rawDims, imgs.length);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
                 const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
@@ -2311,15 +2512,23 @@ export async function transformRequest(
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     const historyProfitable = (text: string, cols: number): boolean => {
-      // Gate at dense 384-col/240-row geometry (matches history.ts renderer).
-      // Price at DENSE_RENDER_STYLE (5×8) — never Opus 9×12 bonuses (see warm
-      // partial path comment). Renderer uses DENSE_RENDER_STYLE (5×8).
       const g = denseGateGeometry(cols, 1);
-      return isCompressionProfitableAmortized(
-        text, g.cols, undefined, 1, historyCpt, horizon,
-        o.priorWarmTokens, o.priorWarmImageTokens, true, g.maxChars,
+      const histAdmission = evaluateCandidateBlockAdmission(
+        'history',
+        text,
+        g.cols,
+        undefined,
+        1,
+        historyCpt,
+        o.priorWarmTokens,
+        o.priorWarmImageTokens,
+        true,
+        g.maxChars,
         DENSE_RENDER_STYLE,
+        horizon,
       );
+      recordCandidateBlockInstrumentation(info, histAdmission, 'history');
+      return histAdmission.profitable;
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
     const { messages: newMessages, info: histInfo } = await collapseHistory(
@@ -2423,6 +2632,7 @@ export async function transformRequest(
     info.droppedCodepointsTop = out;
   }
   clampCacheControlMarkers(req, 4);
+  normalizeCacheControlTtlOrder(req);
   info.outgoingTextChars = countOutgoingTextChars(req);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info };

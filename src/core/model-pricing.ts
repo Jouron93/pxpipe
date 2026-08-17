@@ -100,13 +100,27 @@ function priced(
   };
 }
 
+function subscriptionPrefixForLane(lane?: string): 'claude' | 'codex' | 'agy' {
+  if (lane === 'claude_max_subscription') return 'claude';
+  if (lane === 'codex_subscription') return 'codex';
+  return 'agy';
+}
+
+function subscriptionDisplayNameForLane(lane?: string): string {
+  if (lane === 'claude_max_subscription') return 'Claude Max';
+  if (lane === 'codex_subscription') return 'Codex';
+  return 'AGY';
+}
+
 function applyConfiguredSubscriptionLane(card: ModelRateCard, route?: PricingRoute): ModelRateCard {
   const lane = route?.billingLane;
   if (!lane || !SUBSCRIPTION_LANES.has(lane)) return card;
   if (card.status === 'quota_only') return card;
+  const prefix = subscriptionPrefixForLane(lane);
+  const prefixRegex = /^(agy|claude|codex):/;
   return {
     ...card,
-    id: card.id.startsWith('agy:') ? card.id : `agy:${card.canonicalModel}`,
+    id: prefixRegex.test(card.id) ? card.id : `${prefix}:${card.canonicalModel}`,
     status: 'quota_only',
     note: [
       card.note,
@@ -340,8 +354,11 @@ export function resolveModelRate(
     : undefined;
   const outputPerMtok = isLongContextGpt ? profile.pricing.outputPerMtok * 1.5 : profile.pricing.outputPerMtok;
 
+  const subPrefix = subscriptionPrefixForLane(route?.billingLane);
+  const laneName = subscriptionDisplayNameForLane(route?.billingLane);
+
   const cardId = quotaOnly
-    ? `agy:${profile.canonicalId}`
+    ? `${subPrefix}:${profile.canonicalId}`
     : (isLongContextGpt
         ? `${provider}:${profile.canonicalId}:long`
         : (profile.canonicalId === 'claude-sonnet-5' && !raw.includes('promo')
@@ -368,7 +385,7 @@ export function resolveModelRate(
 
   let cardNote: string | undefined = undefined;
   if (quotaOnly) {
-    cardNote = 'AGY subscription lane; public rates are API-equivalent only. Upstream capacity is reference metadata because AGY does not expose its effective context limit.';
+    cardNote = `${laneName} subscription lane; public rates are API-equivalent only. Upstream capacity is reference metadata because ${laneName} does not expose its effective context limit.`;
   } else if (isLongContextGpt) {
     cardNote = 'Long-context tier: 2x input and 1.5x output.';
   } else if (profile.canonicalId === 'claude-sonnet-5') {

@@ -317,3 +317,81 @@ export function clampCacheControlMarkers(
 
   return maxMarkers;
 }
+
+/**
+ * Enforce Anthropic's cache_control TTL ordering rule.
+ *
+ * The API returns 400 when a `ttl:'1h'` block appears AFTER a `ttl:'5m'` block,
+ * evaluated across the whole request in the documented processing order:
+ * `tools`, then `system`, then `messages`.
+ *
+ * This proxy RELOCATES the caller's breakpoints when it collapses history into
+ * images -- history.ts re-attaches the caller's marker, ttl included, to the
+ * last image of a marked segment -- and ADDS one on the warm-partial path via
+ * markFrozenHistoryCarryOverCache(). Either move can place a 1h marker after a
+ * 5m one that the caller had ordered correctly.
+ *
+ * Observed 2026-08-17: five consecutive 400s on claude-fable-5, every one
+ * compressed=true / reason=cache_preserving_partial, rejected at
+ *     messages.0.content.11.content.0.cache_control.ttl
+ * Because the ordering is a deterministic function of conversation state, each
+ * retry rebuilt the identical invalid request, so the caller's session could
+ * not recover at all -- it had to bypass the proxy entirely.
+ *
+ * DEMOTES a later 1h to 5m rather than promoting an earlier 5m to 1h.
+ * Demotion is always valid and only shortens cache retention; promotion would
+ * extend a cache lifetime the caller never requested, changing cost as well as
+ * behaviour.
+ *
+ * A marker with no explicit ttl is treated as 5m, because that is the API
+ * default and it therefore closes the 1h window too. That is deliberately
+ * conservative: it may demote a 1h that would have been accepted, costing cache
+ * duration but never correctness.
+ *
+ * Unlike clampCacheControlMarkers this recurses into NESTED `content` arrays,
+ * since tool_result blocks carry their own content and that is precisely where
+ * the observed failure lived. Recursion is bounded to the `content` key and to
+ * a depth limit so it cannot descend into base64 image payloads.
+ *
+ * @returns number of markers demoted.
+ */
+export function normalizeCacheControlTtlOrder(
+  req: { tools?: unknown; system?: unknown; messages?: unknown },
+): number {
+  if (!req || typeof req !== 'object') return 0;
+
+  const targets: Record<string, unknown>[] = [];
+  const MAX_DEPTH = 8;
+
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > MAX_DEPTH || !node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    const obj = node as Record<string, unknown>;
+    if (obj.cache_control != null && typeof obj.cache_control === 'object') {
+      targets.push(obj);
+    }
+    if (obj.content !== undefined) visit(obj.content, depth + 1);
+  };
+
+  visit(req.tools, 0);
+  visit(req.system, 0);
+  visit(req.messages, 0);
+
+  let seenShort = false;
+  let demoted = 0;
+  for (const t of targets) {
+    const cc = t.cache_control as { ttl?: unknown };
+    if (cc.ttl === '1h') {
+      if (seenShort) {
+        cc.ttl = '5m';
+        demoted++;
+      }
+    } else {
+      seenShort = true;
+    }
+  }
+  return demoted;
+}

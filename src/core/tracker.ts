@@ -5,10 +5,15 @@
  */
 
 import type { BillingLane, BillingLaneSource, ProxyEvent, UsageScanStatus } from './proxy.js';
+import type { CandidateBlockInstrumentation } from './transform.js';
 import { bytesToBase64 } from './png.js';
 
 /** Flat record persisted per request. Adding a field is non-breaking for readers. */
 export interface TrackEvent {
+  shadow_admission_decision?: 'ADMIT' | 'BYPASS' | 'INSUFFICIENT_EVIDENCE';
+  shadow_admission_reason?: string;
+  shadow_predicted_savings_pct?: number;
+  candidate_blocks?: CandidateBlockInstrumentation[];
   ts: string;
   method: string;
   path: string;
@@ -336,6 +341,14 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.baselineProbeStatus !== undefined) {
       out.baseline_probe_status = info.baselineProbeStatus;
+    }
+    if (info.candidateBlocks && info.candidateBlocks.length > 0) {
+      out.candidate_blocks = info.candidateBlocks;
+    }
+    if (info.shadowAdmission) {
+      out.shadow_admission_decision = info.shadowAdmission.decision;
+      out.shadow_admission_reason = info.shadowAdmission.reason;
+      out.shadow_predicted_savings_pct = info.shadowAdmission.predictedSavingsPct;
     }
   }
   if (env) {

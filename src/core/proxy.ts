@@ -11,6 +11,7 @@ import {
   buildCacheablePrefixCountTokensBody,
   clampCacheControlMarkers,
   countCacheControlMarkers,
+  normalizeCacheControlTtlOrder,
 } from './measurement.js';
 import type { Usage } from './types.js';
 
@@ -1246,6 +1247,11 @@ export function createProxy(config: ProxyConfig = {}) {
           try {
             const parsed = JSON.parse(new TextDecoder().decode(r.body));
             clampCacheControlMarkers(parsed, 4);
+            // Clamping DELETES markers, which changes which ttl values survive
+            // and in what order -- so a request that was validly ordered before
+            // the clamp can be invalid after it. Re-normalize here. Costs
+            // nothing extra: we already hold the parsed object.
+            normalizeCacheControlTtlOrder(parsed);
             r.body = new TextEncoder().encode(JSON.stringify(parsed));
           } catch {}
         }
