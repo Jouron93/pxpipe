@@ -9,4 +9,7 @@ onlyBuiltDependencies:
 # security patches also wait 3 days; that's a deliberate trade-off for a
 # repo we update manually.
 minimumReleaseAge: 4320  # minutes (= 3 days)
-# minimumReleaseAgeExclude:  # add packages here if a fast follow is needed
+# First-party packages we publish ourselves should not block our own iteration.
+minimumReleaseAgeExclude:
+  - "@cloudflare/*"
+ignorePnpmfile: true
