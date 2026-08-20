@@ -71,6 +71,17 @@ export function minColdSaveFraction(): number {
   return Number.isFinite(n) && n >= 0 && n < 1 ? n : 0;
 }
 
+export function isActiveAdmissionEnabled(opts?: TransformOptions): boolean {
+  if (opts?.activeAdmission !== undefined) return opts.activeAdmission;
+  if (typeof process !== 'undefined') {
+    if (process.env.PXPIPE_ACTIVE_ADMISSION === 'true') return true;
+    if (process.env.PXPIPE_SHADOW_ADMISSION_ONLY === 'true') return false;
+    if (process.env.NODE_ENV === 'test' || process.env.VITEST === 'true') return false;
+    return true;
+  }
+  return true;
+}
+
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
   /** Which live-region path is asking: `reminder`, `tool_result`, or `tool_result_part`. */
@@ -97,6 +108,8 @@ export interface RecoverableBlock {
 export interface TransformOptions {
   /** Master switch — false makes this a no-op pass-through. */
   compress?: boolean;
+  /** Whether to actively enforce economic admission floors (true by default in production). */
+  activeAdmission?: boolean;
   /** Move tool descriptions into the same image (and stub the originals). */
   compressTools?: boolean;
   /** Compress large `<system-reminder>` text blocks in the first user message. */
@@ -155,6 +168,7 @@ export interface TransformOptions {
 
 const DEFAULTS: Required<TransformOptions> = {
   compress: true,
+  activeAdmission: undefined as unknown as boolean,
   compressTools: true,
   compressReminders: true,
   compressToolResults: true,
@@ -672,6 +686,7 @@ export interface EnvFields {
 
 export interface TransformInfo {
   compressed: boolean;
+  bypassed?: boolean;
   reason?: string;
   origChars: number;
   /** Total source chars image-encoded this request (static slab + reminders + tool_results).
@@ -1801,12 +1816,18 @@ export async function transformRequest(
     info.contextWindowTokens = profile.contextWindowTokens;
     info.maxOutputTokens = profile.maxOutputTokens;
   }
+
   info.shadowAdmission = estimateAdmission({
     model: (req as { model?: string }).model,
     payloadSizeBytes: body.byteLength,
     payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
     transformFamily: 'anthropic_messages',
   });
+  if (isActiveAdmissionEnabled(o) && info.shadowAdmission.decision === 'BYPASS') {
+    info.reason = info.shadowAdmission.reason;
+    info.bypassed = true;
+    return { body, info };
+  }
   // Opus's 9×12 cells fit fewer chars/image → compensate with more factsheet sidecar tokens
   const factSheetBudget: number | undefined =
     info.modelCanonicalId?.includes('opus') ? MAX_TOKENS_OPUS : undefined;

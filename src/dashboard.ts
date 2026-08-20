@@ -1721,7 +1721,9 @@ export type DashboardRoute =
   | { kind: 'recent' } // /proxy-recent — legacy ring buffer
   | { kind: 'png' } // /proxy-latest-png
   | { kind: 'health' } // /health, /v1/health — liveness probe
-  | { kind: 'models' } // /v1/models, /models — OpenAI-compatible models list
+  | { kind: 'version' } // /version, /api/version
+  | { kind: 'props' } // /v1/props
+  | { kind: 'models' } // /v1/models, /api/v1/models, /models, /models.json, /api/tags
   | { kind: 'api-sessions' } // /api/sessions.json
   | { kind: 'api-stats' } // /api/stats.json
   | { kind: 'current-session' } // /api/current-session.json
@@ -1736,17 +1738,23 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/proxy-recent') return { kind: 'recent' };
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
   if (pathname === '/health' || pathname === '/v1/health') return { kind: 'health' };
+  if (pathname === '/version' || pathname === '/api/version') return { kind: 'version' };
+  if (pathname === '/v1/props') return { kind: 'props' };
   if (
     pathname === '/v1/models' ||
     pathname === '/v1/models/' ||
+    pathname === '/api/v1/models' ||
+    pathname === '/api/v1/models/' ||
     pathname === '/models' ||
-    pathname === '/models/'
+    pathname === '/models/' ||
+    pathname === '/models.json' ||
+    pathname === '/api/tags'
   ) {
     return { kind: 'models' };
   }
-  if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };
-  if (pathname === '/api/stats.json') return { kind: 'api-stats' };
-  if (pathname === '/api/current-session.json') return { kind: 'current-session' };
+  if (pathname === '/api/sessions.json' || pathname === '/api/sessions') return { kind: 'api-sessions' };
+  if (pathname === '/api/stats.json' || pathname === '/api/stats') return { kind: 'api-stats' };
+  if (pathname === '/api/current-session.json' || pathname === '/api/current-session') return { kind: 'current-session' };
   if (pathname === '/api/compression') return { kind: 'api-compression' };
   if (pathname === '/api/image-source') return { kind: 'api-image-source' };
   if (pathname.startsWith('/fragments/')) {

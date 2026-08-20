@@ -502,6 +502,18 @@ async function dispatchDashboard(
         },
       });
     }
+    case 'version': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      return new Response(JSON.stringify({ version: '0.1.0', service: 'pxpipe' }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    case 'props': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      return new Response(JSON.stringify({ props: {} }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
     case 'models': {
       if (method !== 'GET' && method !== 'HEAD') return undefined;
       return dashboard.serveModelsJson();

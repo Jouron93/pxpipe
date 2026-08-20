@@ -118,4 +118,32 @@ describe('PXPIPE-REQ-01: Admission Estimator Unit Tests', () => {
     });
     expect(missing.decision).toBe('INSUFFICIENT_EVIDENCE');
   });
+
+  it('actively bypasses below-floor requests in transformRequest when activeAdmission is true', async () => {
+    const { transformRequest } = await import('../src/core/transform.js');
+    const smallPayload = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude-sonnet-5',
+        messages: [{ role: 'user', content: 'Hello world' }],
+      }),
+    );
+    const result = await transformRequest(smallPayload, { activeAdmission: true });
+    expect(result.info.bypassed).toBe(true);
+    expect(result.info.reason).toBe('below_sonnet_economic_floor');
+    expect(result.info.imageCount).toBe(0);
+  });
+
+  it('actively bypasses below-floor requests in transformOpenAIChatCompletions when activeAdmission is true', async () => {
+    const { transformOpenAIChatCompletions } = await import('../src/core/openai.js');
+    const smallPayload = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content: 'Hello world' }],
+      }),
+    );
+    const result = await transformOpenAIChatCompletions(smallPayload, { activeAdmission: true });
+    expect(result.info.bypassed).toBe(true);
+    expect(result.info.reason).toBe('below_codex_economic_floor');
+    expect(result.info.imageCount).toBe(0);
+  });
 });

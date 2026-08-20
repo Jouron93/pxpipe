@@ -33,6 +33,7 @@ import {
   IMAGE_COST_SAFETY_MARGIN,
   type TransformInfo,
   type TransformOptions,
+  isActiveAdmissionEnabled,
 } from './transform.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
@@ -228,6 +229,7 @@ interface ResponsesFlatTool {
 
 interface OpenAIResolvedOptions {
   compress: boolean;
+  activeAdmission?: boolean;
   compressTools: boolean;
   minCompressChars: number;
   cols?: number;
@@ -240,6 +242,7 @@ interface OpenAIResolvedOptions {
 
 const DEFAULTS: OpenAIResolvedOptions = {
   compress: true,
+  activeAdmission: undefined,
   compressTools: true,
   minCompressChars: 2000,
   cols: undefined,
@@ -252,6 +255,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   return {
     compress: opts.compress ?? DEFAULTS.compress,
+    activeAdmission: opts.activeAdmission,
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
     minCompressChars: opts.minCompressChars ?? DEFAULTS.minCompressChars,
     cols: opts.cols,
@@ -867,6 +871,11 @@ export async function transformOpenAIChatCompletions(
     payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
     transformFamily: 'openai_chat',
   });
+  if (isActiveAdmissionEnabled(o) && info.shadowAdmission.decision === 'BYPASS') {
+    info.reason = info.shadowAdmission.reason;
+    info.bypassed = true;
+    return { body, info };
+  }
   if (!Array.isArray(req.messages)) {
     info.reason = 'parse_error: messages must be an array';
     return { body, info };
@@ -1074,6 +1083,11 @@ export async function transformOpenAIResponses(
     payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
     transformFamily: 'openai_responses',
   });
+  if (isActiveAdmissionEnabled(o) && info.shadowAdmission.decision === 'BYPASS') {
+    info.reason = info.shadowAdmission.reason;
+    info.bypassed = true;
+    return { body, info };
+  }
 
   // Normalize input to an array; preserve original string for wrap-back if needed.
   const inputWasString = typeof req.input === 'string';
