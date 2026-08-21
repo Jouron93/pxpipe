@@ -81,6 +81,17 @@ export interface ProxyEvent {
   actualModel?: string;
   billingLane: BillingLane;
   billingLaneSource: BillingLaneSource;
+  /** Redacted caller identity from CALLER_ID_HEADERS (see describeCaller).
+   *  Set on EVERY event, not just auth denials — without it 63.9% of rows were
+   *  unattributable and per-account spend could not be computed. Never contains
+   *  credential material. */
+  caller?: string;
+  /** Explicit x-session-id when the caller supplies one. */
+  sessionId?: string;
+  /** x-request-id, for correlating this receipt to the caller's own logs. */
+  requestId?: string;
+  /** Account/profile label (claude-a, codex-b, ...) when the caller declares one. */
+  account?: string;
   /** Provider rate-limit headers observed on the upstream response. Values are
    * retained verbatim because providers use both durations and timestamps. */
   rateLimit?: RateLimitTelemetry;
@@ -823,6 +834,11 @@ const CALLER_ID_HEADERS = [
   'x-app',
   'x-session-id',
   'x-request-id',
+  // Account/profile label (claude-a, codex-b, ...). Nothing sets this yet — the
+  // alias generators will — but the slot must exist before routing can balance
+  // spend across the two Claude and two Codex subscriptions. Absent until then,
+  // which reads as undefined rather than as a fabricated default.
+  'x-account',
   'anthropic-version',
   'anthropic-beta',
   'x-stainless-lang',
@@ -852,6 +868,57 @@ function fnv1a8(input: string): string {
   return h.toString(16).padStart(8, '0');
 }
 
+/** Headers safe to persist on EVERY row. Deliberately a STRICT SUBSET of
+ *  CALLER_ID_HEADERS.
+ *
+ *  CALLER_ID_HEADERS also carries provider account identifiers
+ *  (`chatgpt-account-id`, `openai-organization`, `openai-project`). Those are
+ *  acceptable in a 401/403 diagnostic, which is rare, deliberate and scoped to a
+ *  failure being investigated — but NOT in a receipt written for every request
+ *  and retained indefinitely. `tests/gateway.test.ts` "routes ChatGPT Codex
+ *  without persisting OAuth secrets" asserts exactly that, and caught this when
+ *  describeCaller was first wired to the full list.
+ *
+ *  Everything here is either a harness label we generate or an opaque
+ *  correlation id. Nothing here identifies a billable account at the provider.
+ *  The stainless/version headers are omitted too — no attribution value, pure
+ *  row noise. */
+const RECEIPT_ID_HEADERS = [
+  'user-agent',
+  'x-app',
+  'x-session-id',
+  'x-request-id',
+  'x-account',
+] as const;
+
+/** Redacted caller identity for per-request receipts. Never credentials, and
+ *  never provider account identifiers — see RECEIPT_ID_HEADERS above.
+ *
+ *  Shares the truncation/de-delimiting rule with describeAuthDenial so one
+ *  hostile header cannot bloat or split a row; the rule lives in exactly one
+ *  place so the two paths cannot drift.
+ *
+ *  Returns undefined when the caller sent none of these, so an absent identity
+ *  stays absent rather than being recorded as an empty string. */
+export function describeCaller(headers: Headers): string | undefined {
+  const parts = fingerprintHeaders(headers, RECEIPT_ID_HEADERS);
+  return parts.length > 0 ? parts.join(' | ') : undefined;
+}
+
+/** The single implementation of the header-fingerprint rule, shared by the
+ *  receipt path (narrow list) and the auth-denial path (broad list). Values are
+ *  truncated to 80 chars and stripped of whitespace/pipes so one hostile header
+ *  cannot bloat a row or forge a field separator. Kept in one place so the two
+ *  callers cannot drift apart on that guarantee. */
+function fingerprintHeaders(headers: Headers, names: readonly string[]): string[] {
+  const parts: string[] = [];
+  for (const name of names) {
+    const v = headers.get(name);
+    if (v) parts.push(`${name}=${v.slice(0, 80).replace(/[\s|]+/g, ' ')}`);
+  }
+  return parts;
+}
+
 /** Compact, redacted caller identity for auth-denial rows (401/403).
  *  Before this, `grep -rn "403" src/` returned zero hits — a 2,581-request 403
  *  burst on gpt-4o had no attributable caller anywhere in the logs. This records
@@ -868,11 +935,11 @@ function describeAuthDenial(status: number, headers: Headers, upstreamUrl: strin
     const v = headers.get(name);
     if (v) parts.push(`${name}=<redacted:${fnv1a8(v)}>`);
   }
-  for (const name of CALLER_ID_HEADERS) {
-    const v = headers.get(name);
-    // Truncated and de-delimited so one hostile header cannot bloat or split the row.
-    if (v) parts.push(`${name}=${v.slice(0, 80).replace(/[\s|]+/g, ' ')}`);
-  }
+  // Broad list on purpose: an auth denial is a rare, deliberate diagnostic, and
+  // knowing WHICH provider account was refused is the entire value here (the
+  // 2,581-request gpt-4o burst above). Receipts use the narrower
+  // RECEIPT_ID_HEADERS because they persist on every request indefinitely.
+  parts.push(...fingerprintHeaders(headers, CALLER_ID_HEADERS));
   return parts.join(' | ');
 }
 
@@ -1141,6 +1208,15 @@ export function createProxy(config: ProxyConfig = {}) {
           actualModel,
           billingLane,
           billingLaneSource,
+          // Receipts: attach caller identity to EVERY event, regardless of
+          // status. Previously this was computed only for 401/403 (see the
+          // describeAuthDenial call below), leaving 63.9% of rows anonymous and
+          // 1.69B cache_read tokens unattributable. Reads CALLER_ID_HEADERS
+          // only — never credential material.
+          caller: describeCaller(req.headers),
+          sessionId: req.headers.get('x-session-id') ?? undefined,
+          requestId: req.headers.get('x-request-id') ?? undefined,
+          account: req.headers.get('x-account') ?? undefined,
           rateLimit,
           status,
           durationMs: Date.now() - t0,

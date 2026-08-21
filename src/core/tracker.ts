@@ -9,6 +9,15 @@ import type { CandidateBlockInstrumentation } from './transform.js';
 import { bytesToBase64 } from './png.js';
 
 /** Flat record persisted per request. Adding a field is non-breaking for readers. */
+/** Sentinel for traffic whose caller could not be identified. Written explicitly
+ *  into every row rather than omitted, so unattributable usage shows up as a
+ *  visible bucket instead of vanishing from per-session accounting.
+ *
+ *  Lives here (core) rather than in sessions.ts because sessions.ts imports from
+ *  this module; the reverse would be a cycle. sessions.ts re-uses this value so
+ *  the emitter and the aggregator can never disagree on the sentinel. */
+export const UNKNOWN_SESSION_ID = '<unknown>';
+
 export interface TrackEvent {
   shadow_admission_decision?: 'ADMIT' | 'BYPASS' | 'INSUFFICIENT_EVIDENCE';
   shadow_admission_reason?: string;
@@ -132,6 +141,27 @@ export interface TrackEvent {
   claude_md_sha8?: string;
   first_user_sha8?: string;
 
+  // Caller identity (receipts). Recorded on EVERY row, not just auth denials.
+  // Measured 2026-08-20: 63.9% of 75,049 events had no session id at all and
+  // collapsed into one '<unknown>' bucket, taking 1.69B cache_read tokens
+  // (57.7%) with them — which makes per-account and per-route spend
+  // unanswerable. first_user_sha8 only identifies harnesses that emit a stable
+  // first user message, and cwd is regex-scraped from Claude Code's
+  // "Working directory:" preamble (transform.ts), so Codex/Hermes/Atomic were
+  // anonymous by construction. These fields come from CALLER_ID_HEADERS, which
+  // any harness can set.
+  //
+  // NEVER credential material — describeCaller() reads CALLER_ID_HEADERS only.
+  /** Redacted digest of the caller-identifying headers. */
+  caller?: string;
+  /** Explicit x-session-id when supplied; '<unknown>' is recorded, never omitted. */
+  session_id?: string;
+  /** x-request-id, for correlating a receipt back to the caller's own logs. */
+  request_id?: string;
+  /** Account/profile label (e.g. claude-a, codex-b) so spend is attributable
+   *  per subscription rather than per provider. */
+  account?: string;
+
   // From Anthropic/OpenAI Usage:
   input_tokens?: number;
   output_tokens?: number;
@@ -229,6 +259,17 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.usageParseErrorCount !== undefined) {
     out.usage_parse_error_count = ev.usageParseErrorCount;
   }
+  // Receipts: caller identity on EVERY row, independent of status. `error` is
+  // deliberately NOT reused for this — non-401/403 rows leave it unset so
+  // existing consumers are unaffected (see proxy.ts fire()), and overloading it
+  // would corrupt error semantics for every reader of this stream.
+  if (ev.caller) out.caller = ev.caller;
+  if (ev.requestId) out.request_id = ev.requestId;
+  if (ev.account) out.account = ev.account;
+  // session_id is written unconditionally: an absent session must be visible as
+  // '<unknown>' rather than dropped, otherwise unattributable traffic silently
+  // disappears from per-session accounting instead of showing up as a gap.
+  out.session_id = ev.sessionId ?? UNKNOWN_SESSION_ID;
   if (ev.error) out.error = ev.error;
   if (ev.errorBody) out.error_body = ev.errorBody;
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
