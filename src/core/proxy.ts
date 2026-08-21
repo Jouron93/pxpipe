@@ -88,8 +88,17 @@ export interface ProxyEvent {
   caller?: string;
   /** Explicit x-session-id when the caller supplies one. */
   sessionId?: string;
-  /** x-request-id, for correlating this receipt to the caller's own logs. */
+  /** Correlation id for this request. Preserved from the caller's x-request-id
+   *  when supplied, otherwise generated here so EVERY receipt has one. Clients
+   *  generally cannot mint a fresh value per request from static config (Codex,
+   *  for instance, supports only static http_headers and env-backed
+   *  env_http_headers — both fixed for the life of the process), so leaving this
+   *  to the client would permanently strand the field. */
   requestId?: string;
+  /** Whether requestId came from the caller or was minted here. Without this,
+   *  a generated id is indistinguishable from a client-supplied one and
+   *  cross-system correlation silently gives wrong answers. */
+  requestIdSource?: 'client' | 'pxpipe';
   /** Account/profile label (claude-a, codex-b, ...) when the caller declares one. */
   account?: string;
   /** Provider rate-limit headers observed on the upstream response. Values are
@@ -1132,6 +1141,18 @@ export function createProxy(config: ProxyConfig = {}) {
     let reqBodySha8: string | undefined;
     let billingLane: BillingLane = 'unknown';
     let billingLaneSource: BillingLaneSource = 'unresolved';
+    // Resolved once per request rather than at the emit site.
+    //
+    // Today the three fire() call sites are mutually exclusive terminal branches
+    // (transport failure, the documented-unreachable no-response case, and the
+    // normal path), so exactly one event is emitted per inbound request and
+    // hoisting changes nothing observable. It is done anyway because minting
+    // inside the event literal would silently produce a DIFFERENT uuid per
+    // fire() call the moment a second, non-terminal emit is ever added — e.g. a
+    // per-attempt retry event — and the receipts for one request would no longer
+    // stitch together. Cheap here, subtle and hard to spot later.
+    const inboundRequestId = req.headers.get('x-request-id') ?? undefined;
+    const resolvedRequestId = inboundRequestId ?? crypto.randomUUID();
 
     const fire = (
       status: number,
@@ -1215,7 +1236,12 @@ export function createProxy(config: ProxyConfig = {}) {
           // only — never credential material.
           caller: describeCaller(req.headers),
           sessionId: req.headers.get('x-session-id') ?? undefined,
-          requestId: req.headers.get('x-request-id') ?? undefined,
+          // Preserve the caller's id when present; mint one otherwise so no
+          // receipt is ever uncorrelatable. crypto.randomUUID is available on
+          // both runtimes this builds for (Node and cloudflare-workers) — the
+          // same Web Crypto global already used for crypto.subtle.digest above.
+          requestId: resolvedRequestId,
+          requestIdSource: inboundRequestId ? 'client' : 'pxpipe',
           account: req.headers.get('x-account') ?? undefined,
           rateLimit,
           status,

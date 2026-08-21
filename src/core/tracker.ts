@@ -156,8 +156,13 @@ export interface TrackEvent {
   caller?: string;
   /** Explicit x-session-id when supplied; '<unknown>' is recorded, never omitted. */
   session_id?: string;
-  /** x-request-id, for correlating a receipt back to the caller's own logs. */
+  /** Correlation id. Always present: the caller's x-request-id when supplied,
+   *  otherwise minted by pxpipe so no receipt is uncorrelatable. */
   request_id?: string;
+  /** 'client' or 'pxpipe'. A minted id must be distinguishable from a
+   *  client-supplied one, or cross-system correlation quietly gives wrong
+   *  answers when someone joins on an id the client never saw. */
+  request_id_source?: 'client' | 'pxpipe';
   /** Account/profile label (e.g. claude-a, codex-b) so spend is attributable
    *  per subscription rather than per provider. */
   account?: string;
@@ -265,6 +270,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   // would corrupt error semantics for every reader of this stream.
   if (ev.caller) out.caller = ev.caller;
   if (ev.requestId) out.request_id = ev.requestId;
+  if (ev.requestIdSource) out.request_id_source = ev.requestIdSource;
   if (ev.account) out.account = ev.account;
   // session_id is written unconditionally: an absent session must be visible as
   // '<unknown>' rather than dropped, otherwise unattributable traffic silently
