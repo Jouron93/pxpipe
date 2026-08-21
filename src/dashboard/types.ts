@@ -145,6 +145,10 @@ export interface RecentRow {
   session_saved_so_far_delta?: number;
   img_id?: number;
   img_ids?: number[];
+  baseline_tokens?: number;
+  shadow_predicted_savings_pct?: number;
+  reason?: string;
+  first_byte_ms?: number;
 }
 
 /** /api/sessions.json payload. */

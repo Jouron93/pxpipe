@@ -154,6 +154,10 @@ export interface RecentRow {
    *  ring (the id stays on the row but no longer fetches). */
   img_id?: number;
   img_ids?: number[];
+  baseline_tokens?: number;
+  shadow_predicted_savings_pct?: number;
+  reason?: string;
+  first_byte_ms?: number;
 }
 
 /** Aggregate over the whole session. Reset on process restart unless
@@ -985,6 +989,20 @@ export class DashboardState {
         creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
       img_id: imgId,
       img_ids: imgIds,
+      // Text-equivalent size of the request. Published on EVERY row, including
+      // passthrough — unlike baseline_input above, which is gated behind
+      // creditSaving (compressed only) because pxpipe must never credit itself
+      // with savings it did not produce. Displaying the counterfactual is not
+      // the same as claiming credit for it, so the display gets the honest
+      // number and the accounting keeps its guarantee. No fallback to actual
+      // input: an absent baseline must read as absent, not as "zero saved".
+      baseline_tokens: info?.baselineTokens,
+      // The estimator writes to info.shadowAdmission (see core/openai.ts:868);
+      // tracker.ts:351 reads .predictedSavingsPct off it. Reading a bare
+      // info.shadowPredictedSavingsPct silently yields undefined forever.
+      shadow_predicted_savings_pct: info?.shadowAdmission?.predictedSavingsPct,
+      reason: info?.reason ?? ev.error,
+      first_byte_ms: ev.firstByteMs,
     };
     this.recent.push(row);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);

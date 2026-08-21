@@ -709,18 +709,47 @@ export function renderRecentFragment(p: RecentPayload): string {
             const createNote = createLoss
               ? ` <span class="mk-create" title="Cache-create turn: this loss is the one-time ${CACHE_CREATE_RATE}× premium for writing ${numFmt(cc)} tokens to cache. Later turns re-read that prefix at ${CACHE_READ_RATE}×, which typically recoups it.">create</span>`
               : '';
+            // A passthrough row has no REALISED saving — nothing was imaged, so
+            // pxpipe saved nothing and must not claim otherwise. But the
+            // admission estimator already computed what imaging WOULD have
+            // saved, and that counterfactual is the whole question the operator
+            // is asking. Show it, explicitly marked as an estimate, and never
+            // let it reach a realised-savings total. Empty-cell text is also
+            // corrected: on these rows the baseline is not "unavailable" (the
+            // probe is fine, baseline_probe_status is 'ok' on ~99.6% of rows) —
+            // the request simply was not imaged.
+            const predPct = e.shadow_predicted_savings_pct;
             const savedCell = saved == null
-              ? `<td class="num muted">${inference ? 'baseline unavailable' : notApplicable}</td>`
+              ? predPct != null && inference
+                ? `<td class="num muted"><span class="mk-est" title="Estimate only — this request was NOT imaged, so nothing was actually saved. The admission estimator predicted imaging would have removed ${predPct.toFixed(1)}% of input. Not counted in any realised total.">~${predPct.toFixed(1)}% if imaged</span></td>`
+                : `<td class="num muted">${inference ? 'not imaged' : notApplicable}</td>`
               : saved > 0
                 ? `<td class="num pos">${numFmt(saved)}</td>`
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
+            const reasonTitle = e.reason ? ` title="${escapeHtml(e.reason)}"` : '';
+            // "As text" — what this request would have cost as plain text.
+            // baseline_input is cache-aware but is published only on compressed
+            // rows (gated behind creditSaving). baseline_tokens is the raw
+            // text-equivalent and IS present on passthrough rows. Prefer the
+            // cache-aware figure; fall back to the raw one prefixed with ~ so
+            // the two bases are never silently conflated. Previously this cell
+            // rendered the literal 'probe unavailable' on every passthrough row
+            // — i.e. it reported a healthy probe as broken, which read as a
+            // system failure when nothing was wrong.
+            const baselineCell = e.baseline_input != null
+              ? numFmt(e.baseline_input)
+              : e.baseline_tokens != null
+                ? `<span class="mk-raw" title="Raw text-equivalent size (${numFmt(e.baseline_tokens)} tokens), not cache-adjusted. The cache-aware baseline is only computed for imaged requests, so this is the closest honest figure for a passthrough row.">~${numFmt(e.baseline_tokens)}</span>`
+                : inference
+                  ? 'not measured'
+                  : notApplicable;
             const imaged = !inference
               ? `<span class="muted">${notApplicable}</span>`
               : e.cc_added
-              ? `<span class="badge badge-img">image</span>`
-              : `<span class="badge badge-txt">text</span>`;
+              ? `<span class="badge badge-img"${reasonTitle}>image</span>`
+              : `<span class="badge badge-txt"${reasonTitle}>text</span>`;
             const requestedDiffers = e.requested_model && e.actual_model && e.requested_model !== e.actual_model;
             // A failed request (401/404/etc.) often has no resolved `model`, but the
             // client still named one — show requested_model so no-usage rows aren't nameless.
@@ -741,7 +770,10 @@ export function renderRecentFragment(p: RecentPayload): string {
               `Cache Hits: ${e.cache_read != null ? numFmt(e.cache_read) : 'N/A'}`,
               `As Text: ${e.baseline_input != null ? numFmt(e.baseline_input) : 'N/A'}`,
               `Sent: ${e.actual_input != null ? numFmt(e.actual_input) : 'N/A'}`,
-              `Saved: ${saved != null ? numFmt(saved) : 'N/A'}`
+              `Saved: ${saved != null ? numFmt(saved) : 'N/A'}`,
+              ...(e.first_byte_ms != null ? [`TTFB: ${Math.round(e.first_byte_ms)}ms`] : []),
+              ...(e.reason ? [`Reason: ${e.reason}`] : []),
+              ...(e.shadow_predicted_savings_pct != null ? [`Pred Savings: ${e.shadow_predicted_savings_pct.toFixed(1)}%`] : [])
             ].join(' | ');
             const copyIcon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
             const copyBtn = `<button class="btn-copy" onclick="copyReq(this)" data-row="${escapeHtml(rowSummary)}" title="Copy request row summary">${copyIcon} Copy</button>`;
@@ -756,7 +788,7 @@ export function renderRecentFragment(p: RecentPayload): string {
               `<td>${modelCell}</td>` +
               `<td>${imaged}</td>` +
               `<td class="num">${usageCell(e.cache_read, 'usage not reported')}</td>` +
-              `<td class="num">${usageCell(e.baseline_input, 'probe unavailable')}</td>` +
+              `<td class="num">${baselineCell}</td>` +
               `<td class="num">${usageCell(e.actual_input, 'usage not reported')}</td>` +
               savedCell +
               `<td class="num">${actionCell}</td>` +
