@@ -168,6 +168,16 @@ export function rewriteUrl(route: Route, requestUri: string): string {
     const joiner = route.substitute.endsWith('/') ? '/' : '';
     return `${route.target.protocol}//${route.target.host}${route.prefix}${joiner}${rest}`;
   }
+  // If pattern is an exact path (no '*'), and requestUri matches or has query params:
+  // e.g. /backend-api/codex?client_version=1 -> /v1?client_version=1
+  if (!route.pattern.includes('*') && route.prefix) {
+    const slash = route.pattern.indexOf('/');
+    const patternPath = slash < 0 ? '' : route.pattern.slice(slash);
+    if (patternPath && requestUri.toLowerCase().startsWith(patternPath.toLowerCase())) {
+      const rest = requestUri.slice(patternPath.length);
+      return `${route.target.protocol}//${route.target.host}${route.prefix}${rest}`;
+    }
+  }
   return `${route.target.protocol}//${route.target.host}${route.prefix}${requestUri}`;
 }
 

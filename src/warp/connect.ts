@@ -231,15 +231,30 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
    * CONNECT to an intercepted host and then ask, by Host, for any other. Now
    * all three must agree.
    */
-  const connectAuthority = new Map<number, { host: string; port: number }>();
+  /**
+   * The CONNECT authority each hijacked connection was opened for.
+   * Keyed directly by the accepted Socket object via WeakMap (connection-identity bound),
+   * with an endpoint-tuple fallback Map `${remoteAddress}:${remotePort}` to ensure multi-interface
+   * loopback isolation (127.0.0.1 vs 127.0.0.2 vs ::1).
+   */
+  const socketAuthority = new WeakMap<Socket, { host: string; port: number }>();
+  const endpointAuthority = new Map<string, { host: string; port: number; socket: Socket }>();
 
   const boundAuthority = (
     req: IncomingMessage,
   ): { host: string; port: number; reason?: undefined } | { reason: string } => {
-    const remotePort = req.socket.remotePort;
-    const bound = remotePort === undefined ? undefined : connectAuthority.get(remotePort);
+    const tlsSocket = req.socket as TLSSocket;
+    const rawSocket = ((tlsSocket as any)._parent ?? tlsSocket) as Socket;
+    let bound = socketAuthority.get(rawSocket) ?? socketAuthority.get(tlsSocket);
+    if (!bound && tlsSocket.remotePort !== undefined) {
+      const endpointKey = `${tlsSocket.remoteAddress ?? ''}:${tlsSocket.remotePort}`;
+      const entry = endpointAuthority.get(endpointKey);
+      if (entry && (entry.socket === rawSocket || entry.socket === (tlsSocket as any))) {
+        bound = entry;
+      }
+    }
     if (!bound) return { reason: 'no CONNECT authority for this connection' };
-    const servername = (req.socket as TLSSocket).servername || '';
+    const servername = tlsSocket.servername || '';
     if (servername && canonicalHost(servername) !== canonicalHost(bound.host)) {
       return { reason: `TLS SNI ${servername} does not match CONNECT host ${bound.host}` };
     }
@@ -350,10 +365,16 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
 
     // Remember what this connection was opened for; every decrypted request on
     // it is checked against this, not against whatever Host or SNI it carries.
+    socketAuthority.set(clientSocket, { host, port });
     const remotePort = clientSocket.remotePort;
     if (remotePort !== undefined) {
-      connectAuthority.set(remotePort, { host, port });
-      clientSocket.once('close', () => connectAuthority.delete(remotePort));
+      const endpointKey = `${clientSocket.remoteAddress ?? ''}:${remotePort}`;
+      endpointAuthority.set(endpointKey, { host, port, socket: clientSocket });
+      clientSocket.once('close', () => {
+        if (endpointAuthority.get(endpointKey)?.socket === clientSocket) {
+          endpointAuthority.delete(endpointKey);
+        }
+      });
     }
 
     clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');

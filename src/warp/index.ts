@@ -58,7 +58,7 @@ export function defaultRoutes(port: number): Route[] {
     // again on the way out). Without this rule that client tunnelled straight
     // past warp as raw TCP and nothing was imaged.
     parseRoute(`chatgpt.com/backend-api/codex/*=http://127.0.0.1:${port}/v1/*`),
-    parseRoute(`chatgpt.com/backend-api/codex*=http://127.0.0.1:${port}/v1/*`),
+    parseRoute(`chatgpt.com/backend-api/codex=http://127.0.0.1:${port}/v1`),
     parseRoute(`api.x.ai/v1/chat/completions*=http://127.0.0.1:${port}`),
     parseRoute(`api.x.ai/v1/responses*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
@@ -128,10 +128,13 @@ export function resolveExecutable(
  * directly, with `shell: false`, keeps every argument intact: handed to
  * cmd.exe via the shim, `&`, `|`, `<`, `>`, `^`, `%VAR%` and `!` inside a prompt
  * are re-parsed as shell syntax.
+ *
+ * Fails closed on unrecognized batch files or arbitrary scripts to guarantee
+ * that argument semantics are preserved.
  */
 export function resolveShimTarget(
   shimPath: string,
-): { kind: 'node'; script: string } | { kind: 'exe'; path: string } | null {
+): { kind: 'node'; execPath?: string; script: string } | { kind: 'exe'; path: string } | null {
   let text: string;
   try {
     text = readFileSync(shimPath, 'utf8');
@@ -139,20 +142,78 @@ export function resolveShimTarget(
     return null;
   }
   const dp0 = dirname(shimPath);
-  const found: Array<{ kind: 'node'; script: string } | { kind: 'exe'; path: string }> = [];
-  // Match both quoted and unquoted %dp0% or %~dp0 targets with optional leading slash,
-  // including relative parent paths (%~dp0..\...) and shims where %~dp0 already has a trailing backslash.
-  const re = /(?:"(?:%~dp0%?|%dp0%)[\\/]?([^"]+?\.(js|mjs|cjs|exe))"|(?:%~dp0%?|%dp0%)[\\/]?([^\s\r\n]+?\.(js|mjs|cjs|exe)))/gi;
-  for (const m of text.matchAll(re)) {
-    const rawRel = m[1] ?? m[3];
-    if (!rawRel) continue;
-    const cleanRel = rawRel.replace(/^[\\/]+/, '');
-    const full = resolvePath(dp0, cleanRel);
-    if (!existsSync(full)) continue;
-    const ext = (m[2] ?? m[4] ?? '').toLowerCase();
-    found.push(ext === 'exe' ? { kind: 'exe', path: full } : { kind: 'node', script: full });
+  const lines = text.split(/\r?\n/);
+
+  // Check if a local node.exe is present adjacent to the shim (%dp0%\node.exe)
+  const localNode = join(dp0, 'node.exe');
+  const hasLocalNode = existsSync(localNode);
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    // Ignore empty lines and comments
+    if (!line || /^[@\s]*(?:rem\b|::)/i.test(line)) continue;
+
+    // Must be an execution line forwarding arguments (%*)
+    if (!/%\*/.test(line)) continue;
+
+    // Normalize forward slashes and escaped dp0 constructs
+    // Match node script invocation forwarding %*
+    const nodeMatch =
+      /(?:(?:"%_prog%"|"%~?dp0%?\\node\.exe"|node)\s+)?(?:(?:"(%~?dp0%?[\\/]?[^"]+?\.(?:js|mjs|cjs))")|(?:(%~?dp0%?[\\/]?[^\s\r\n]+?\.(?:js|mjs|cjs))))\s+%\*/i.exec(
+        line,
+      );
+    if (nodeMatch) {
+      const rawRel = nodeMatch[1] ?? nodeMatch[2];
+      if (rawRel) {
+        const cleanRel = rawRel.replace(/^%~?dp0%?/i, '').replace(/^[\\/]+/, '');
+        const full = resolvePath(dp0, cleanRel);
+        if (existsSync(full)) {
+          return hasLocalNode
+            ? { kind: 'node', execPath: localNode, script: full }
+            : { kind: 'node', script: full };
+        }
+      }
+    }
+
+    // Match direct binary exe invocation forwarding %*
+    const exeMatch =
+      /(?:(?:"(%~?dp0%?[\\/]?[^"]+?\.exe)")|(?:(%~?dp0%?[\\/]?[^\s\r\n]+?\.exe)))\s+%\*/i.exec(
+        line,
+      );
+    if (exeMatch) {
+      const rawRel = exeMatch[1] ?? exeMatch[2];
+      if (rawRel) {
+        const cleanRel = rawRel.replace(/^%~?dp0%?/i, '').replace(/^[\\/]+/, '');
+        const full = resolvePath(dp0, cleanRel);
+        if (existsSync(full)) {
+          return { kind: 'exe', path: full };
+        }
+      }
+    }
+
+    // Match cmd-shim title %COMSPEC% compound invocation
+    const titleMatch =
+      /(?:title\s+%COMSPEC%\s+&\s+)(?:(?:"%_prog%"|node)\s+)?(?:(?:"(%~?dp0%?[\\/]?[^"]+?\.(?:js|mjs|cjs|exe))")|(?:(%~?dp0%?[\\/]?[^\s\r\n]+?\.(?:js|mjs|cjs|exe))))\s+%\*/i.exec(
+        line,
+      );
+    if (titleMatch) {
+      const rawRel = titleMatch[1] ?? titleMatch[2];
+      if (rawRel) {
+        const cleanRel = rawRel.replace(/^%~?dp0%?/i, '').replace(/^[\\/]+/, '');
+        const full = resolvePath(dp0, cleanRel);
+        if (existsSync(full)) {
+          const isExe = full.toLowerCase().endsWith('.exe');
+          return isExe
+            ? { kind: 'exe', path: full }
+            : hasLocalNode
+              ? { kind: 'node', execPath: localNode, script: full }
+              : { kind: 'node', script: full };
+        }
+      }
+    }
   }
-  return found.length > 0 ? found[found.length - 1]! : null;
+
+  return null;
 }
 
 /**
@@ -163,8 +224,19 @@ export function resolveShimTarget(
  */
 const CMD_METACHARACTERS = /[&|<>^%!"\r\n()]/;
 
-export function findUnsafeCmdArgument(args: readonly string[]): string | null {
-  for (const arg of args) if (CMD_METACHARACTERS.test(arg)) return arg;
+export interface UnsafeCmdArgument {
+  readonly index: number;
+  readonly char: string;
+  readonly argument: string;
+}
+
+export function findUnsafeCmdArgument(args: readonly string[]): UnsafeCmdArgument | null {
+  for (let i = 0; i < args.length; i++) {
+    const match = CMD_METACHARACTERS.exec(args[i]!);
+    if (match) {
+      return { index: i, char: match[0], argument: args[i]! };
+    }
+  }
   return null;
 }
 
@@ -183,24 +255,32 @@ export function escapeCmdArg(a: string): string {
 /**
  * Descendants of a Windows process keep its PID as their ParentProcessId after
  * it exits, so they stay enumerable even though `taskkill /T` on the dead PID
- * can no longer walk to them. A breadth-first search sweeps all generations
- * (children, grandchildren) of the process tree with cycle-protection.
+ * can no longer walk to them.
+ *
+ * Hardened with:
+ * - CreationDate verification: ignores reused PIDs created before the root process.
+ * - Multi-generational ancestor seeding: seeds with root PID and any known intermediate child PIDs.
+ * - PowerShell status checking: only accepts exit status 0 without errors.
  */
-export function reapWindowsOrphans(parentPid: number): void {
+export function reapWindowsOrphans(parentPid: number, extraSeedPids: readonly number[] = []): void {
   if (!parentPid || parentPid <= 0) return;
+  const seedList = [parentPid, ...extraSeedPids.filter((p) => p > 0)].join(',');
   const script =
-    `$procs = Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId; ` +
+    `$root = Get-CimInstance Win32_Process -Filter "ProcessId = ${parentPid}"; ` +
+    `$minDate = if ($root -and $root.CreationDate) { $root.CreationDate } else { [DateTime]::MinValue }; ` +
+    `$procs = Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate; ` +
     `$queue = [System.Collections.Generic.Queue[int]]::new(); ` +
-    `$queue.Enqueue(${parentPid}); ` +
     `$visited = [System.Collections.Generic.HashSet[int]]::new(); ` +
-    `$null = $visited.Add(${parentPid}); ` +
+    `foreach ($id in @(${seedList})) { if ($visited.Add($id)) { $queue.Enqueue($id); } } ` +
     `$toKill = [System.Collections.Generic.List[int]]::new(); ` +
     `while ($queue.Count -gt 0) { ` +
       `$cur = $queue.Dequeue(); ` +
       `foreach ($p in $procs) { ` +
         `if ($p.ParentProcessId -eq $cur -and $visited.Add($p.ProcessId)) { ` +
-          `$toKill.Add($p.ProcessId); ` +
-          `$queue.Enqueue($p.ProcessId); ` +
+          `if ($p.CreationDate -ge $minDate) { ` +
+            `$toKill.Add($p.ProcessId); ` +
+            `$queue.Enqueue($p.ProcessId); ` +
+          `} ` +
         `} ` +
       `} ` +
     `} ` +
@@ -217,25 +297,36 @@ export function reapWindowsOrphans(parentPid: number): void {
       timeout: 5000,
       windowsHide: true,
     });
-    if (!r.error) return;
+    if (r.status === 0 && !r.error) return;
   }
 }
 
-/** Reaps a process and its entire child tree on Windows / POSIX. */
-export function killProcessTree(child: ChildProcess): void {
-  if (!child.pid || child.pid <= 0) return;
+/** Reaps a process and its entire child tree on Windows / POSIX with bounded escalation. */
+export function killProcessTree(child: ChildProcess, extraSeedPids: readonly number[] = []): void {
+  const pid = child.pid;
+  if (!pid || pid <= 0) return;
   if (isWindows) {
     const systemRoot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
     const taskkillExe = join(systemRoot, 'System32', 'taskkill.exe');
     const exe = existsSync(taskkillExe) ? taskkillExe : 'taskkill';
-    spawnSync(exe, ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-    reapWindowsOrphans(child.pid);
+    spawnSync(exe, ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    reapWindowsOrphans(pid, extraSeedPids);
   } else {
     try {
       try {
-        process.kill(-child.pid, 'SIGTERM');
+        process.kill(-pid, 'SIGTERM');
+        setTimeout(() => {
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {}
+        }, 500).unref();
       } catch {
         child.kill('SIGTERM');
+        setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch {}
+        }, 500).unref();
       }
     } catch {
       /* ignore */
@@ -270,22 +361,12 @@ export function childEnvironment(
       delete env[key];
     }
   }
-  // Sanitize NO_PROXY / no_proxy: prevent proxy bypass for intercepted AI hosts
-  for (const key of ['no_proxy', 'NO_PROXY']) {
-    if (env[key]) {
-      const val = env[key]!;
-      if (val.trim() === '*' || /chatgpt\.com|anthropic\.com|openai\.com|x\.ai/i.test(val)) {
-        const filtered = val
-          .split(',')
-          .map((s) => s.trim())
-          .filter((s) => s && s !== '*' && !/chatgpt\.com|anthropic\.com|openai\.com|x\.ai/i.test(s))
-          .join(',');
-        if (filtered) {
-          env[key] = filtered;
-        } else {
-          delete env[key];
-        }
-      }
+  // Sanitize NO_PROXY / no_proxy: remove all case variations of NO_PROXY to guarantee
+  // that all intercepted AI traffic flows through the transparent local warp proxy,
+  // preventing bypass via wildcards (*), suffixes (.com), or mixed casing (No_Proxy).
+  for (const key of Object.keys(env)) {
+    if (/^no_proxy$/i.test(key)) {
+      delete env[key];
     }
   }
   env.HTTP_PROXY = proxyUrl;
@@ -340,13 +421,13 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     program: string,
     args: readonly string[],
     env: NodeJS.ProcessEnv,
-    direct: { stdio: 'inherit'; env: NodeJS.ProcessEnv },
+    direct: { stdio: 'inherit'; env: NodeJS.ProcessEnv; detached?: boolean },
   ): ChildProcess => {
     const unsafe = findUnsafeCmdArgument([program, ...args]);
     if (unsafe !== null && env.PXPIPE_WARP_ALLOW_SHELL_ARGS !== '1') {
       console.error(
-        `[pxpipe] warp: refusing to run ${program} through cmd.exe: an argument contains ` +
-          `shell metacharacters (${JSON.stringify(unsafe.slice(0, 40))}). Run the program's ` +
+        `[pxpipe] warp: refusing to run ${program} through cmd.exe: argument at index ${unsafe.index} ` +
+          `contains forbidden shell metacharacter (${JSON.stringify(unsafe.char)}). Run the program's ` +
           `.exe/.js directly, or set PXPIPE_WARP_ALLOW_SHELL_ARGS=1 to accept cmd.exe parsing it.`,
       );
       process.exit(2);
@@ -360,7 +441,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   };
 
   const spawnResolved = (command: string[], env: NodeJS.ProcessEnv): ChildProcess => {
-    const direct = { stdio: 'inherit', env } as const;
+    const direct = { stdio: 'inherit', env, detached: !isWindows } as const;
     const resolved = resolveExecutable(command[0]!, env);
 
     const args = command.slice(1);
@@ -372,7 +453,8 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       // wraps and run it without any shell at all.
       const target = resolveShimTarget(resolved.path);
       if (target?.kind === 'node') {
-        return spawn(process.execPath, [target.script, ...args], direct);
+        const nodeBinary = target.execPath || process.execPath;
+        return spawn(nodeBinary, [target.script, ...args], direct);
       }
       if (target?.kind === 'exe') {
         return spawn(target.path, args, direct);
@@ -402,11 +484,41 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     const env = childEnvironment(process.env, proxyUrl, ca);
 
     const child = spawnResolved(command, env);
+    const knownPids = new Set<number>();
+    if (isWindows && child.pid) {
+      const tracker = setInterval(() => {
+        if (!child.pid) return;
+        const out = spawnSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId | Select-Object -Property ProcessId, ParentProcessId | ConvertTo-Json -Compress`,
+          ],
+          { encoding: 'utf8', timeout: 2000, windowsHide: true },
+        );
+        if (out.stdout) {
+          try {
+            const raw = JSON.parse(out.stdout);
+            const procs = Array.isArray(raw) ? raw : [raw];
+            for (const p of procs) {
+              if (p && (p.ParentProcessId === child.pid || knownPids.has(p.ParentProcessId))) {
+                knownPids.add(p.ProcessId);
+              }
+            }
+          } catch {}
+        }
+      }, 1500);
+      tracker.unref();
+      child.once('exit', () => clearInterval(tracker));
+    }
+
     let reaped = false;
     const cleanupTree = () => {
       if (reaped) return;
       reaped = true;
-      killProcessTree(child);
+      killProcessTree(child, Array.from(knownPids));
     };
 
     child.on('exit', () => {

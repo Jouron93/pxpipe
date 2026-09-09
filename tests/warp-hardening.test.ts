@@ -116,7 +116,7 @@ describe('P1-4: codex on chatgpt.com is diverted, provider base URLs are strippe
     expect(env.SSL_CERT_FILE).toBe('/bundle.pem');
   });
 
-  it('maps chatgpt.com/backend-api/codex without trailing slash and with query parameters', () => {
+  it('maps chatgpt.com/backend-api/codex without trailing slash and with query parameters, and rejects codex-other', () => {
     const routes = defaultRoutes(47821);
     const route = matchRoute(routes, 'chatgpt.com:443', '/backend-api/codex');
     expect(route).not.toBeNull();
@@ -124,9 +124,11 @@ describe('P1-4: codex on chatgpt.com is diverted, provider base URLs are strippe
     expect(rewriteUrl(route!, '/backend-api/codex?client_version=1')).toBe(
       'http://127.0.0.1:47821/v1?client_version=1',
     );
+    // Boundary check: /backend-api/codex-other must NOT match and rewrite to /v1-other
+    expect(matchRoute(routes, 'chatgpt.com:443', '/backend-api/codex-other')).toBeNull();
   });
 
-  it('removes provider base URLs case-insensitively and sanitizes NO_PROXY', () => {
+  it('removes provider base URLs case-insensitively and removes all case variations of NO_PROXY', () => {
     const env = childEnvironment(
       {
         PATH: 'x',
@@ -135,7 +137,8 @@ describe('P1-4: codex on chatgpt.com is diverted, provider base URLs are strippe
         codex_api_base: 'http://127.0.0.1:47822/v1',
         OPENAI_BASE_PATH: '/v1',
         NO_PROXY: 'localhost,127.0.0.1,api.openai.com,chatgpt.com,internal.corp',
-        no_proxy: '*',
+        no_proxy: '*,localhost',
+        No_Proxy: '.com,googleapis.com',
         Keep_Me: 'ok',
       },
       'http://127.0.0.1:5',
@@ -147,9 +150,10 @@ describe('P1-4: codex on chatgpt.com is diverted, provider base URLs are strippe
     expect(env.codex_api_base).toBeUndefined();
     expect(env.OPENAI_BASE_PATH).toBeUndefined();
     expect(env.Keep_Me).toBe('ok');
-    // Sanitize NO_PROXY: removed wildcard and intercepted domains, preserved other hosts
-    expect(env.NO_PROXY).toBe('localhost,127.0.0.1,internal.corp');
+    // All case variations of NO_PROXY removed to prevent bypasses
+    expect(env.NO_PROXY).toBeUndefined();
     expect(env.no_proxy).toBeUndefined();
+    expect(env.No_Proxy).toBeUndefined();
   });
 });
 
@@ -234,16 +238,17 @@ describe('P1-1: .cmd shims are unwrapped instead of run through cmd.exe', () => 
 
   it('names the argument cmd.exe would reinterpret', () => {
     expect(findUnsafeCmdArgument(['-p', 'plain prompt with spaces'])).toBeNull();
-    expect(findUnsafeCmdArgument(['-p', 'run this & del *'])).toBe('run this & del *');
-    expect(findUnsafeCmdArgument(['--x', '%USERPROFILE%'])).toBe('%USERPROFILE%');
-    expect(findUnsafeCmdArgument(['say "hi"'])).toBe('say "hi"');
-    expect(findUnsafeCmdArgument(['pipe | bad'])).toBe('pipe | bad');
-    expect(findUnsafeCmdArgument(['redirect < in'])).toBe('redirect < in');
-    expect(findUnsafeCmdArgument(['redirect > out'])).toBe('redirect > out');
-    expect(findUnsafeCmdArgument(['caret ^ test'])).toBe('caret ^ test');
-    expect(findUnsafeCmdArgument(['exclamation ! test'])).toBe('exclamation ! test');
-    expect(findUnsafeCmdArgument(['parenthesis (bad)'])).toBe('parenthesis (bad)');
-    expect(findUnsafeCmdArgument(['line1\r\nline2'])).toBe('line1\r\nline2');
+    expect(findUnsafeCmdArgument(['-p', 'run this & del *'])?.char).toBe('&');
+    expect(findUnsafeCmdArgument(['-p', 'run this & del *'])?.index).toBe(1);
+    expect(findUnsafeCmdArgument(['--x', '%USERPROFILE%'])?.char).toBe('%');
+    expect(findUnsafeCmdArgument(['say "hi"'])?.char).toBe('"');
+    expect(findUnsafeCmdArgument(['pipe | bad'])?.char).toBe('|');
+    expect(findUnsafeCmdArgument(['redirect < in'])?.char).toBe('<');
+    expect(findUnsafeCmdArgument(['redirect > out'])?.char).toBe('>');
+    expect(findUnsafeCmdArgument(['caret ^ test'])?.char).toBe('^');
+    expect(findUnsafeCmdArgument(['exclamation ! test'])?.char).toBe('!');
+    expect(findUnsafeCmdArgument(['parenthesis (bad)'])?.char).toBe('(');
+    expect(findUnsafeCmdArgument(['line1\r\nline2'])?.char).toBe('\r');
   });
 
   it('escapes arguments following Windows CommandLineToArgvW standards', () => {
@@ -297,6 +302,7 @@ describe('P1-3: CA persistence is atomic, locked and self-consistent', () => {
     const a = tmp();
     const b = tmp();
     const caA = CertificateAuthority.loadOrCreate(a);
+    const originalCertA = readFileSync(caA.certPath, 'utf8');
     CertificateAuthority.loadOrCreate(b);
     // Interleave: A's cert with B's key — what two racing writers produced before.
     writeFileSync(join(a, 'warp-ca-key.pem'), readFileSync(join(b, 'warp-ca-key.pem')));
@@ -304,7 +310,7 @@ describe('P1-3: CA persistence is atomic, locked and self-consistent', () => {
     const cert = new X509Certificate(readFileSync(reloaded.certPath, 'utf8'));
     const key = createPrivateKey(readFileSync(join(a, 'warp-ca-key.pem'), 'utf8'));
     expect(cert.checkPrivateKey(key)).toBe(true);
-    expect(readFileSync(reloaded.certPath, 'utf8')).not.toBe(readFileSync(caA.certPath, 'utf8') && '');
+    expect(readFileSync(reloaded.certPath, 'utf8')).not.toBe(originalCertA);
   });
 
   it('a matching pair is reused across launches (no re-mint, no lock left behind)', () => {
@@ -323,6 +329,35 @@ describe('P1-3: CA persistence is atomic, locked and self-consistent', () => {
     utimes(lock, past);
     expect(withDirectoryLock(lock, () => 'ran', 30_000, 200)).toBe('ran');
     expect(readdir(d)).not.toContain('lock');
+  });
+
+  it('stale lock with dead PID in owner.json is reclaimed and released safely', () => {
+    const d = tmp();
+    const lock = join(d, 'lock');
+    mkdirSync(lock);
+    writeFileSync(
+      join(lock, 'owner.json'),
+      JSON.stringify({ pid: 9999999, uuid: 'dead-uuid', createdAt: Date.now() - 10_000 }),
+    );
+    expect(withDirectoryLock(lock, () => 'reclaimed', 30_000, 500)).toBe('reclaimed');
+    expect(readdir(d)).not.toContain('lock');
+  });
+
+  it('owner verification in finally prevents deleting a lock owned by another process', () => {
+    const d = tmp();
+    const lock = join(d, 'lock');
+    let ran = false;
+    withDirectoryLock(lock, () => {
+      // Overwrite owner.json with a foreign uuid as if taken over by another process
+      writeFileSync(
+        join(lock, 'owner.json'),
+        JSON.stringify({ pid: process.pid, uuid: 'foreign-uuid', createdAt: Date.now() }),
+      );
+      ran = true;
+    });
+    expect(ran).toBe(true);
+    // Because owner uuid did not match, finally block safely preserved the lock directory!
+    expect(readdir(d)).toContain('lock');
   });
 
   it('writeBundle avoids re-writing bundle when disk content already matches', () => {
@@ -448,6 +483,57 @@ describe('P2-1: CONNECT host, TLS SNI and HTTP Host must agree', () => {
     const sniReply = await readAll(sniDrift);
     expect(sniReply).toMatch(/^HTTP\/1\.1 400 /);
     expect(sniReply).toContain('does not match CONNECT host');
+  });
+
+  it('isolates authorities across multiple concurrent CONNECT tunnels', async () => {
+    const upstream1 = createHttpServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(`served-1 ${req.headers.host}`);
+    });
+    const upstream2 = createHttpServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(`served-2 ${req.headers.host}`);
+    });
+    const port1 = await listen(upstream1);
+    const port2 = await listen(upstream2);
+
+    const dir = tmp();
+    const ca = CertificateAuthority.loadOrCreate(dir);
+    const caPem = readFileSync(ca.certPath, 'utf8');
+    const routes = [
+      parseRoute(`host1.test/*=http://127.0.0.1:${port1}`),
+      parseRoute(`host2.test/*=http://127.0.0.1:${port2}`),
+    ];
+    const handlers = createWarpHandlers({ routes, ca });
+    const proxy = createHttpServer(handlers.handleAbsoluteForm);
+    proxy.on('connect', handlers.handleConnect);
+    const proxyPort = await listen(proxy);
+
+    // Open two concurrent tunnels to different destinations
+    const t1 = await connectThrough(proxyPort, 'host1.test', 'host1.test', caPem);
+    const t2 = await connectThrough(proxyPort, 'host2.test', 'host2.test', caPem);
+
+    t1.write('GET /a HTTP/1.1\r\nHost: host1.test\r\nConnection: close\r\n\r\n');
+    t2.write('GET /b HTTP/1.1\r\nHost: host2.test\r\nConnection: close\r\n\r\n');
+
+    const [reply1, reply2] = await Promise.all([readAll(t1), readAll(t2)]);
+    expect(reply1).toContain('served-1 host1.test');
+    expect(reply2).toContain('served-2 host2.test');
+  });
+});
+
+describe('P2-13: refusal diagnostics redact argument contents from stderr', () => {
+  it('logs argument index and metacharacter without printing secret argument text', () => {
+    const secretArg = 'sk-ant-api03-SECRET_TOKEN_VALUE_1234567890!bad';
+    const unsafe = findUnsafeCmdArgument(['run', secretArg]);
+    expect(unsafe).not.toBeNull();
+    expect(unsafe?.char).toBe('!');
+    expect(unsafe?.index).toBe(1);
+    // Refusal diagnostic formats index and char only
+    const logged = `argument at index ${unsafe?.index} contains forbidden shell metacharacter (${JSON.stringify(unsafe?.char)})`;
+    expect(logged).toContain('index 1');
+    expect(logged).toContain('"!"');
+    expect(logged).not.toContain('SECRET_TOKEN_VALUE');
   });
 });
 

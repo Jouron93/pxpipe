@@ -16,6 +16,7 @@ import {
   createPrivateKey,
   generateKeyPairSync,
   randomBytes,
+  randomUUID,
   sign,
   X509Certificate,
   type KeyObject,
@@ -209,42 +210,115 @@ export function writeFileAtomic(path: string, data: string, mode: number): void 
   }
 }
 
+interface LockOwner {
+  pid: number;
+  uuid: string;
+  createdAt: number;
+}
+
+function isPidAlive(pid: number): boolean {
+  if (typeof pid !== 'number' || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 /**
  * A directory is the one thing every platform creates atomically, so it serves
  * as the mutex around minting a CA: two concurrent launches on an empty
  * `~/.pxpipe` would otherwise each mint their own root and interleave the two
- * cert/key pairs on disk. A lock older than `staleMs` belongs to a process that
- * died mid-mint and is taken over.
+ * cert/key pairs on disk.
+ *
+ * Hardened with:
+ * 1. Owner token (PID, UUID, timestamp) written inside lock directory.
+ * 2. Process liveness verification via process.kill(pid, 0).
+ * 3. Race-free stale lock takeover via atomic directory rename (renameSync) to a unique path.
+ * 4. Lease verification in finally to guarantee a process NEVER deletes another process's lock.
  */
-export function withDirectoryLock<T>(lockDir: string, fn: () => T, staleMs = 30_000, waitMs = 10_000): T {
+export function withDirectoryLock<T>(
+  lockDir: string,
+  fn: () => T,
+  staleMs = 30_000,
+  waitMs = 10_000,
+): T {
   const deadline = Date.now() + waitMs;
+  const myOwner: LockOwner = {
+    pid: process.pid,
+    uuid: randomUUID(),
+    createdAt: Date.now(),
+  };
+  const ownerFile = join(lockDir, 'owner.json');
+
   for (;;) {
     try {
       mkdirSync(lockDir);
+      try {
+        writeFileSync(ownerFile, JSON.stringify(myOwner));
+      } catch (err) {
+        try {
+          rmSync(lockDir, { recursive: true, force: true });
+        } catch {}
+        throw err;
+      }
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      let age = 0;
+
+      let isStale = false;
       try {
-        age = Date.now() - statSync(lockDir).mtimeMs;
+        if (existsSync(ownerFile)) {
+          const raw = readFileSync(ownerFile, 'utf8');
+          const owner = JSON.parse(raw) as LockOwner;
+          if (!isPidAlive(owner.pid) || Date.now() - owner.createdAt > staleMs) {
+            isStale = true;
+          }
+        } else {
+          // No owner file yet: fallback to directory modification time
+          const age = Date.now() - statSync(lockDir).mtimeMs;
+          if (age > staleMs) isStale = true;
+        }
       } catch {
-        continue; // vanished between our attempt and the stat: retry immediately
-      }
-      if (age > staleMs) {
-        rmSync(lockDir, { recursive: true, force: true });
+        // Transient filesystem read or parsing race: retry immediately
         continue;
       }
+
+      if (isStale) {
+        // Atomic stale lock takeover: rename lockDir to a unique target.
+        // Only ONE concurrent contender succeeds; losing contenders get ENOENT and retry.
+        const staleDir = `${lockDir}.stale.${randomUUID()}`;
+        try {
+          renameSync(lockDir, staleDir);
+          rmSync(staleDir, { recursive: true, force: true });
+        } catch {
+          // Lost rename race or directory already recycled: loop and retry
+        }
+        continue;
+      }
+
       if (Date.now() > deadline) throw new Error(`timed out waiting for ${lockDir}`);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
   }
+
   try {
     return fn();
   } finally {
+    // Verified deletion: ensure this lock instance still belongs to us before deleting
     try {
-      rmSync(lockDir, { recursive: true, force: true });
+      if (existsSync(ownerFile)) {
+        const raw = readFileSync(ownerFile, 'utf8');
+        const owner = JSON.parse(raw) as LockOwner;
+        if (owner.uuid === myOwner.uuid) {
+          rmSync(lockDir, { recursive: true, force: true });
+        }
+      } else {
+        rmSync(lockDir, { recursive: true, force: true });
+      }
     } catch {
-      /* ignore directory removal delay */
+      /* ignore removal delay or permission error */
     }
   }
 }
