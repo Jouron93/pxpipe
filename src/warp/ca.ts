@@ -251,6 +251,7 @@ export function withDirectoryLock<T>(
     createdAt: Date.now(),
   };
   const ownerFile = join(lockDir, 'owner.json');
+  const reclaimDir = `${lockDir}.reclaim`;
 
   for (;;) {
     try {
@@ -259,7 +260,9 @@ export function withDirectoryLock<T>(
         writeFileSync(ownerFile, JSON.stringify(myOwner));
       } catch (err) {
         try {
-          rmSync(lockDir, { recursive: true, force: true });
+          if (!existsSync(ownerFile)) {
+            rmSync(lockDir, { recursive: true, force: true });
+          }
         } catch {}
         throw err;
       }
@@ -267,37 +270,75 @@ export function withDirectoryLock<T>(
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
 
-      let isStale = false;
+      // Lock directory exists: inspect owner to check liveness
+      let inspectedOwner: LockOwner | null = null;
+      let ownerAbsent = false;
       try {
         if (existsSync(ownerFile)) {
           const raw = readFileSync(ownerFile, 'utf8');
-          const owner = JSON.parse(raw) as LockOwner;
-          if (!isPidAlive(owner.pid) || Date.now() - owner.createdAt > staleMs) {
-            isStale = true;
-          }
+          inspectedOwner = JSON.parse(raw) as LockOwner;
         } else {
-          // No owner file yet: fallback to directory modification time
-          const age = Date.now() - statSync(lockDir).mtimeMs;
-          if (age > staleMs) isStale = true;
+          ownerAbsent = true;
         }
       } catch {
-        // Transient filesystem read or parsing race: retry immediately
-        continue;
+        // Transient read/parse collision; will check deadline and back off below
       }
 
-      if (isStale) {
-        // Atomic stale lock takeover: rename lockDir to a unique target.
-        // Only ONE concurrent contender succeeds; losing contenders get ENOENT and retry.
-        const staleDir = `${lockDir}.stale.${randomUUID()}`;
+      // If the owner is alive, the lock is NEVER stale. Never revoke a live process.
+      if (inspectedOwner && isPidAlive(inspectedOwner.pid)) {
+        // Live owner: wait for normal release
+      } else if (inspectedOwner || ownerAbsent) {
+        // Owner is confirmed dead, or owner.json has been absent
+        // Acquire exclusive reclamation mutex to eliminate the ABA takeover race
+        let gotReclaim = false;
         try {
-          renameSync(lockDir, staleDir);
-          rmSync(staleDir, { recursive: true, force: true });
+          mkdirSync(reclaimDir);
+          gotReclaim = true;
         } catch {
-          // Lost rename race or directory already recycled: loop and retry
+          // Another contender is currently executing stale reclamation
         }
-        continue;
+
+        if (gotReclaim) {
+          try {
+            // Under exclusive reclamation mutex: re-verify that the lock still
+            // matches the inspected dead owner before taking any action.
+            if (inspectedOwner && existsSync(ownerFile)) {
+              const currentRaw = readFileSync(ownerFile, 'utf8');
+              const currentOwner = JSON.parse(currentRaw) as LockOwner;
+              if (currentOwner.uuid === inspectedOwner.uuid && !isPidAlive(currentOwner.pid)) {
+                // Verified dead owner matches: safe to take over
+                const staleDir = `${lockDir}.stale.${randomUUID()}`;
+                try {
+                  renameSync(lockDir, staleDir);
+                  rmSync(staleDir, { recursive: true, force: true });
+                } catch {
+                  rmSync(lockDir, { recursive: true, force: true });
+                }
+              }
+            } else if (ownerAbsent && existsSync(lockDir) && !existsSync(ownerFile)) {
+              // Lock directory without owner file: only reclaim if older than staleMs
+              const age = Date.now() - statSync(lockDir).mtimeMs;
+              if (age > staleMs) {
+                const staleDir = `${lockDir}.stale.${randomUUID()}`;
+                try {
+                  renameSync(lockDir, staleDir);
+                  rmSync(staleDir, { recursive: true, force: true });
+                } catch {
+                  rmSync(lockDir, { recursive: true, force: true });
+                }
+              }
+            }
+          } catch {
+            /* ignore transient reclamation error */
+          } finally {
+            try {
+              rmSync(reclaimDir, { recursive: true, force: true });
+            } catch {}
+          }
+        }
       }
 
+      // Bound all retries by waitMs deadline and backoff
       if (Date.now() > deadline) throw new Error(`timed out waiting for ${lockDir}`);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
@@ -314,8 +355,6 @@ export function withDirectoryLock<T>(
         if (owner.uuid === myOwner.uuid) {
           rmSync(lockDir, { recursive: true, force: true });
         }
-      } else {
-        rmSync(lockDir, { recursive: true, force: true });
       }
     } catch {
       /* ignore removal delay or permission error */
