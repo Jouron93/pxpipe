@@ -1,10 +1,91 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot) · 2026-08-17 (atlas template-decoder)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot)
 **Model scope (current):** Fable 5 only. Sol, Opus, GPT 5.5, and Grok remain explicit opt-ins.
 **Harnesses:** Claude/Opus/Fable: `eval/needle-haystack/` (older receipts preserved from `/tmp/needle_eval`); Sol: `eval/sol-profile/` (raw responses and receipts committed)
+
+---
+
+## Update (2026-08-17) — Deterministic atlas template-decoder replaces VLM surrogates: 100% at 5×8, 0 VRAM
+
+Threads 2 (runtime canary) and 3 (surrogate-reader pre-flight) parked on 2026-07-05
+collapse into a single deterministic mechanism: template-decoding against the
+exact 1-bit font atlas the proxy already renders with (`src/core/atlas.ts`).
+
+### The measured sweep results
+
+Benchmarked across the same 20 deterministic sweep pages (`eval/glyph-matrix/sweep/`,
+mulberry32 seed `20260616`, 5 labelled 12-char hex IDs per page, dense JSON) graded
+with `grade_sweep.py`:
+
+| reader | mechanism | 5×8 exact (351 cells / 20 IDs) | ambiguous | latency / page | VRAM / GPU |
+|---|---|:---:|:---:|:---:|:---:|
+| **atlas decoder** (`decode_atlas.mjs`) | deterministic Hamming template match | **351/351 cells (100%)** · **20/20 IDs** | **0** | **~6 ms** | **0 MB** |
+| **Opus / Fable** (`claude-opus-4-8`) | frontier cloud VLM | 2/20 IDs (10%) | silent misreads | ~8–25 s | API |
+| **Qwen2.5-VL-7B** (`read_local_vlm.mjs`) | local 7B VLM surrogate (LM Studio) | 0/20 IDs (0%) | silent misreads | ~1.5 s | ~6–8 GB |
+
+### Why template decoding works where VLMs cannot
+
+The 2026-07-05 update documented why VLMs fail at high density (*"Model vision is
+not OCR"*): VLMs project continuous image patches into embedding space without
+segmenting discrete glyphs or emitting per-character confidence scores. When pixel
+evidence is ambiguous, the language prior confabulates plausible text silently.
+
+Template decoding reverses this because pxpipe renders from a known 1-bit font atlas
+onto a deterministic grid:
+
+1. **Discrete cell segmentation:** Cell bounds are known from `PAD_X`, `PAD_Y`, `CELL_W`,
+   and `CELL_H` (4px pad, 5×8 production cell).
+2. **Hamming distance against ground-truth glyphs:** Each non-blank cell bitmask is
+   compared against the 95 printable ASCII Spleen templates extracted from the atlas.
+3. **Explicit character-level confidence:**
+   - $d = 0$: exact match (100% confidence).
+   - margin $\le 1$ ($d_{\text{runner-up}} - d_{\text{best}} \le 1$): ambiguous classification.
+   - $d > 6$: unreadable / corrupted cell.
+
+This distance margin directly provides the discrete per-character confidence
+metric that the capacity argument showed a VLM cannot produce.
+
+### The VLM arm's real finding
+
+The local VLM surrogate arm (`eval/glyph-matrix/sweep/read_local_vlm.mjs` hitting
+Qwen2.5-VL-7B over OpenAI-compatible `:1234`) established one useful correlation:
+at larger cell sizes where Qwen can resolve characters, **Qwen-hit $\Rightarrow$
+Opus-hit precision is 95.7% (22/23)**.
+
+However, at the production 5×8 cell size, Qwen scored **0/20 (0%)**. As a pre-flight
+gate, a local VLM would reject 100% of production-density renders, green-lighting
+nothing. The deterministic atlas decoder eliminates the local model requirement,
+achieving 100% accuracy in ~6 ms with zero VRAM.
+
+### Authoritative atlas format specification
+
+Ground truth extracted from `scripts/gen-atlas.ts` and `src/core/atlas.ts`:
+- **Bit offsets:** `ATLAS_OFFSETS[rank]` is a **bit offset**, NOT a byte offset
+  (`gen-atlas.ts:7, 336, 498`). (Only the grayscale companion `ATLAS_GRAY_OFFSETS`
+  uses byte offsets).
+- **Row-major indexing:** `bitIdx = off + gy * ATLAS_CELL_W + gx`.
+- **MSB-first bit packing:** Bit value = `(ATLAS_PIXELS[bitIdx >> 3] >> (7 - (bitIdx & 7))) & 1`.
+- **Glyph metrics:** 40 bits per narrow 5×8 glyph. Printable ASCII rank is `cp - 32`.
+- **Render polarity:** Dark text on light background (corner background pixel = 255,
+  ink = 0; threshold $v < 128$).
+
+### Open limits and honest scope
+
+1. **Multi-size scaling (Slice A):** `decode_atlas.mjs` is optimized for the 5×8
+   production cell. Scaling to larger cell sizes (7×10, 10×16, 14×22, 20×32) currently
+   degrades due to font rasterization differences versus simple block scaling.
+2. **Post-downscale validation (Slice B):** The decoder has been validated on direct
+   renders. Verification against API-downscaled images (Anthropic long-edge $\le 1568$
+   and $\le 1.15$ MP resampling) is outstanding to measure at-risk glyphs post-resample.
+3. **Integrity vs. legibility:** The decoder reads the same pixels Opus reads at 10%.
+   It proves the pixels are intact on the canvas, not that a model can read them.
+   It is an integrity check, not a legibility check, and it confirms the FINDINGS
+   "capacity-bound" conclusion rather than overturning it. Thread 2's canary becomes
+   unnecessary (every page self-verifies, free). Thread 3's original goal — predicting
+   model misreads — is not solved by it.
 
 ---
 

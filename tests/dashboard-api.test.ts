@@ -15,7 +15,7 @@ import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicab
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
-import { renderPage } from '../src/dashboard/fragments.js';
+import { renderPage, formatContextBadge } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -32,6 +32,8 @@ function ev(p: Partial<TrackEvent>): TrackEvent {
     path: '/v1/messages',
     status: 200,
     duration_ms: 100,
+    billing_lane: 'local',
+    billing_lane_source: 'local_origin',
     ...p,
   };
 }
@@ -75,6 +77,11 @@ describe('dashboardPath()', () => {
     expect(dashboardPath('/proxy-latest-png')?.kind).toBe('png');
   });
 
+  it('matches liveness probes', () => {
+    expect(dashboardPath('/health')?.kind).toBe('health');
+    expect(dashboardPath('/v1/health')?.kind).toBe('health');
+  });
+
   it('matches the new /api/* routes', () => {
     expect(dashboardPath('/api/sessions.json')?.kind).toBe('api-sessions');
     expect(dashboardPath('/api/stats.json')?.kind).toBe('api-stats');
@@ -100,7 +107,7 @@ describe('serveSessionsJson', () => {
     ]);
     const res = await dash.serveSessionsJson();
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await res.json() as any;
     expect(body.count).toBe(2);
     expect(body.sessions).toHaveLength(2);
     // Most-recent-first
@@ -115,7 +122,7 @@ describe('serveSessionsJson', () => {
       ev({ first_user_sha8: 'bbbbbbbb', cwd: '/Users/me/code/other' }),
     ]);
     const res = await dash.serveSessionsJson({ project: 'pxpipe' });
-    const body = await res.json();
+    const body = await res.json() as any;
     expect(body.count).toBe(1);
     expect(body.sessions[0].id).toBe('aaaaaaaa');
   });
@@ -138,7 +145,7 @@ describe('serveApiStats', () => {
     ]);
     const res = await dash.serveApiStats();
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await res.json() as any;
     expect(body.parsed).toBe(3);
     expect(body.summary.total).toBe(3);
     expect(body.summary.ok2xx).toBe(2);
@@ -177,35 +184,60 @@ describe('serveFragment', () => {
     dash.handleCompressionToggle({ enabled: true });
   });
 
-  it('renders opt-in GPT 5.5/5.6 chips and mutates the single model scope', async () => {
+  it('locks weak-reader chips; PXPIPE_MODELS env opt-in unlocks; OFF is never gated', async () => {
     const prev = process.env.PXPIPE_MODELS;
     try {
       delete process.env.PXPIPE_MODELS;
       setAllowedModelBases(null); // reset to built-in Fable-only default
       const off = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(off).toContain('Image GPT models');
+      expect(off).toContain('codex-john / codex-orn');
       expect(off).not.toContain('<div class="models" style="display:none">');
-      expect(off).toContain('GPT 5.6 Sol</button>');
-      expect(off).toContain('GPT 5.5</button>');
-      // Sol remains available and ordered before GPT 5.5.
-      expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
+      // Weak/unvalidated readers render locked: disabled, no hx-post, 🔒 marker.
+      expect(off).toContain('codex-john|orn-sol<span class="badge-ctx">262K</span> 🔒</button>');
+      expect(off).toContain('GPT 5.5<span class="badge-ctx">1M</span> 🔒</button>');
+      // Sol remains visible and ordered before GPT 5.5.
+      expect(off.indexOf('codex-john|orn-sol')).toBeLessThan(off.indexOf('GPT 5.5'));
+      // Validated Fable 5 stays a live, lit toggle.
+      expect(off).toContain('claude-john-fable<span class="badge-ctx">1M</span> ✓');
       expect(getAllowedModelBases()).toContain('claude-fable-5');
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
+
+      // Server-side twin: forged/stale enables for locked models are refused.
+      dash.handleModelsToggle('gpt-5.6-sol', true);
+      dash.handleModelsToggle('gpt-5.5', true);
       expect(getAllowedModelBases()).not.toContain('gpt-5.6-sol');
       expect(getAllowedModelBases()).not.toContain('gpt-5.5');
 
-      dash.handleModelsToggle('gpt-5.6-sol', true);
-      dash.handleModelsToggle('gpt-5.5', true);
-      const onBoth = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(onBoth).toContain('GPT 5.5 ✓');
-      expect(onBoth).toContain('GPT 5.6 Sol ✓');
+      // The deliberate env opt-in unlocks the chip and the server mutation.
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.5';
+      setAllowedModelBases(null); // drop runtime override so env scope is read
+      const envScoped = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(envScoped).toContain('GPT 5.5<span class="badge-ctx">1M</span> ✓');
+      expect(envScoped).toContain('codex-john|orn-sol<span class="badge-ctx">262K</span> 🔒</button>');
+      dash.handleModelsToggle('gpt-5.5', false); // OFF is never gated
+      expect(getAllowedModelBases()).not.toContain('gpt-5.5');
+      dash.handleModelsToggle('gpt-5.5', true); // env-configured → ON allowed
       expect(getAllowedModelBases()).toContain('gpt-5.5');
-      expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
       else process.env.PXPIPE_MODELS = prev;
     }
+  });
+
+  it('renders per-family toggle chip sections with context badges across all 5 model families', async () => {
+    const html = await (await dash.serveFragment('models', url, 1234)).text();
+    expect(html).toContain('claude-john-20x / claude-orn-pro');
+    expect(html).toContain('codex-john / codex-orn');
+    expect(html).toContain('xai-oauth-grok');
+    expect(html).toContain('Image AGY Proxy models');
+    expect(html).toContain('Image NVIDIA NIM Flagships');
+
+    // Context badges check
+    expect(html).toContain('<span class="badge-ctx">1M</span>');
+    expect(html).toContain('<span class="badge-ctx">2M</span>');
+    expect(html).toContain('<span class="badge-ctx">262K</span>');
+    expect(html).toContain('<span class="badge-ctx">128K</span>');
   });
 
   it('renders header + recent + stats fragments from the same payloads as JSON', async () => {
@@ -226,6 +258,7 @@ describe('serveFragment', () => {
     dash.update({
       method: 'POST', path: '/v1/responses', model: 'gpt-5.6-sol', status: 200,
       durationMs: 1,
+      billingLane: 'local', billingLaneSource: 'local_origin',
       usage: { input_tokens: 500000, output_tokens: 10, cached_tokens: 490000 },
       info: {
         compressed: true, imageCount: 1, imagePngs: [new Uint8Array([1])],
@@ -342,6 +375,95 @@ describe('GPT savings split', () => {
     expect(stats.baseline_input_weighted).toBe(12400);
     expect(stats.saved_input_tokens).toBe(4200);
     expect(stats.saved_pct_input_only).toBeGreaterThan(0);
+  });
+
+  it('separates Claude Max and Codex API-equivalent subscription usage', async () => {
+    const subscriptions = new DashboardState(tmp, async () => new Map(), {
+      claudeMonthlySubscriptionUsd: 200,
+      codexMonthlySubscriptionUsd: 200,
+    });
+    subscriptions.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-opus-4-8', status: 200, durationMs: 1,
+      billingLane: 'claude_max_subscription', billingLaneSource: 'anthropic_oauth_marker',
+      usage: { input_tokens: 1_000_000, output_tokens: 0 },
+    });
+    subscriptions.update({
+      method: 'POST', path: '/v1/responses', model: 'gpt-5.6-sol', status: 200, durationMs: 1,
+      billingLane: 'codex_subscription', billingLaneSource: 'chatgpt_codex_origin',
+      usage: { input_tokens: 1_000_000, output_tokens: 0 },
+    });
+
+    const stats = (await subscriptions.serveStats().json()) as StatsPayload;
+    expect(stats.claude_subscription).toEqual({
+      monthly_usd: 200,
+      api_equivalent_used_usd: 5,
+      break_even_pct: 2.5,
+      api_equivalent_remaining_usd: 195,
+      usage_requests: 1,
+    });
+    expect(stats.codex_subscription).toEqual({
+      monthly_usd: 200,
+      api_equivalent_used_usd: 10,
+      break_even_pct: 5,
+      api_equivalent_remaining_usd: 190,
+      usage_requests: 1,
+    });
+    expect(stats.actual_cost_status).toBe('not_measured');
+  });
+
+  it('uses the successful upstream model for Anthropic output weighting', async () => {
+    const actualModel = new DashboardState(tmp, async () => new Map());
+    actualModel.update({
+      method: 'POST', path: '/v1/messages', model: 'unpriced-request-alias',
+      requestedModel: 'unpriced-request-alias', actualModel: 'claude-opus-4-8',
+      status: 200, durationMs: 1,
+      billingLane: 'api_key', billingLaneSource: 'configured_route',
+      usage: { input_tokens: 100, output_tokens: 10 },
+    });
+
+    const stats = (await actualModel.serveStats().json()) as StatsPayload;
+    expect(stats.all_output_weighted).toBe(50);
+    const recent = (await actualModel.serveRecent().json()) as RecentPayload;
+    expect(recent.recent.at(-1)).toMatchObject({
+      model: 'claude-opus-4-8',
+      requested_model: 'unpriced-request-alias',
+      actual_model: 'claude-opus-4-8',
+    });
+  });
+
+  it('reports a sole free-by-terms rate card without labeling it mixed', async () => {
+    const free = new DashboardState(tmp, async () => new Map());
+    free.update({
+      method: 'POST', path: '/v1/responses', model: 'glm-4.5-flash',
+      status: 200, durationMs: 1, billingLane: 'api_key', billingLaneSource: 'configured_route',
+      usage: { input_tokens: 1_000, output_tokens: 100 },
+    });
+
+    const stats = (await free.serveStats().json()) as StatsPayload;
+    expect(stats.pricing_assumptions.status).toBe('free_by_terms');
+    expect(stats.pricing_assumptions.rate_cards).toHaveLength(1);
+    expect(stats.pricing_assumptions.rate_cards[0]?.cost_status).toBe('free_by_terms');
+  });
+
+  it('counts unpriced subscription traffic without inventing API-equivalent dollars', async () => {
+    const subscriptions = new DashboardState(tmp, async () => new Map(), {
+      agyMonthlySubscriptionUsd: 200,
+    });
+    subscriptions.update({
+      method: 'POST', path: '/v1/responses', model: 'agy-private-worker', status: 200, durationMs: 1,
+      billingLane: 'agy_ultra_subscription', billingLaneSource: 'agy_bridge_origin',
+      usage: { input_tokens: 1_000_000, output_tokens: 1_000 },
+    });
+
+    const stats = (await subscriptions.serveStats().json()) as StatsPayload;
+    expect(stats.agy_subscription).toEqual({
+      monthly_usd: 200,
+      api_equivalent_used_usd: 0,
+      break_even_pct: 0,
+      api_equivalent_remaining_usd: 200,
+      usage_requests: 1,
+    });
+    expect(stats.actual_cost_status).toBe('not_measured');
   });
 
   it('populates As-text / Sent / Cache-hits / Saved recent columns for GPT', async () => {
@@ -652,5 +774,23 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     expect(row.baseline_input).toBe(12000);
     expect(row.baseline_input).not.toBe(35000); // the inflated cold-priced bug value
     expect(row.session_saved_so_far_delta).toBe(9900);
+  });
+});
+
+describe('formatContextBadge', () => {
+  it('formats context window token counts into compact UI badges', () => {
+    expect(formatContextBadge(2_097_152)).toBe('2M');
+    expect(formatContextBadge(1_048_576)).toBe('1M');
+    expect(formatContextBadge(1_050_000)).toBe('1M');
+    expect(formatContextBadge(1_000_000)).toBe('1M');
+    expect(formatContextBadge(524_288)).toBe('524K');
+    expect(formatContextBadge(500_000)).toBe('500K');
+    expect(formatContextBadge(262_144)).toBe('262K');
+    expect(formatContextBadge(200_000)).toBe('200K');
+    expect(formatContextBadge(131_072)).toBe('128K');
+    expect(formatContextBadge(128_000)).toBe('128K');
+    expect(formatContextBadge(null)).toBe('');
+    expect(formatContextBadge(undefined)).toBe('');
+    expect(formatContextBadge(0)).toBe('');
   });
 });

@@ -22,6 +22,7 @@ import {
   resolveGptProfile,
   type GptVisionCost,
 } from './gpt-model-profiles.js';
+import { resolveModelProfile } from './model-registry.js';
 import { bytesToBase64 } from './png.js';
 import {
   compactSlabWhitespace,
@@ -32,6 +33,7 @@ import {
   IMAGE_COST_SAFETY_MARGIN,
   type TransformInfo,
   type TransformOptions,
+  isActiveAdmissionEnabled,
 } from './transform.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
@@ -44,7 +46,12 @@ import {
 } from './openai-history.js';
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { factSheetText } from './factsheet.js';
+import {
+  buildExactContextManifest,
+  buildExactContextPlanFromDocuments,
+} from './exact-context.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { estimateAdmission } from './admission-estimator.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -118,7 +125,23 @@ export function isClaudeModel(model: string | null | undefined): boolean {
 }
 
 export function isGrokModel(model: string | null | undefined): boolean {
-  return (model ?? '').toLowerCase().startsWith('grok-');
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('grok') || m.startsWith('xai/');
+}
+
+export function isAgyModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('agy') || m.includes('gemini') || m.startsWith('google/');
+}
+
+export function isLmStudioModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('qwen') || m.startsWith('nemotron') || m.includes('local') || m.includes('obliterated');
+}
+
+export function isNimModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('nim/') || m.startsWith('nvidia/');
 }
 
 /** Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel
@@ -221,6 +244,7 @@ interface ResponsesFlatTool {
 
 interface OpenAIResolvedOptions {
   compress: boolean;
+  activeAdmission?: boolean;
   compressTools: boolean;
   minCompressChars: number;
   cols?: number;
@@ -233,6 +257,7 @@ interface OpenAIResolvedOptions {
 
 const DEFAULTS: OpenAIResolvedOptions = {
   compress: true,
+  activeAdmission: undefined,
   compressTools: true,
   minCompressChars: 2000,
   cols: undefined,
@@ -245,6 +270,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   return {
     compress: opts.compress ?? DEFAULTS.compress,
+    activeAdmission: opts.activeAdmission,
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
     minCompressChars: opts.minCompressChars ?? DEFAULTS.minCompressChars,
     cols: opts.cols,
@@ -355,6 +381,32 @@ function responsesContentText(content: ResponsesInputItem['content']): string {
       && typeof (p as { text?: unknown }).text === 'string')
     .map((p) => p.text)
     .join('\n\n');
+}
+
+function replaceResponsesTextWithPointer(
+  content: ResponsesInputItem['content'],
+  pointer: string,
+): ResponsesInputItem['content'] {
+  if (typeof content === 'string') return pointer;
+  if (!Array.isArray(content)) return content;
+
+  const replaced: ResponsesContentPart[] = [];
+  let pointerInserted = false;
+  for (const part of content) {
+    const isInputText = typeof part === 'object'
+      && part !== null
+      && (part as { type?: unknown }).type === 'input_text'
+      && typeof (part as { text?: unknown }).text === 'string';
+    if (!isInputText) {
+      replaced.push(part);
+      continue;
+    }
+    if (!pointerInserted) {
+      replaced.push({ type: 'input_text', text: pointer });
+      pointerInserted = true;
+    }
+  }
+  return replaced;
 }
 
 function firstResponsesUserText(
@@ -536,10 +588,14 @@ function measureResponsesComposition(
       c.systemDeveloper += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
     } else if (role === 'user' || role === 'assistant') {
       c.userAssistant += gptTextTokens(responsesContentText(o.content as ResponsesInputItem['content']));
-    } else if (type === 'function_call') {
+    } else if (type === 'function_call' || type === 'custom_tool_call') {
       c.functionCalls += gptTextTokens(JSON.stringify(o));
-    } else if (type === 'function_call_output') {
+    } else if (type === 'function_call_output' || type === 'custom_tool_call_output') {
       c.functionOutputs += gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
+    } else if (type === 'additional_tools') {
+      // Codex places its native tool catalog inside input[] rather than the
+      // top-level Responses tools field. Measure it, but never rewrite it.
+      c.toolsJson += gptTextTokens(JSON.stringify(o));
     } else if (type === 'reasoning') {
       // Includes encrypted_content when present; this is often a large Codex-native bucket.
       c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));
@@ -604,12 +660,27 @@ function droppedCodepointsTop(droppedCodepoints: Map<number, number>): Record<st
  *  `charsPerToken` to force the length/cpt lever (tests use 1). Images bill full
  *  pages at maxHeight and the last page at residual height — charging every page
  *  as a full strip over-states cost and blocks profitable collapses. */
+interface OpenAIGateAccounting {
+  readonly baselineText?: string;
+  readonly textTokens?: number;
+  readonly preservedText?: string;
+  readonly preservedTextTokens?: number;
+}
+
+function gateTextTokens(text: string, charsPerToken: number): number {
+  if (!text) return 0;
+  return charsPerToken === DEFAULTS.charsPerToken
+    ? Math.max(1, gptTextTokens(text) || Math.ceil(text.length / charsPerToken))
+    : text.length / Math.max(1e-6, charsPerToken);
+}
+
 function evalOpenAIGate(
   model: string,
   renderedText: string,
   cols: number,
   charsPerToken: number,
-): { imageTokens: number; textTokens: number; profitable: boolean } {
+  accounting: OpenAIGateAccounting = {},
+): { imageTokens: number; preservedTextTokens: number; textTokens: number; profitable: boolean } {
   const profile = resolveGptProfile(model);
   const style = profile.style;
   const cellW = renderCellWidth(style);
@@ -650,11 +721,18 @@ function evalOpenAIGate(
       ? lastPageTokens
       : (estImages - 1) * fullPageTokens + lastPageTokens;
   // Default: o200k. Non-default charsPerToken keeps the force/override lever.
-  const textTokens =
-    charsPerToken === DEFAULTS.charsPerToken
-      ? Math.max(1, gptTextTokens(renderedText) || Math.ceil(renderedText.length / charsPerToken))
-      : renderedText.length / Math.max(1e-6, charsPerToken);
-  return { imageTokens, textTokens, profitable: imageTokens < textTokens };
+  // Selective transforms may supply an original-source baseline independently
+  // from the rendered source and a numeric native-overhead cost.
+  const textTokens = accounting.textTokens
+    ?? gateTextTokens(accounting.baselineText ?? renderedText, charsPerToken);
+  const preservedTextTokens = accounting.preservedTextTokens
+    ?? gateTextTokens(accounting.preservedText ?? '', charsPerToken);
+  return {
+    imageTokens,
+    preservedTextTokens,
+    textTokens,
+    profitable: imageTokens + preservedTextTokens < textTokens,
+  };
 }
 
 /** Shared image-part accumulation from rendered PNGs. */
@@ -773,7 +851,9 @@ const CHAT_POINTER =
   'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
 
 const RESPONSES_POINTER =
-  'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON; rendered tool docs are supplemental.';
+  'Image-safe instruction text was rendered into image(s) attached by pxpipe. Exact protected source is attached beside the images as native text. Treat both with the original authority. Tool definitions remain in native JSON.';
+
+const RESPONSES_END_MARKER = '[End of rendered GPT system/tool context.]';
 
 export async function transformOpenAIChatCompletions(
   body: Uint8Array,
@@ -791,6 +871,24 @@ export async function transformOpenAIChatCompletions(
     req = JSON.parse(new TextDecoder().decode(body));
   } catch (e) {
     info.reason = `parse_error: ${(e as Error).message}`;
+    return { body, info };
+  }
+  if (req.model) {
+    const profile = resolveModelProfile(req.model);
+    info.modelId = req.model;
+    info.modelCanonicalId = profile.canonicalId;
+    info.contextWindowTokens = profile.contextWindowTokens;
+    info.maxOutputTokens = profile.maxOutputTokens;
+  }
+  info.shadowAdmission = estimateAdmission({
+    model: req.model,
+    payloadSizeBytes: body.byteLength,
+    payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
+    transformFamily: 'openai_chat',
+  });
+  if (isActiveAdmissionEnabled(o) && info.shadowAdmission.decision === 'BYPASS') {
+    info.reason = info.shadowAdmission.reason;
+    info.bypassed = true;
     return { body, info };
   }
   if (!Array.isArray(req.messages)) {
@@ -987,6 +1085,24 @@ export async function transformOpenAIResponses(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  if (req.model) {
+    const profile = resolveModelProfile(req.model);
+    info.modelId = req.model;
+    info.modelCanonicalId = profile.canonicalId;
+    info.contextWindowTokens = profile.contextWindowTokens;
+    info.maxOutputTokens = profile.maxOutputTokens;
+  }
+  info.shadowAdmission = estimateAdmission({
+    model: req.model,
+    payloadSizeBytes: body.byteLength,
+    payloadChars: body.byteLength > 0 ? body.byteLength : undefined,
+    transformFamily: 'openai_responses',
+  });
+  if (isActiveAdmissionEnabled(o) && info.shadowAdmission.decision === 'BYPASS') {
+    info.reason = info.shadowAdmission.reason;
+    info.bypassed = true;
+    return { body, info };
+  }
 
   // Normalize input to an array; preserve original string for wrap-back if needed.
   const inputWasString = typeof req.input === 'string';
@@ -1016,6 +1132,17 @@ export async function transformOpenAIResponses(
     req, inputWasString, originalInputString, inputItems,
   );
 
+  // The whole gpt-5.6 family shares this Responses wire shape and is either
+  // 'degraded' (sol: 0/15 dense-hex) or 'unvalidated' (terra, luna) as an imaged
+  // reader, so all of them need the selective path: precision-sensitive source
+  // blocks are lifted out of the rendered slab and carried in bounded native
+  // parts. Restricting it to sol left terra/luna imaging via the legacy single
+  // manifest, which both fails closed above 32,768 chars and gives them no
+  // precision protection at all.
+  const selectiveExactContext = /^gpt-5[.-]6(\b|[-_])/.test(
+    (req.model ?? '').trim().toLowerCase(),
+  );
+
   // Collect static context: instructions + system/developer items + flat tools.
   const authorityDocs: string[] = [];
   const systemTexts: string[] = [];
@@ -1037,23 +1164,51 @@ export async function transformOpenAIResponses(
     info.staticChars += text.length;
   }
 
-  const { tools: rewrittenTools, docs: toolDocs } = o.compressTools
+  // Keep Sol tools native until source-span accounting can distinguish stripped
+  // tool-description tokens from structure that remains in the native JSON.
+  const { tools: rewrittenTools, docs: toolDocs } = o.compressTools && !selectiveExactContext
     ? rewriteFlatToolsForGpt(req.tools)
     : { tools: req.tools, docs: '' };
 
-  const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
+  // Sol's selective baseline is original authority text only. Synthetic role
+  // headings and tool-doc renderings must not inflate claimed token savings.
+  const combinedRaw = selectiveExactContext
+    ? systemTexts.join('\n\n')
+    : [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
   if (!combinedRaw) {
     info.reason = 'no_static_context';
     return { body, info };
   }
 
+  // Sol's dense-image exact-id gate scored 0/15. Selectively remove complete
+  // precision-sensitive source blocks from the rendered slab and carry them in
+  // independently bounded native parts. Other Responses models retain the legacy
+  // manifest behavior until they have model-specific reader validation.
+  const exactContextPlan = selectiveExactContext
+    ? buildExactContextPlanFromDocuments(systemTexts)
+    : undefined;
+  const exactContextManifest = selectiveExactContext
+    ? undefined
+    : buildExactContextManifest(combinedRaw);
+  const exactContextComplete = exactContextPlan?.complete ?? exactContextManifest!.complete;
+  const exactContextReason = exactContextPlan?.reason ?? exactContextManifest?.reason;
+  if (!exactContextComplete) {
+    info.reason = `exact_context_${exactContextReason ?? 'incomplete'}`;
+    return { body, info };
+  }
+
   const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
   if (firstUser) info.firstUserSha8 = await sha8(firstUser);
 
-  const combined = compactSlabWhitespace(combinedRaw).trimEnd();
-  if (combined.length < o.minCompressChars) {
-    info.reason = `below_min_chars (${combined.length} < ${o.minCompressChars})`;
+  const imageSourceRaw = exactContextPlan?.imageSource ?? combinedRaw;
+  const imageableChars = exactContextPlan?.imageableChars ?? combinedRaw.length;
+  const renderSourceRaw = exactContextPlan
+    ? imageSourceRaw.replace(/\r\n?/g, '\n')
+    : imageSourceRaw;
+  const combined = compactSlabWhitespace(renderSourceRaw).trimEnd();
+  if (imageableChars < o.minCompressChars) {
+    info.reason = `below_min_chars (${imageableChars} < ${o.minCompressChars})`;
     return { body, info };
   }
 
@@ -1069,10 +1224,31 @@ export async function transformOpenAIResponses(
     profile.stripCols,
   );
 
-  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
+  const nativeOverheadGateTokens = exactContextPlan
+    ? Math.max(
+        0,
+        gateTextTokens(exactContextPlan.text, o.charsPerToken)
+          - gateTextTokens(exactContextPlan.protectedText, o.charsPerToken),
+      )
+      + systemTexts.length * gateTextTokens(RESPONSES_POINTER, o.charsPerToken)
+      + gateTextTokens(RESPONSES_END_MARKER, o.charsPerToken)
+    : undefined;
+  const gate = evalOpenAIGate(
+    req.model,
+    renderedText,
+    cols,
+    o.charsPerToken,
+    exactContextPlan
+      ? {
+          baselineText: exactContextPlan.imageableText,
+          preservedTextTokens: nativeOverheadGateTokens,
+        }
+      : { preservedText: exactContextManifest!.text },
+  );
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
+    preservedTextTokens: gate.preservedTextTokens,
     textTokens: gate.textTokens,
     burnImageSide: 0,
     burnTextSide: 0,
@@ -1098,10 +1274,23 @@ export async function transformOpenAIResponses(
   // GPT savings basis (see src/core/openai-savings.ts). req.tools is still the
   // original here — reassigned to the stripped set below.
   info.imageTokens = gptImageTokens(req.model, images);
-  info.baselineImagedTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
-  info.compressedChars = combinedRaw.length;
-  info.bucketChars = { static_slab: combinedRaw.length };
-  info.systemSha8 = await sha8(combined);
+  const nativeOverheadTokens = exactContextPlan
+    ? Math.max(
+        0,
+        gptTextTokens(exactContextPlan.text) - gptTextTokens(exactContextPlan.protectedText),
+      )
+      + systemTexts.length * gptTextTokens(RESPONSES_POINTER)
+      + gptTextTokens(RESPONSES_END_MARKER)
+    : gptTextTokens(exactContextManifest!.text);
+  info.preservedTextTokens = nativeOverheadTokens;
+  info.exactContextLines = exactContextPlan?.lineCount ?? exactContextManifest!.lineCount;
+  info.exactContextChars = exactContextPlan?.preservedChars ?? exactContextManifest!.preservedChars;
+  info.baselineImagedTokens = exactContextPlan
+    ? gptTextTokens(exactContextPlan.imageableText)
+    : gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
+  info.compressedChars = imageableChars;
+  info.bucketChars = { static_slab: imageableChars };
+  info.systemSha8 = await sha8(exactContextPlan?.imageableText ?? combined);
   info.firstImagePng = images[0]!.png;
   info.firstImageWidth = images[0]!.width;
   info.firstImageHeight = images[0]!.height;
@@ -1113,12 +1302,12 @@ export async function transformOpenAIResponses(
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map(responsesImagePart);
-  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]' };
-  // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
-  const slabFactSheet = factSheetText(combinedRaw);
-  const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet
-    ? [{ type: 'input_text', text: slabFactSheet }]
-    : [];
+  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: RESPONSES_END_MARKER };
+  const exactContextParts: ResponsesInputTextPart[] = exactContextPlan
+    ? exactContextPlan.nativeParts.map((text) => ({ type: 'input_text', text }))
+    : exactContextManifest!.text
+      ? [{ type: 'input_text', text: exactContextManifest!.text }]
+      : [];
 
   if (inputWasString) {
     // Wrap bare string input into a user item with images prepended.
@@ -1126,7 +1315,7 @@ export async function transformOpenAIResponses(
       role: 'user',
       content: [
         ...imagePartsResp,
-        ...slabFactSheetPart,
+        ...exactContextParts,
         endMarker,
         { type: 'input_text', text: originalInputString! },
       ],
@@ -1137,7 +1326,7 @@ export async function transformOpenAIResponses(
     // and protecting it made stale first-turn requests look live.
     const slabUserItem: ResponsesInputItem = {
       role: 'user',
-      content: [...imagePartsResp, ...slabFactSheetPart, endMarker],
+      content: [...imagePartsResp, ...exactContextParts, endMarker],
     };
     inputItems = [
       ...inputItems.slice(0, firstUserIdx),
@@ -1164,7 +1353,9 @@ export async function transformOpenAIResponses(
       if (typeof content === 'string') {
         if (content.length > 0) it.content = RESPONSES_POINTER;
       } else if (Array.isArray(content) && responsesContentText(content).length > 0) {
-        it.content = [{ type: 'input_text', text: RESPONSES_POINTER }];
+        it.content = selectiveExactContext
+          ? replaceResponsesTextWithPointer(content, RESPONSES_POINTER)
+          : [{ type: 'input_text', text: RESPONSES_POINTER }];
       }
     }
   }

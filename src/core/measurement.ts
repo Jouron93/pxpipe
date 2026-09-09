@@ -46,6 +46,7 @@ export function buildBaselineCountTokensBody(bytes: BytesLike): Uint8Array | nul
       if (COUNT_TOKENS_FIELDS.has(k)) out[k] = obj[k];
     }
     if (typeof out.model !== 'string' || !Array.isArray(out.messages)) return null;
+    clampCacheControlMarkers(out, 4);
     return new TextEncoder().encode(JSON.stringify(out));
   } catch {
     return null;
@@ -211,4 +212,186 @@ function countCacheControlValue(value: unknown): number {
     }
   }
   return n;
+}
+
+export interface MarkerTarget {
+  cache_control?: unknown;
+}
+
+/**
+ * Enforce Anthropic's hard cap of at most 4 cache_control blocks per request.
+ * If > 4 markers are found across tools, system, and messages, prunes lower-priority
+ * intermediate markers to guarantee count <= 4 without breaking prefix cache integrity.
+ */
+export function clampCacheControlMarkers(
+  req: { tools?: unknown; system?: unknown; messages?: unknown },
+  maxMarkers = 4,
+): number {
+  if (!req || typeof req !== 'object') return 0;
+
+  interface MarkerRef {
+    target: Record<string, unknown>;
+    kind: 'tool' | 'system' | 'msg_first' | 'msg_last' | 'msg_mid';
+    order: number;
+  }
+
+  const refs: MarkerRef[] = [];
+  let order = 0;
+
+  // 1. Scan tools
+  if (Array.isArray(req.tools)) {
+    for (const t of req.tools) {
+      if (t && typeof t === 'object' && (t as Record<string, unknown>).cache_control != null) {
+        refs.push({ target: t as Record<string, unknown>, kind: 'tool', order: order++ });
+      }
+    }
+  }
+
+  // 2. Scan system
+  if (Array.isArray(req.system)) {
+    for (const s of req.system) {
+      if (s && typeof s === 'object' && (s as Record<string, unknown>).cache_control != null) {
+        refs.push({ target: s as Record<string, unknown>, kind: 'system', order: order++ });
+      }
+    }
+  } else if (req.system && typeof req.system === 'object' && (req.system as Record<string, unknown>).cache_control != null) {
+    refs.push({ target: req.system as Record<string, unknown>, kind: 'system', order: order++ });
+  }
+
+  // 3. Scan messages
+  const msgRefs: MarkerRef[] = [];
+  if (Array.isArray(req.messages)) {
+    for (let i = 0; i < req.messages.length; i++) {
+      const m = req.messages[i];
+      if (!m || typeof m !== 'object') continue;
+      const content = (m as { content?: unknown }).content;
+      if (Array.isArray(content)) {
+        for (const b of content) {
+          if (b && typeof b === 'object' && (b as Record<string, unknown>).cache_control != null) {
+            msgRefs.push({ target: b as Record<string, unknown>, kind: 'msg_mid', order: order++ });
+          }
+        }
+      } else if (content && typeof content === 'object' && (content as Record<string, unknown>).cache_control != null) {
+        msgRefs.push({ target: content as Record<string, unknown>, kind: 'msg_mid', order: order++ });
+      }
+    }
+  }
+
+  // Refine message marker kinds: first vs last vs middle
+  if (msgRefs.length > 0) {
+    msgRefs[0]!.kind = 'msg_first';
+    if (msgRefs.length > 1) {
+      msgRefs[msgRefs.length - 1]!.kind = 'msg_last';
+    }
+  }
+
+  refs.push(...msgRefs);
+
+  if (refs.length <= maxMarkers) {
+    return refs.length;
+  }
+
+  // Priority: 1. tool, 2. system, 3. msg_last (live turn), 4. msg_first (carry-over chunk), 5. msg_mid
+  const priorityOrder = (kind: MarkerRef['kind']): number => {
+    switch (kind) {
+      case 'tool': return 1;
+      case 'system': return 2;
+      case 'msg_last': return 3;
+      case 'msg_first': return 4;
+      case 'msg_mid': return 5;
+    }
+  };
+
+  const ranked = [...refs].sort((a, b) => {
+    const pDiff = priorityOrder(a.kind) - priorityOrder(b.kind);
+    if (pDiff !== 0) return pDiff;
+    // For msg_mid, drop older middle markers before newer middle markers
+    if (a.kind === 'msg_mid' && b.kind === 'msg_mid') return b.order - a.order;
+    return a.order - b.order;
+  });
+
+  const toDrop = ranked.slice(maxMarkers);
+  for (const ref of toDrop) {
+    delete ref.target.cache_control;
+  }
+
+  return maxMarkers;
+}
+
+/**
+ * Enforce Anthropic's cache_control TTL ordering rule.
+ *
+ * The API returns 400 when a `ttl:'1h'` block appears AFTER a `ttl:'5m'` block,
+ * evaluated across the whole request in the documented processing order:
+ * `tools`, then `system`, then `messages`.
+ *
+ * This proxy RELOCATES the caller's breakpoints when it collapses history into
+ * images -- history.ts re-attaches the caller's marker, ttl included, to the
+ * last image of a marked segment -- and ADDS one on the warm-partial path via
+ * markFrozenHistoryCarryOverCache(). Either move can place a 1h marker after a
+ * 5m one that the caller had ordered correctly.
+ *
+ * Observed 2026-08-17: five consecutive 400s on claude-fable-5, every one
+ * compressed=true / reason=cache_preserving_partial, rejected at
+ *     messages.0.content.11.content.0.cache_control.ttl
+ * Because the ordering is a deterministic function of conversation state, each
+ * retry rebuilt the identical invalid request, so the caller's session could
+ * not recover at all -- it had to bypass the proxy entirely.
+ *
+ * DEMOTES a later 1h to 5m rather than promoting an earlier 5m to 1h.
+ * Demotion is always valid and only shortens cache retention; promotion would
+ * extend a cache lifetime the caller never requested, changing cost as well as
+ * behaviour.
+ *
+ * A marker with no explicit ttl is treated as 5m, because that is the API
+ * default and it therefore closes the 1h window too. That is deliberately
+ * conservative: it may demote a 1h that would have been accepted, costing cache
+ * duration but never correctness.
+ *
+ * Unlike clampCacheControlMarkers this recurses into NESTED `content` arrays,
+ * since tool_result blocks carry their own content and that is precisely where
+ * the observed failure lived. Recursion is bounded to the `content` key and to
+ * a depth limit so it cannot descend into base64 image payloads.
+ *
+ * @returns number of markers demoted.
+ */
+export function normalizeCacheControlTtlOrder(
+  req: { tools?: unknown; system?: unknown; messages?: unknown },
+): number {
+  if (!req || typeof req !== 'object') return 0;
+
+  const targets: Record<string, unknown>[] = [];
+  const MAX_DEPTH = 8;
+
+  const visit = (node: unknown, depth: number): void => {
+    if (depth > MAX_DEPTH || !node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    const obj = node as Record<string, unknown>;
+    if (obj.cache_control != null && typeof obj.cache_control === 'object') {
+      targets.push(obj);
+    }
+    if (obj.content !== undefined) visit(obj.content, depth + 1);
+  };
+
+  visit(req.tools, 0);
+  visit(req.system, 0);
+  visit(req.messages, 0);
+
+  let seenShort = false;
+  let demoted = 0;
+  for (const t of targets) {
+    const cc = t.cache_control as { ttl?: unknown };
+    if (cc.ttl === '1h') {
+      if (seenShort) {
+        cc.ttl = '5m';
+        demoted++;
+      }
+    } else {
+      seenShort = true;
+    }
+  }
+  return demoted;
 }

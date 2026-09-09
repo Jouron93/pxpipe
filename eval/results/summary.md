@@ -1,6 +1,6 @@
 # Reflow Eval — Combined Summary Report
 
-**Generated:** 2026-05-22T03:18:39.382Z  
+**Generated:** 2026-07-27T01:48:41.884Z *(dry run — scores are simulated)*  
 **Model:** claude-sonnet-4-5  
 **Levels run:** L1, L2
 
@@ -10,8 +10,8 @@
 
 | | Baseline | Reflow | Δ |
 |--|---------|--------|---|
-| Mean char accuracy | 97.73% | 80.64% | -17.09pp |
-| Macro accuracy | 97.18% | 75.65% | -21.54pp |
+| Mean char accuracy | 4.03% | 7.23% | 3.20pp |
+| Macro accuracy | 2.38% | 4.40% | 2.02pp |
 | Image savings | — | 0.0% | |
 
 Full L1 report: [l1-report.md](l1-report.md)
@@ -21,9 +21,9 @@ Full L1 report: [l1-report.md](l1-report.md)
 
 | | Value |
 |--|------|
-| Mean judge score | 51.0% |
-| Pass rate (≥ 0.75) | 30.0% |
-| Image savings | 50.0% |
+| Mean judge score | 85.0% |
+| Pass rate (≥ 0.75) | 100.0% |
+| Image savings | 58.3% |
 
 Full L2 report: [l2-report.md](l2-report.md)
 
@@ -43,3 +43,4 @@ If any gate fails, investigate the failing sessions/blocks before shipping.
 
 See [README.md](README.md) for full guidance on running and interpreting each level.
 
+> ⚠️  **Dry-run mode**: all scores are simulated. Re-run with `--confirm` to get real scores.

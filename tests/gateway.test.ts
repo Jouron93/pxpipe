@@ -3,7 +3,8 @@
  * the suite never touches the network (global fetch is stubbed).
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { createProxy, parseGatewayHeaders, resolveUpstreams } from '../src/core/proxy.js';
+import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyEvent } from '../src/core/proxy.js';
+import { toTrackEvent } from '../src/core/tracker.js';
 
 const FAKE_BASE = 'https://gateway.example.test/v1/acct_fake/gw_fake';
 const FAKE_TOKEN = 'Bearer fake-gateway-token';
@@ -35,6 +36,29 @@ describe('resolveUpstreams', () => {
     expect(() => resolveUpstreams({ provider: 'cloudflare-ai-gateway' })).toThrow(
       /gatewayBaseUrl/,
     );
+  });
+
+  it('accepts only the exact credential-free ChatGPT Codex OAuth upstream', () => {
+    expect(resolveUpstreams({ openAIUpstream: 'https://chatgpt.com/backend-api/codex/' }))
+      .toEqual({
+        anthropic: 'https://api.anthropic.com',
+        openai: 'https://chatgpt.com/backend-api/codex',
+        stripOpenAIV1: true,
+      });
+    expect(() => resolveUpstreams({
+      openAIUpstream: 'https://chatgpt.com/backend-api/codex',
+      openAIApiKey: 'sentinel',
+    })).toThrow(/cannot be combined/i);
+    expect(() => resolveUpstreams({
+      openAIUpstream: 'https://chatgpt.com/backend-api/codex',
+      gatewayHeaders: { authorization: 'sentinel' },
+    })).toThrow(/cannot override/i);
+    expect(() => resolveUpstreams({
+      openAIUpstream: 'https://chatgpt.com/backend-api/codex',
+      gatewayHeaders: { 'chatgpt-account-id': 'sentinel' },
+    })).toThrow(/cannot override/i);
+    expect(resolveUpstreams({ openAIUpstream: 'https://chatgpt.com/backend-api/codex-extra' }).stripOpenAIV1)
+      .toBe(false);
   });
 });
 
@@ -99,6 +123,137 @@ describe('gateway end-to-end routing (stubbed fetch)', () => {
     expect(cap.headers?.get('cf-aig-authorization')).toBe(FAKE_TOKEN);
     expect(cap.headers?.get('x-api-key')).toBe('fake-anthropic-key');
   });
+
+  it('routes ChatGPT Codex without persisting OAuth secrets', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    let resolveEvent!: (event: ProxyEvent) => void;
+    const eventPromise = new Promise<ProxyEvent>((resolve) => { resolveEvent = resolve; });
+    const response = await createProxy({
+      openAIUpstream: 'https://chatgpt.com/backend-api/codex',
+      onRequest: resolveEvent,
+    })(
+      new Request('http://127.0.0.1/v1/responses', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer codex-test-secret',
+          'chatgpt-account-id': 'acct-test-secret',
+        },
+        body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+      }),
+    );
+    await response.text();
+    const event = await eventPromise;
+
+    expect(cap.url).toBe('https://chatgpt.com/backend-api/codex/responses');
+    expect(cap.headers?.get('authorization')).toBe('Bearer codex-test-secret');
+    expect(cap.headers?.get('chatgpt-account-id')).toBe('acct-test-secret');
+    expect(event.billingLane).toBe('codex_subscription');
+    expect(event.billingLaneSource).toBe('chatgpt_codex_origin');
+    const persisted = JSON.stringify(toTrackEvent(event));
+    expect(persisted).not.toContain('codex-test-secret');
+    expect(persisted).not.toContain('acct-test-secret');
+  });
+
+  const configuredLaneConflicts: Array<{
+    name: string;
+    config: NonNullable<Parameters<typeof createProxy>[0]>;
+    request: () => Request;
+    expectedLane: ProxyEvent['billingLane'];
+  }> = [
+    {
+      name: 'AGY origin',
+      config: { upstream: 'http://127.0.0.1:4017', billingLanes: { anthropic: 'api_key' } },
+      request: () => new Request('http://127.0.0.1/v1/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+      expectedLane: 'api_key',
+    },
+    {
+      name: 'local origin',
+      config: { upstream: 'http://127.0.0.1:1234', billingLanes: { anthropic: 'api_key' } },
+      request: () => new Request('http://127.0.0.1/v1/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'local-model', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+      expectedLane: 'api_key',
+    },
+    {
+      name: 'ChatGPT Codex origin',
+      config: {
+        openAIUpstream: 'https://chatgpt.com/backend-api/codex',
+        billingLanes: { openai: 'local' },
+      },
+      request: () => new Request('http://127.0.0.1/v1/responses', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+      }),
+      expectedLane: 'local',
+    },
+    {
+      name: 'configured OpenAI API key',
+      config: {
+        openAIApiKey: 'sk-observed-secret',
+        billingLanes: { openai: 'codex_subscription' },
+      },
+      request: () => new Request('http://127.0.0.1/v1/responses', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+      }),
+      expectedLane: 'codex_subscription',
+    },
+    {
+      name: 'Anthropic API key',
+      config: {
+        apiKey: 'sk-observed-secret',
+        billingLanes: { anthropic: 'claude_max_subscription' },
+      },
+      request: () => new Request('http://127.0.0.1/v1/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'sk-request-secret' },
+        body: JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+      expectedLane: 'claude_max_subscription',
+    },
+    {
+      name: 'Anthropic OAuth marker',
+      config: { billingLanes: { anthropic: 'api_key' } },
+      request: () => new Request('http://127.0.0.1/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: 'Bearer oauth-observed-secret',
+          'anthropic-beta': 'oauth-2025-04-20',
+        },
+        body: JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+      expectedLane: 'api_key',
+    },
+    {
+      name: 'NVIDIA Build catalog route',
+      config: { billingLanes: { anthropic: 'nvidia_build_free' } },
+      request: () => new Request('http://127.0.0.1/v1/messages', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'nvidia/meta/llama-3.3-70b-instruct', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+      expectedLane: 'nvidia_build_free',
+    },
+  ];
+
+  it.each(configuredLaneConflicts)(
+    'treats configured billing lanes as authoritative over $name inference',
+    async ({ config, request, expectedLane }) => {
+      stubFetch({});
+      let resolveEvent!: (event: ProxyEvent) => void;
+      const eventPromise = new Promise<ProxyEvent>((resolve) => { resolveEvent = resolve; });
+      const response = await createProxy({ ...config, onRequest: resolveEvent })(request());
+      await response.text();
+      const event = await eventPromise;
+      expect(event.billingLane).toBe(expectedLane);
+      expect(event.billingLaneSource).toBe('configured_route');
+    },
+  );
 
   it('routes OpenAI /v1/chat/completions to {base}/openai/chat/completions', async () => {
     const cap: { url?: string; headers?: Headers } = {};

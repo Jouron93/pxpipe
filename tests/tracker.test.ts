@@ -8,12 +8,23 @@ describe('toTrackEvent', () => {
       method: 'POST',
       path: '/v1/messages',
       model: 'gpt-5.5',
+      requestedModel: 'gpt-5.6-sol',
+      actualModel: 'gpt-5.6-sol-2026-07-01',
+      billingLane: 'codex_subscription',
+      billingLaneSource: 'chatgpt_codex_origin',
       status: 200,
       durationMs: 1234,
       firstByteMs: 200,
+      responseContentType: '<missing>',
+      usageScanStatus: 'partial_stream_error',
+      usageScanError: 'Error',
+      usageTerminalEventSeen: true,
+      usageSseEventCount: 4,
+      usageParseErrorCount: 0,
       info: {
         compressed: true,
         origChars: 16000,
+        compressedChars: 16000,
         imageCount: 1,
         imageBytes: 2103,
         staticChars: 14000,
@@ -45,9 +56,19 @@ describe('toTrackEvent', () => {
     expect(out.method).toBe('POST');
     expect(out.path).toBe('/v1/messages');
     expect(out.model).toBe('gpt-5.5');
+    expect(out.requested_model).toBe('gpt-5.6-sol');
+    expect(out.actual_model).toBe('gpt-5.6-sol-2026-07-01');
+    expect(out.billing_lane).toBe('codex_subscription');
+    expect(out.billing_lane_source).toBe('chatgpt_codex_origin');
     expect(out.status).toBe(200);
     expect(out.duration_ms).toBe(1234);
     expect(out.first_byte_ms).toBe(200);
+    expect(out.response_content_type).toBe('<missing>');
+    expect(out.usage_scan_status).toBe('partial_stream_error');
+    expect(out.usage_scan_error).toBe('Error');
+    expect(out.usage_terminal_event_seen).toBe(true);
+    expect(out.usage_sse_event_count).toBe(4);
+    expect(out.usage_parse_error_count).toBe(0);
     expect(out.compressed).toBe(true);
     expect(out.orig_chars).toBe(16000);
     expect(out.static_chars).toBe(14000);
@@ -70,6 +91,7 @@ describe('toTrackEvent', () => {
   it('persists Responses completed-pair imageability telemetry', () => {
     const out = toTrackEvent({
       method: 'POST', path: '/v1/responses', status: 200, durationMs: 1,
+      billingLane: 'local', billingLaneSource: 'local_origin',
       info: {
         compressed: true, origChars: 1, compressedChars: 1,
         imageCount: 1, imageBytes: 1, staticChars: 1, dynamicChars: 0,
@@ -109,6 +131,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 100,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       usage: {
         input_tokens: 10,
         output_tokens: 250,
@@ -139,6 +163,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 100,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       usage: {
         input_tokens: 10,
         output_tokens: 5,
@@ -146,8 +172,8 @@ describe('toTrackEvent', () => {
         cache_read_input_tokens: 0,
       },
     });
-    expect(out.cache_creation_5m_tokens).toBeUndefined();
-    expect(out.cache_creation_1h_tokens).toBeUndefined();
+    expect(out.cache_create_5m_tokens).toBeUndefined();
+    expect(out.cache_create_1h_tokens).toBeUndefined();
     expect(out.web_search_requests).toBeUndefined();
   });
 
@@ -162,9 +188,17 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 50,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       info: {
         compressed: true,
         origChars: 30000,
+        compressedChars: 30000,
+        imageCount: 0,
+        imageBytes: 0,
+        staticChars: 0,
+        dynamicChars: 0,
+        dynamicBlockCount: 0,
         bucketChars: {
           static_slab: 27000,
           reminder: 1500,
@@ -196,7 +230,13 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
-      info: { compressed: false, reason: 'compress=false', origChars: 0 },
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
+      info: {
+        compressed: false, reason: 'compress=false', origChars: 0,
+        compressedChars: 0, imageCount: 0, imageBytes: 0,
+        staticChars: 0, dynamicChars: 0, dynamicBlockCount: 0,
+      },
     });
     expect(noBuckets.bucket_chars).toBeUndefined();
     expect(noBuckets.history_text_chars).toBeUndefined();
@@ -206,7 +246,13 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
-      info: { compressed: true, origChars: 100, bucketChars: {} },
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
+      info: {
+        compressed: true, origChars: 100, bucketChars: {},
+        compressedChars: 0, imageCount: 0, imageBytes: 0,
+        staticChars: 0, dynamicChars: 0, dynamicBlockCount: 0,
+      },
     });
     expect(emptyBucketMap.bucket_chars).toBeUndefined();
   });
@@ -217,6 +263,8 @@ describe('toTrackEvent', () => {
       path: '/health',
       status: 200,
       durationMs: 4,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
     });
     expect(out.method).toBe('GET');
     expect(out.compressed).toBeUndefined();
@@ -230,6 +278,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       stopReason: 'end_turn',
     });
     expect(out.stop_reason).toBe('end_turn');
@@ -244,6 +294,8 @@ describe('toTrackEvent', () => {
         path: '/v1/messages',
         status: 200,
         durationMs: 10,
+        billingLane: 'local',
+        billingLaneSource: 'local_origin',
         stopReason: reason,
       });
       expect(out.stop_reason).toBe(reason);
@@ -257,6 +309,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
     });
     expect('stop_reason' in out).toBe(false);
     expect('safety_flagged' in out).toBe(false);

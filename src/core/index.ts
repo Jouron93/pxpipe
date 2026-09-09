@@ -28,10 +28,14 @@ export {
 } from './library.js';
 export {
   transformRequest,
+  evaluateCandidateBlockAdmission,
+  recordCandidateBlockInstrumentation,
   type TransformInfo as PxpipeTransformInfo,
   type TransformOptions,
   type KeepSharpBlock,
   type RecoverableBlock,
+  type CandidateBlockInstrumentation,
+  type AdmissionEvaluation,
 } from './transform.js';
 export { transformOpenAIChatCompletions, transformOpenAIResponses, resolveVisionCost, openAIVisionTokens } from './openai.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';
@@ -41,3 +45,10 @@ export {
   CACHE_CREATE_RATE,
   CACHE_READ_RATE,
 } from './baseline.js';
+export {
+  estimateAdmission,
+  ECONOMIC_FLOORS,
+  type AdmissionDecision,
+  type AdmissionEstimatorInput,
+  type AdmissionEstimatorResult,
+} from './admission-estimator.js';

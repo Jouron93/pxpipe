@@ -99,8 +99,9 @@ describe('evalCompressionProfitability observability', () => {
     expect(e!.textTokens).toBeGreaterThan(0);
   });
 
-  it('returns null when textLen ≤ 0 (defensive against degenerate inputs)', () => {
-    expect(evalCompressionProfitability(0, 100)).toBeNull();
-    expect(evalCompressionProfitability(-5, 100)).toBeNull();
+  it('returns null on empty text (defensive against degenerate inputs)', () => {
+    // Signature takes the text itself now, not a length — the degenerate
+    // input is empty text (length 0).
+    expect(evalCompressionProfitability('', 100)).toBeNull();
   });
 });

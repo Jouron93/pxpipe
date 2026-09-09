@@ -53,9 +53,11 @@
     "restart": "bash scripts/restart.sh",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:bounded": "vitest run --maxWorkers=1",
     "test:watch": "vitest",
     "test:restart": "bash tests/restart.test.sh",
-    "prepublishOnly": "pnpm run typecheck && pnpm test && pnpm run build",
+    "verify:glyph": "pnpm run build && node eval/glyph-matrix/sweep/gen_sweep.mjs && node eval/glyph-matrix/sweep/decode_atlas.mjs --tag verify --assert-exact",
+    "prepublishOnly": "pnpm run typecheck && pnpm run test:bounded && pnpm run verify:glyph",
     "vendor:ui": "node scripts/vendor-ui.mjs"
   },
   "keywords": [

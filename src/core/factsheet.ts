@@ -41,6 +41,9 @@ const MIN_LEN = 3;
 const MAX_LEN = 120;
 /** Budget cap: highest-priority tokens kept first. Exported so consumers can report drops. */
 export const MAX_TOKENS = 96;
+/** Opus's 9x12 cells fit fewer chars/image, so we allow more sidecar tokens to
+ *  compensate (~5% → ~8% of source chars). Callers pass this for Opus models. */
+export const MAX_TOKENS_OPUS = 160;
 // At most this many URL exemplars: URLs are long, structured, low OCR-risk, and usually
 // reconstructable, so they must never crowd out short zero-redundancy tokens.
 const MAX_URLS = 8;
@@ -115,7 +118,9 @@ export interface FactSheetEntry {
  * behaviour; only counts are new. Same-token spans matched by two patterns are
  * deduped by offset so a token is never double-counted.
  */
-export function extractFactSheetEntries(text: string): FactSheetEntry[] {
+export function extractFactSheetEntries(text: string, maxTokens?: number): FactSheetEntry[] {
+  const budget = maxTokens ?? MAX_TOKENS;
+  if (!text) return [];
   const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
   const counts = new Map<string, number>();
   for (const chunk of scan.split(/\s+/)) {
@@ -154,7 +159,7 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
   const kept: string[] = [];
   let urls = 0;
   for (const { t, tier } of ranked) {
-    if (kept.length >= MAX_TOKENS) break;
+    if (kept.length >= budget) break;
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push(t);
   }
@@ -188,7 +193,9 @@ export function extractFactSheetTokensAllPages(
 export function extractFactSheetEntriesAllPages(
   text: string,
   charsPerPage: number,
+  maxTokens?: number,
 ): { kept: FactSheetEntry[]; dropped: number } {
+  const budget = maxTokens ?? MAX_TOKENS;
   const counts = new Map<string, number>();
   const all: string[] = [];
 
@@ -211,7 +218,7 @@ export function extractFactSheetEntriesAllPages(
   const kept: FactSheetEntry[] = [];
   let urls = 0;
   for (const { t, tier } of ranked) {
-    if (kept.length >= MAX_TOKENS) break;
+    if (kept.length >= budget) break;
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push({ token: t, count: counts.get(t) ?? 1 });
   }
@@ -243,11 +250,11 @@ export function factSheetTextFromEntries(entries: readonly FactSheetEntry[]): st
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found.
  *  Single path for slab, history, and tool results: page long text so early-turn
  *  ids are not dropped by MAX_SCAN. Short text is one page (same as before). */
-export function factSheetText(text: string): string {
+export function factSheetText(text: string, maxTokens?: number): string {
   if (!text) return '';
   if (text.length <= MAX_SCAN) {
-    return factSheetTextFromEntries(extractFactSheetEntries(text));
+    return factSheetTextFromEntries(extractFactSheetEntries(text, maxTokens));
   }
-  const { kept } = extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS);
+  const { kept } = extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS, maxTokens);
   return factSheetTextFromEntries(kept);
 }

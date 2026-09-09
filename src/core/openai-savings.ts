@@ -17,7 +17,7 @@
  * premium like Anthropic's ephemeral cache.
  */
 
-import { CACHE_READ_RATE } from './baseline.js';
+import { cacheReadRatio, outputInputRatio } from './model-pricing.js';
 
 /** gpt-5 cached input list ratio: $0.125 / $1.25 per 1M tokens. */
 export const OPENAI_GPT5_CACHE_READ_RATE = 0.1;
@@ -37,23 +37,11 @@ export const GROK_CACHE_READ_RATE = 0.25;
 export const GROK_OUTPUT_RATE = 3;
 
 export function openAICacheReadRate(model: string | undefined): number {
-  const m = (model ?? '').toLowerCase();
-  // Model-based rates on the shared Responses path (several families share /v1/responses).
-  if (m.startsWith('claude') || m.includes('anthropic')) return CACHE_READ_RATE;
-  if (m.startsWith('grok-')) return GROK_CACHE_READ_RATE;
-  if (/^gpt-5/.test(m)) return OPENAI_GPT5_CACHE_READ_RATE;
-  return 0.5;
+  return cacheReadRatio(model);
 }
 
 export function openAIOutputRate(model: string | undefined): number {
-  const m = (model ?? '').toLowerCase();
-  if (m.startsWith('claude') || m.includes('anthropic')) return 5;
-  if (m.startsWith('grok-')) return GROK_OUTPUT_RATE;
-  if (/^gpt-5/.test(m)) return OPENAI_GPT5_OUTPUT_RATE;
-  // Good-enough fallback for non-compressed OpenAI rows; they normally do not
-  // enter the savings numerator, but the all-usage denominator should still be
-  // roughly dollar-weighted.
-  return 4;
+  return outputInputRatio(model);
 }
 
 /** Weighted input tokens actually paid to OpenAI this turn. `cachedTokens` is a

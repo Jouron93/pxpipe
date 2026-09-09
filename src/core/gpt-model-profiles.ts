@@ -283,6 +283,8 @@ function envProfiles(): Map<string, GptModelProfile> {
   return envMap;
 }
 
+import { resolveModelProfile } from './model-registry.js';
+
 export function resolveGptProfile(model: string | null | undefined): GptModelProfile {
   // Match applicability.ts: bracketed transport variants (for example [1m])
   // do not define a different visual reader profile.
@@ -299,5 +301,36 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
     }
     if (best) return best;
   }
-  return resolveBuiltin(m);
+  const builtin = resolveBuiltin(m);
+  const registryProfile = resolveModelProfile(model ?? '');
+  return {
+    vision: builtin.vision,
+    stripCols: registryProfile.renderProfile.stripCols,
+    maxHeightPx: registryProfile.renderProfile.maxHeightPx,
+    style: registryProfile.renderProfile.style,
+  };
+}
+
+/**
+ * Env-declared per-model STYLE override for the Anthropic/messages imaging path.
+ * Longest matching PXPIPE_GPT_PROFILES prefix wins — but unlike resolveGptProfile
+ * there is NO builtin fallback: models without an explicit env entry return
+ * undefined, so the Anthropic renderer keeps its DENSE_RENDER_STYLE (5×8) default.
+ * This is the knob that lets e.g. claude-opus-4-8 render at 9×12 (cellW/HBonus 4,
+ * its measured-legible density) while claude-fable-5 stays on the validated
+ * max-density production font. @jules
+ */
+export function envStyleOverride(model: string | null | undefined): GptRenderStyle | undefined {
+  const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
+  const env = envProfiles();
+  if (env.size === 0) return undefined;
+  let best: GptModelProfile | undefined;
+  let bestLen = -1;
+  for (const [k, p] of env) {
+    if (m.startsWith(k) && k.length > bestLen) {
+      best = p;
+      bestLen = k.length;
+    }
+  }
+  return best?.style;
 }

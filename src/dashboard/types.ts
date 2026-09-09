@@ -24,14 +24,27 @@ export interface StatsPayload {
   /** Observed cost split: compressed vs passthrough paths on real traffic. `split_sufficient_sample` gates the per-request delta (UI shows caveat below threshold). */
   compressed_paid_requests: number;
   passthrough_paid_requests: number;
+  compressed_priced_requests: number;
+  passthrough_priced_requests: number;
+  priced_usage_requests: number;
+  unpriced_usage_requests: number;
   compressed_actual_usd: number;
   passthrough_actual_usd: number;
+  compressed_api_equivalent_usd: number;
+  passthrough_api_equivalent_usd: number;
   compressed_avg_usd_per_request: number;
   passthrough_avg_usd_per_request: number;
   compressed_minus_passthrough_avg_usd: number;
   split_sufficient_sample: boolean;
   split_min_sample_per_bucket: number;
   saved_usd: number;
+  api_equivalent_saved_usd: number;
+  actual_cost_usd: null;
+  actual_cost_status: 'not_measured';
+  agy_subscription: SubscriptionStats;
+  claude_subscription: SubscriptionStats;
+  codex_subscription: SubscriptionStats;
+  rate_limits: RateLimitStats;
   output_weighted: number;
   baseline_token_equivalent: number;
   actual_token_equivalent: number;
@@ -46,12 +59,62 @@ export interface StatsPayload {
 }
 
 export interface PricingAssumptions {
-  input_per_mtok: number;
-  output_multiplier: number;
-  cache_write_5m_multiplier: number;
-  cache_write_1h_multiplier: number;
-  cache_read_multiplier: number;
+  status: 'api_equivalent' | 'quota_only' | 'free_by_terms' | 'mixed' | 'unavailable';
+  basis: 'public_api_list_price_equivalent';
+  priced_requests: number;
+  unpriced_requests: number;
+  input_per_mtok?: number;
+  output_multiplier?: number;
+  cache_write_5m_multiplier?: number;
+  cache_write_1h_multiplier?: number;
+  cache_read_multiplier?: number;
   source: string;
+  rate_cards: PricingRateCard[];
+}
+
+export interface PricingRateCard {
+  id: string;
+  provider: string;
+  model: string;
+  cost_status: 'api_equivalent' | 'quota_only' | 'allocation_required' | 'free_by_terms' | 'unavailable';
+  input_per_mtok?: number;
+  cached_input_per_mtok?: number;
+  output_per_mtok?: number;
+  context_window_tokens?: number;
+  max_output_tokens?: number;
+  source: string;
+  note?: string;
+  subscription_break_even_input_tokens?: number;
+  subscription_break_even_cached_input_tokens?: number;
+  subscription_break_even_output_tokens?: number;
+}
+
+export interface SubscriptionStats {
+  monthly_usd: number | null;
+  api_equivalent_used_usd: number;
+  break_even_pct: number | null;
+  api_equivalent_remaining_usd: number | null;
+  usage_requests: number;
+}
+
+/** Backward-compatible type name for existing consumers. */
+export type AgYSubscriptionStats = SubscriptionStats;
+
+export interface RateLimitStats {
+  responses_429: number;
+  responses_with_headers: number;
+  latest?: {
+    ts: number;
+    status: number;
+    model?: string;
+    retry_after?: string;
+    request_limit?: string;
+    request_remaining?: string;
+    request_reset?: string;
+    token_limit?: string;
+    token_remaining?: string;
+    token_reset?: string;
+  };
 }
 
 /** /proxy-recent payload. */
@@ -67,6 +130,8 @@ export interface RecentRow {
   method: string;
   path: string;
   model?: string;
+  requested_model?: string;
+  actual_model?: string;
   status: number;
   size_in?: number;
   compressed: boolean;
@@ -80,6 +145,10 @@ export interface RecentRow {
   session_saved_so_far_delta?: number;
   img_id?: number;
   img_ids?: number[];
+  baseline_tokens?: number;
+  shadow_predicted_savings_pct?: number;
+  reason?: string;
+  first_byte_ms?: number;
 }
 
 /** /api/sessions.json payload. */

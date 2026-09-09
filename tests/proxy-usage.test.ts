@@ -41,6 +41,7 @@ describe('proxy usage extraction', () => {
         new Response(
           JSON.stringify({
             id: 'msg_1',
+            model: 'claude-haiku-4-5-20251001',
             type: 'message',
             role: 'assistant',
             content: [{ type: 'text', text: 'hello' }],
@@ -64,7 +65,7 @@ describe('proxy usage extraction', () => {
     });
 
     const res = await proxy(
-      new Request('http://localhost/v1/messages', {
+      new Request('http://127.0.0.1/v1/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: SAMPLE_REQ_BODY,
@@ -80,13 +81,152 @@ describe('proxy usage extraction', () => {
     expect(captured!.usage?.input_tokens).toBe(123);
     expect(captured!.usage?.output_tokens).toBe(7);
     expect(captured!.usage?.cache_read_input_tokens).toBe(100);
+    expect(captured!.requestedModel).toBe('claude-3-5-haiku-latest');
+    expect(captured!.actualModel).toBe('claude-haiku-4-5-20251001');
     expect(captured!.firstByteMs).toBeTypeOf('number');
+  });
+
+  it('extracts Responses usage from CRLF-delimited terminal SSE events', async () => {
+    const terminal = {
+      type: 'response.completed',
+      response: {
+        id: 'resp_sol_stream_1',
+        status: 'completed',
+        usage: {
+          input_tokens: 8357,
+          output_tokens: 5,
+          input_tokens_details: { cached_tokens: 1024 },
+        },
+      },
+    };
+    // Codex emits the event discriminator in JSON `type`, without an `event:` line.
+    const sse = [
+      'data: {"type":"response.created"}\r\n\r\n',
+      'data: {"type":"response.output_text.delta","delta":"OK"}\r\n\r\n',
+      `data: ${JSON.stringify(terminal)}\r\n\r\n`,
+    ].join('');
+    const restore = mockUpstream(
+      // ChatGPT's Codex backend currently omits Content-Type on Responses streams.
+      () => new Response(new TextEncoder().encode(sse), { status: 200 }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://api.openai.test',
+      openAIApiKey: 'sk-test',
+      transform: {},
+      onRequest: (event) => { captured = event; },
+    });
+    const res = await proxy(new Request('http://127.0.0.1/v1/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi', stream: true }),
+    }));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(captured?.usage?.input_tokens).toBe(8357);
+    expect(captured?.usage?.output_tokens).toBe(5);
+    expect(captured?.usage?.cached_tokens).toBe(1024);
+    expect(captured?.stopReason).toBe('stop');
+    expect(captured?.measurement?.textChars).toBe(2);
+    expect(captured?.usageScanStatus).toBe('complete');
+    expect(captured?.usageTerminalEventSeen).toBe(true);
+    expect(captured?.usageSseEventCount).toBe(3);
+    expect(captured?.usageParseErrorCount).toBe(0);
+  });
+
+  it('preserves terminal Responses usage when a later stream read fails', async () => {
+    const terminal = `data: ${JSON.stringify({
+      type: 'response.completed',
+      response: {
+        status: 'completed',
+        usage: {
+          input_tokens: 8357,
+          output_tokens: 5,
+          input_tokens_details: { cached_tokens: 1024 },
+        },
+      },
+    })}\r\n\r\n`;
+    let pullCount = 0;
+    const restore = mockUpstream(() => new Response(new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (pullCount++ === 0) {
+          controller.enqueue(new TextEncoder().encode(terminal));
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        controller.error(new Error('fixture late stream failure'));
+      },
+    }), { status: 200 }));
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://api.openai.test',
+      openAIApiKey: 'sk-test',
+      transform: {},
+      onRequest: (event) => { captured = event; },
+    });
+    const res = await proxy(new Request('http://127.0.0.1/v1/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi', stream: true }),
+    }));
+    await res.text().catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    restore();
+
+    expect(captured?.usage?.input_tokens).toBe(8357);
+    expect(captured?.usage?.output_tokens).toBe(5);
+    expect(captured?.usage?.cached_tokens).toBe(1024);
+    expect(captured?.stopReason).toBe('stop');
+    expect(captured?.usageScanStatus).toBe('partial_stream_error');
+    expect(captured?.usageScanError).toBe('Error');
+    expect(captured?.usageTerminalEventSeen).toBe(true);
+    expect(captured?.usageSseEventCount).toBe(1);
+  });
+
+  it('sniffs a headerless plain JSON response instead of treating it as SSE', async () => {
+    const restore = mockUpstream(() => new Response(new TextEncoder().encode(JSON.stringify({
+      id: 'resp_headerless_json',
+      status: 'completed',
+      output: [],
+      usage: {
+        input_tokens: 21,
+        output_tokens: 3,
+        input_tokens_details: { cached_tokens: 8 },
+      },
+    })), { status: 200 }));
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      openAIUpstream: 'https://api.openai.test',
+      openAIApiKey: 'sk-test',
+      transform: {},
+      onRequest: (event) => { captured = event; },
+    });
+    const res = await proxy(new Request('http://127.0.0.1/v1/responses', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-sol', input: 'hi' }),
+    }));
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    restore();
+
+    expect(captured?.usage?.input_tokens).toBe(21);
+    expect(captured?.usage?.output_tokens).toBe(3);
+    expect(captured?.usage?.cached_tokens).toBe(8);
+    expect(captured?.usageScanStatus).toBe('complete');
+    expect(captured?.usageTerminalEventSeen).toBe(true);
+    expect(captured?.usageSseEventCount).toBeUndefined();
   });
 
   it('never calls Anthropic count_tokens for Sol Responses', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(JSON.stringify({
         id: 'resp_sol_1', object: 'response', status: 'completed',
         output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
@@ -115,7 +255,7 @@ describe('proxy usage extraction', () => {
   it('transforms OpenCode /anthropic/messages (no /v1) and records the model', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       const url = req.url;
       if (url.endsWith('/count_tokens')) {
         return new Response(JSON.stringify({ input_tokens: 9000 }), {
@@ -176,7 +316,7 @@ describe('proxy usage extraction', () => {
   it('passes Claude Code Messages + Sol through without Anthropic count_tokens', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(JSON.stringify({
         id: 'msg_sol', type: 'message', role: 'assistant',
         content: [{ type: 'text', text: 'ok' }], model: 'gpt-5.6-sol',
@@ -211,7 +351,7 @@ describe('proxy usage extraction', () => {
   it('routes GPT 5.6 Sol chat completions to OpenAI, transforms once, and normalizes usage', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(
         JSON.stringify({
           id: 'chatcmpl_1',
@@ -279,7 +419,7 @@ describe('proxy usage extraction', () => {
   it('transforms provider-prefixed OpenAI chat but forwards through the generic upstream', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(
         JSON.stringify({
           id: 'chatcmpl_1',
@@ -326,7 +466,7 @@ describe('proxy usage extraction', () => {
   it('transforms OpenCode /openai/responses requests and records the model', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(
         JSON.stringify({
           id: 'resp_1',
@@ -458,7 +598,7 @@ describe('proxy usage extraction', () => {
       }),
     );
     await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 250));
     restore();
 
     expect(captured).toBeDefined();
@@ -554,7 +694,7 @@ describe('proxy usage extraction', () => {
     return new Uint8Array(await new Response(stream).arrayBuffer());
   }
 
-  it('captures the FULL gzipped transformed body on 4xx + sets reqBodySha8', async () => {
+  it('captures the FULL gzipped transformed body on 4xx only when opted in', async () => {
     // Pair with errorBody so a future debugger can reconstruct
     // "we sent X, Anthropic said Y" from the JSONL alone. We gzip the body
     // so even a 170 KiB transformed payload fits inline once base64'd
@@ -570,6 +710,7 @@ describe('proxy usage extraction', () => {
     let captured: ProxyEvent | undefined;
     const proxy = createProxy({
       transform: {},
+      captureRequestBodiesOn4xx: true,
       onRequest: (e) => {
         captured = e;
       },
@@ -604,6 +745,61 @@ describe('proxy usage extraction', () => {
     const parsed = JSON.parse(decoded);
     expect(parsed.model).toBe('claude-3-5-haiku-latest');
     expect(parsed.messages[0].role).toBe('user');
+  });
+
+  it('does not retain request bodies on 4xx by default', async () => {
+    const restore = mockUpstream(
+      () => new Response('{"error":"bad request"}', {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({ onRequest: (e) => { captured = e; } });
+
+    const res = await proxy(new Request('http://127.0.0.1/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: SAMPLE_REQ_BODY,
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured?.status).toBe(400);
+    expect(captured?.reqBodySha8).toMatch(/^[0-9a-f]{8}$/);
+    expect(captured?.reqBodyGz).toBeUndefined();
+    expect(captured?.errorBody).toContain('bad request');
+  });
+
+  it('passes the exact original body upstream when the transformer throws', async () => {
+    let upstreamBody = '';
+    const restore = mockUpstream(async (req) => {
+      upstreamBody = await req.text();
+      return new Response('{"ok":true}', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: () => { throw new Error('synthetic transformer failure'); },
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(new Request('http://127.0.0.1/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: SAMPLE_REQ_BODY,
+    }));
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(res.status).toBe(200);
+    expect(upstreamBody).toBe(SAMPLE_REQ_BODY);
+    expect(captured?.info?.compressed).toBe(false);
+    expect(captured?.info?.reason).toContain('transform_error: synthetic transformer failure');
   });
 
   it('does NOT gzip the request body on 2xx (but still sets reqBodySha8)', async () => {
@@ -1260,7 +1456,7 @@ describe('proxy usage extraction', () => {
       }),
     );
     await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 250));
     restore();
 
     expect(captured).toBeDefined();
@@ -1463,5 +1659,32 @@ describe('proxy usage extraction', () => {
 
     expect(captured).toBeDefined();
     expect(captured!.stopReason).toBeUndefined();
+  });
+
+  it('augments /v1/models response to include both data and models keys', async () => {
+    const mockData = [
+      { id: 'gpt-5.6-sol', object: 'model', created: 1782228018, owned_by: 'system' },
+    ];
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          JSON.stringify({ object: 'list', data: mockData }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    );
+
+    const proxy = createProxy({ transform: {} });
+    const res = await proxy(
+      new Request('http://127.0.0.1/v1/models', {
+        method: 'GET',
+        headers: { authorization: 'Bearer test' },
+      }),
+    );
+    const json = await res.json() as { data?: unknown[]; models?: unknown[] };
+    restore();
+
+    expect(res.status).toBe(200);
+    expect(json.data).toEqual(mockData);
+    expect(json.models).toEqual(mockData);
   });
 });

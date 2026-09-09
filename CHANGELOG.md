@@ -6,6 +6,100 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+### Security
+- Client credentials are no longer forwarded across providers. A bearer now reaches an
+  upstream only when its SHAPE proves it belongs there (`src/core/credential-shape.ts`:
+  `sk-ant-` for Anthropic, `xai-` or an auth.x.ai-issued JWT for xAI, an
+  auth.openai.com-issued JWT for the ChatGPT backend, compared by exact issuer HOST);
+  anything else is stripped and the request fails closed. Four leaks are closed:
+  - `claude-*` on an OpenAI path reroutes to Anthropic, but the auth branch stayed in
+    OpenAI mode, so the proxy's OpenAI key -- or the client's ChatGPT JWT -- was sent to
+    api.anthropic.com.
+  - The grok lane forwarded ANY client bearer to api.x.ai. The lane is also selected by
+    body model, so a Codex client asking for `grok-*` sent its ChatGPT session token
+    there; both credentials are `eyJ` JWTs and prefix checks cannot tell them apart.
+  - A configured Anthropic key was injected over a Claude Max OAuth session and the
+    request was billed as `api_key`. The OAuth marker now wins for both auth and billing.
+  - `/v1/chat/completions/` (trailing slash) missed every exact-equality route predicate
+    and landed on the Anthropic upstream carrying the OpenAI bearer. Pathnames are
+    normalised once, before any predicate runs.
+  `tests/auth-routing.test.ts` fails 8/11 against the pre-change code.
+- A second review pass (gpt-6-astra) found three more, now fixed and pinned (those tests fail
+  against the first pass, which still passes its own 11):
+  - `x-api-key` was never shape-checked — only `Authorization` was — so an Anthropic key
+    sent alongside a `grok-*` body still reached api.x.ai. It is dropped on that lane.
+  - Suppressing key injection keyed on the `anthropic-beta` marker ALONE, so a request
+    carrying the header but no credential got no key at all and 401'd. Suppression now
+    requires a real Anthropic OAuth bearer; the marker by itself is not a credential.
+  - Normalising the trailing slash mutated `url.pathname` in place, which also rewrote the
+    FORWARDED path (`/anthropic/v1/messages/` reached the gateway without its slash).
+    Routing uses a separate normalised pathname; the client's path is forwarded untouched.
+- Credential sanitisation is now ONE choke point instead of three per-lane branches:
+  `sanitizeCredentialHeaders(headers, provider)` runs once per request, just before the
+  upstream fetch, and strips every credential header that provably belongs to a provider
+  OTHER than the destination — `authorization`, `x-api-key`, `chatgpt-account-id`,
+  `cookie`, `proxy-authorization`, plus `api-key` (Azure) and `x-goog-api-key` (Google),
+  none of which any built-in lane inspected before.
+  The rule is DENY-KNOWN-FOREIGN, not allow-known-own: a token whose shape names no provider
+  is forwarded, because stripping it would 401 the operator's own lane the day a provider
+  changes token format, and no leak we measured involved an unrecognisable credential. The
+  repo's pre-existing `tests/gateway.test.ts` already depended on this (it sends an opaque
+  `Bearer codex-test-secret` to the ChatGPT backend and asserts it arrives).
+  Two deliberate asymmetries, both grounded in existing code rather than preference: a
+  configured gateway (`provider: 'cloudflare-ai-gateway'`) and provider-prefixed paths are
+  exempt, because the gateway owns its own auth; and an `sk-` key is foreign to the ChatGPT
+  backend (`resolveUpstreams` already throws on that pairing) while a ChatGPT token on the
+  api.openai.com lane is same-vendor and merely useless, so it passes.
+- `Buffer.byteLength` is gone from `src/core/proxy.ts` (it does not exist on Workers, and
+  this repo builds one); both call sites use `TextEncoder`. One predates this change.
+- `fetchUpstreamCodexModels` forwards only a ChatGPT session token (it previously
+  forwarded any non-Anthropic bearer, including a Grok CLI's SuperGrok JWT), declines when
+  an `x-api-key` is present, passes 401/403 through so an expired session is visible
+  instead of masked by a stale list, and rejects a 200 whose JSON is not a models catalog.
+
+### Fixed
+- `/v1/models` advertised only the compression scope, so a model could not be
+  listed for clients without also enabling imaging on it (-294% on GPT lanes).
+  It now advertises the compression scope UNION every registered profile, and
+  every entry carries `slug`. Compression scope itself is unchanged.
+- Codex's `/model` picker showed a stale built-in list: codex decodes the models
+  response into a struct requiring `slug`, `display_name`, `context_window`, ...
+  and the synthesized four-field entries failed to parse ("failed to refresh
+  available models: missing field `slug`"). For a caller presenting a
+  non-Anthropic bearer, `GET /v1/models` is now forwarded to the OpenAI upstream
+  with the caller's own query string (codex sends `client_version` itself); any
+  failure falls back to the synthesized list. `PXPIPE_DEBUG_MODELS=1` logs why a
+  request was not forwarded.
+- `applyProfileMap` collapsed complete config profiles that differ only by a
+  reasoning-tier suffix (`-high|-medium|-low`) onto whichever registered first,
+  because every key was resolved through `normalizeModelId`, which strips that
+  suffix. A complete profile (own `canonicalId` + `family`) now resolves by exact
+  id; partial overrides keep alias resolution. Pinned by
+  `tests/model-registry-tier-collision.test.ts`.
+- `/v1/models/<id>` returned a disturbed stream after the body had been read for the
+  data/models augmentation, which threw a TypeError and surfaced as a 500 on a valid
+  request. The already-read text is returned instead.
+- A client that disconnected mid-stream did not stop the upstream: the request carried no
+  abort signal, so generation continued and billed for output nobody received. The client
+  socket now aborts the upstream fetch and both count_tokens probes, and an aborted
+  request is not retried or logged as an upstream failure.
+- `waitForDrain` leaked the losing `once()` listener on every backpressured chunk
+  (MaxListenersExceededWarning on long streams).
+- Event-log rotation used `renameSync` onto an existing `.1`, which fails on Windows
+  (EEXIST/EPERM), so the log grew past its cap forever. The previous generation is removed
+  first.
+- AGY Gemini Flash 3.5-3.7 carried Gemini 2.x numbers: `0.15/0.60` per Mtok and a
+  2,097,152 context. Sourced 2026-09-05 (Google Cloud pricing page, DeepMind model cards),
+  3.6/3.7 are $0.75/$3.75 introductory ($1.50/$7.50 from 2027-01-01), cached $0.075, and
+  every Flash tier 3.5-3.8 is 1,048,576 ctx / 65,536 out. 3.1 Pro keeps its 2M window.
+
+### Added
+- Builtin profiles for `agy-gemini-3.8-flash-{high,medium,low}`. The AGY proxy
+  has served them since 2026-09-02; without profiles they billed as `unknown`
+  through the dynamic fallback. Priced at Google's published introductory rate
+  ($0.75 / $3.75 per Mtok, cached $0.075, 1,048,576 ctx, 65,536 out), which
+  rises to $1.50 / $7.50 on 2027-01-01.
+
 ### Changed
 - `gpt-5.6-sol` is now opt-in rather than silently enabled. Its exact profile
   remains available when selected, and sibling 5.6 variants do not inherit it.

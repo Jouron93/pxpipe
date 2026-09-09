@@ -26,6 +26,8 @@ function ev(partial: Partial<TrackEvent>): TrackEvent {
     path: '/v1/messages',
     status: 200,
     duration_ms: 100,
+    billing_lane: 'local',
+    billing_lane_source: 'local_origin',
     ...partial,
   };
 }

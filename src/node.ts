@@ -12,7 +12,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import {
+  createProxy,
+  parseGatewayHeaders,
+  resolveUpstreams,
+  type BillingLane,
+  type ProxyConfig,
+} from './core/proxy.js';
 import {
   parseExportArgv,
   runExportCore,
@@ -31,6 +37,8 @@ import {
   dashboardPath,
   type DashboardRoute,
 } from './dashboard.js';
+import { applyRuntimeConfigOverrides } from './core/model-registry.js';
+import { fetchUpstreamCodexModels } from './core/codex-models.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -44,11 +52,21 @@ interface RuntimeConfig {
   host: string;
   upstream: string;
   openAIUpstream: string;
+  xaiUpstream: string;
+  agyUpstream?: string;
+  lmStudioUpstream?: string;
+  nimUpstream?: string;
   openAIApiKey?: string;
+  xaiApiKey?: string;
   provider?: 'cloudflare-ai-gateway';
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
+  captureRequestBodiesOn4xx: boolean;
+  agyMonthlySubscriptionUsd: number | null;
+  claudeMonthlySubscriptionUsd: number | null;
+  codexMonthlySubscriptionUsd: number | null;
+  billingLanes: Partial<Record<'anthropic' | 'openai' | 'passthrough', BillingLane>>;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -64,16 +82,28 @@ function normalizeModelsConfig(value: unknown): string | undefined {
 
 function applyConfigFileDefaults(): void {
   const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
-  if (!fs.existsSync(file)) return;
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
-  } catch (e) {
-    console.warn(`[pxpipe] ignored invalid config ${file}: ${(e as Error).message}`);
+  if (fs.existsSync(file)) {
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
+    } catch (e) {
+      console.warn(`[pxpipe] ignored invalid config ${file}: ${(e as Error).message}`);
+      return;
+    }
+  } else if (process.env.PXPIPE_CONFIG && process.env.PXPIPE_CONFIG.trim().startsWith('{')) {
+    try {
+      parsed = JSON.parse(process.env.PXPIPE_CONFIG) as unknown;
+    } catch {
+      // Ignore invalid JSON string
+    }
+  } else {
     return;
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
   const cfg = parsed as Record<string, unknown>;
+
+  // Apply per-model configuration overrides to model-registry
+  applyRuntimeConfigOverrides(cfg);
 
   // Env wins over file config. The dashboard can still override the scope at
   // runtime (in-memory) for an emergency live flip.
@@ -81,6 +111,72 @@ function applyConfigFileDefaults(): void {
     const models = normalizeModelsConfig(cfg.models);
     if (models !== undefined) process.env.PXPIPE_MODELS = models;
   }
+  if (process.env.PXPIPE_AGY_MONTHLY_USD === undefined) {
+    const monthly = cfg.agy_monthly_subscription_usd;
+    if (typeof monthly === 'number' || typeof monthly === 'string') {
+      process.env.PXPIPE_AGY_MONTHLY_USD = String(monthly);
+    }
+  }
+  if (process.env.PXPIPE_CLAUDE_MONTHLY_USD === undefined) {
+    const monthly = cfg.claude_max_monthly_subscription_usd ?? cfg.claude_monthly_subscription_usd;
+    if (typeof monthly === 'number' || typeof monthly === 'string') {
+      process.env.PXPIPE_CLAUDE_MONTHLY_USD = String(monthly);
+    }
+  }
+  if (process.env.PXPIPE_CODEX_MONTHLY_USD === undefined) {
+    const monthly = cfg.codex_monthly_subscription_usd;
+    if (typeof monthly === 'number' || typeof monthly === 'string') {
+      process.env.PXPIPE_CODEX_MONTHLY_USD = String(monthly);
+    }
+  }
+  if (process.env.PXPIPE_MIN_BODY_BYTES === undefined) {
+    const minBytes = cfg.min_body_bytes ?? cfg.min_compress_body_bytes;
+    if (typeof minBytes === 'number' || typeof minBytes === 'string') {
+      process.env.PXPIPE_MIN_BODY_BYTES = String(minBytes);
+    }
+  }
+  if (process.env.XAI_API_KEY === undefined && typeof cfg.xai_api_key === 'string') {
+    process.env.XAI_API_KEY = cfg.xai_api_key;
+  }
+  const laneKeys = [
+    ['PXPIPE_ANTHROPIC_BILLING_LANE', 'anthropic_billing_lane'],
+    ['PXPIPE_OPENAI_BILLING_LANE', 'openai_billing_lane'],
+    ['PXPIPE_PASSTHROUGH_BILLING_LANE', 'passthrough_billing_lane'],
+  ] as const;
+  for (const [envKey, configKey] of laneKeys) {
+    if (process.env[envKey] === undefined && typeof cfg[configKey] === 'string') {
+      process.env[envKey] = String(cfg[configKey]);
+    }
+  }
+}
+
+function parsePositiveUsd(value: string | undefined, label: string): number | null {
+  if (value === undefined || value.trim() === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(`[pxpipe] ignored invalid ${label}: ${value}`);
+    return null;
+  }
+  return parsed;
+}
+
+const BILLING_LANES = new Set<BillingLane>([
+  'agy_ultra_subscription',
+  'claude_max_subscription',
+  'codex_subscription',
+  'grok_subscription',
+  'nvidia_build_free',
+  'api_key',
+  'local',
+  'unknown',
+]);
+
+function parseBillingLane(value: string | undefined, label: string): BillingLane | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const lane = value.trim() as BillingLane;
+  if (BILLING_LANES.has(lane)) return lane;
+  console.warn(`[pxpipe] ignored invalid ${label}: ${value}`);
+  return undefined;
 }
 
 function parseCli(argv: string[]): RuntimeConfig {
@@ -110,13 +206,47 @@ function parseCli(argv: string[]): RuntimeConfig {
     host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+    xaiUpstream: process.env.XAI_UPSTREAM ?? 'https://api.x.ai',
+    agyUpstream: process.env.AGY_UPSTREAM ?? 'http://127.0.0.1:4017',
+    lmStudioUpstream: process.env.LMSTUDIO_UPSTREAM ?? 'http://127.0.0.1:1234',
+    nimUpstream: process.env.NIM_UPSTREAM ?? 'https://integrate.api.nvidia.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
+    xaiApiKey: process.env.XAI_API_KEY,
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
+    captureRequestBodiesOn4xx: /^(1|true|yes|on)$/i.test(
+      process.env.PXPIPE_CAPTURE_4XX_REQUEST_BODIES ?? '',
+    ),
+    agyMonthlySubscriptionUsd: parsePositiveUsd(
+      process.env.PXPIPE_AGY_MONTHLY_USD,
+      'PXPIPE_AGY_MONTHLY_USD',
+    ),
+    claudeMonthlySubscriptionUsd: parsePositiveUsd(
+      process.env.PXPIPE_CLAUDE_MONTHLY_USD,
+      'PXPIPE_CLAUDE_MONTHLY_USD',
+    ),
+    codexMonthlySubscriptionUsd: parsePositiveUsd(
+      process.env.PXPIPE_CODEX_MONTHLY_USD,
+      'PXPIPE_CODEX_MONTHLY_USD',
+    ),
+    billingLanes: {
+      anthropic: parseBillingLane(
+        process.env.PXPIPE_ANTHROPIC_BILLING_LANE,
+        'PXPIPE_ANTHROPIC_BILLING_LANE',
+      ),
+      openai: parseBillingLane(
+        process.env.PXPIPE_OPENAI_BILLING_LANE,
+        'PXPIPE_OPENAI_BILLING_LANE',
+      ),
+      passthrough: parseBillingLane(
+        process.env.PXPIPE_PASSTHROUGH_BILLING_LANE,
+        'PXPIPE_PASSTHROUGH_BILLING_LANE',
+      ),
+    },
   };
 }
 
@@ -154,8 +284,13 @@ Environment:
   ANTHROPIC_UPSTREAM      Anthropic API base; overrides PXPIPE_UPSTREAM
                            (default https://api.anthropic.com)
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
-                           (default https://api.openai.com)
+                           (default https://api.openai.com). Codex keeps this;
+                           Grok models re-route per-request to XAI_UPSTREAM.
+  XAI_UPSTREAM            xAI API base for grok-* models on /v1/responses and
+                           /v1/chat/completions (default https://api.x.ai)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
+  XAI_API_KEY             xAI key / OAuth JWT injected for every grok-* request
+                           (required for grok-4.5 to work through the proxy)
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
@@ -164,16 +299,35 @@ Environment:
                           default claude-fable-5 (Sol/Opus/GPT-5.5/Grok opt-in);
                           off disables
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
-                          supports {"models": [...]} or {"models": "off"}
+                          supports models plus fixed subscription prices
+  PXPIPE_AGY_MONTHLY_USD  fixed AGY subscription price used for API-equivalent
+                          break-even accounting (no per-request cash claim)
+  PXPIPE_CLAUDE_MONTHLY_USD fixed Claude Max subscription price for the same
+                          API-equivalent break-even accounting
+  PXPIPE_CODEX_MONTHLY_USD fixed Codex/ChatGPT subscription price for the same
+                          API-equivalent break-even accounting
+  PXPIPE_*_BILLING_LANE   optional trusted route attribution for ANTHROPIC,
+                          OPENAI, or PASSTHROUGH; configured routes take precedence
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
+  PXPIPE_CAPTURE_4XX_REQUEST_BODIES
+                          debug only: retain full transformed request bodies on
+                          upstream 4xx (default off; may contain sensitive data)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
 
+Use with Codex/ChatGPT OAuth:
+  OPENAI_UPSTREAM=https://chatgpt.com/backend-api/codex
+  Configure Codex base_url=http://127.0.0.1:47821/v1 and leave OPENAI_API_KEY unset
+
 Use with OpenAI-compatible GPT clients:
   OPENAI_BASE_URL=http://127.0.0.1:47821/v1
+
+Use with Grok CLI (compress + forward to api.x.ai; keep xAI auth):
+  PXPIPE_MODELS=...,grok-4.5
+  GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:47821/v1
 `);
 }
 
@@ -192,7 +346,11 @@ function printVersion(): void {
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
 
-function toWebRequest(req: IncomingMessage): Request {
+function toWebRequest(req: IncomingMessage, res: ServerResponse): Request {
+  const controller = new AbortController();
+  res.once('close', () => {
+    if (!res.writableFinished) controller.abort();
+  });
   const proto = (req.headers['x-forwarded-proto'] as string) ?? 'http';
   const host = req.headers.host ?? 'localhost';
   const url = `${proto}://${host}${req.url ?? '/'}`;
@@ -224,6 +382,7 @@ function toWebRequest(req: IncomingMessage): Request {
     method,
     headers,
     body,
+    signal: controller.signal,
     // @ts-expect-error — duplex is required for streamed request bodies in Node 18+
     duplex: hasBody ? 'half' : undefined,
   });
@@ -255,10 +414,20 @@ function isConnectionAbort(err: unknown): boolean {
 }
 
 async function waitForDrain(out: ServerResponse): Promise<void> {
-  const event = await Promise.race([
-    once(out, 'drain').then(() => 'drain'),
-    once(out, 'close').then(() => 'close'),
-  ]);
+  // `once()` installs a listener per call and the race's loser was never removed, so a
+  // long backpressured stream stacked one dangling 'close' listener per chunk
+  // (MaxListenersExceededWarning). Abort the loser; its rejection is swallowed on purpose.
+  const ac = new AbortController();
+  const drain = once(out, 'drain', { signal: ac.signal }).then(
+    () => 'drain' as const,
+    () => 'aborted' as const,
+  );
+  const close = once(out, 'close', { signal: ac.signal }).then(
+    () => 'close' as const,
+    () => 'aborted' as const,
+  );
+  const event = await Promise.race([drain, close]);
+  ac.abort();
   if (event === 'close') throw new Error('client response closed');
 }
 
@@ -324,6 +493,7 @@ async function dispatchDashboard(
   req: IncomingMessage,
   url: URL,
   port: number,
+  healthMeta?: { openAIUpstream: string; anthropicUpstream: string; xaiUpstream?: string },
 ): Promise<Response | undefined> {
   const method = req.method ?? 'GET';
   switch (route.kind) {
@@ -336,6 +506,42 @@ async function dispatchDashboard(
     case 'recent':
       if (method !== 'GET') return undefined;
       return dashboard.serveRecent();
+    case 'health': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      const body = JSON.stringify({
+        ok: true,
+        service: 'pxpipe',
+        upstream_openai: healthMeta?.openAIUpstream ?? '',
+        upstream_anthropic: healthMeta?.anthropicUpstream ?? '',
+        upstream_xai: healthMeta?.xaiUpstream ?? '',
+        pid: process.pid,
+        uptime_s: Math.round(process.uptime() * 10) / 10,
+      });
+      return new Response(method === 'HEAD' ? null : body, {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
+    case 'version': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      return new Response(JSON.stringify({ version: '0.1.0', service: 'pxpipe' }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    case 'props': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      return new Response(JSON.stringify({ props: {} }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    case 'models': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      const upstream = await fetchUpstreamCodexModels(req, url, healthMeta?.openAIUpstream);
+      return upstream ?? dashboard.serveModelsJson();
+    }
     case 'png': {
       if (method !== 'GET') return undefined;
       const idRaw = url.searchParams.get('id');
@@ -488,10 +694,19 @@ class FileTracker implements Tracker {
       this.fd = null;
     }
     try {
-      fs.renameSync(this.filePath, this.filePath + '.1');
+      // POSIX rename overwrites the target; Windows refuses (EEXIST/EPERM) when `.1`
+      // already exists, which every rotation after the first does. That left the log
+      // growing past its cap forever (Gemini 3.8 census, 2026-09-05). Remove the previous
+      // generation first — single-backup rotation is what this always intended.
+      const rotated = this.filePath + '.1';
+      try {
+        fs.rmSync(rotated, { force: true });
+      } catch {
+        /* fall through to the rename attempt */
+      }
+      fs.renameSync(this.filePath, rotated);
     } catch {
-      /* if rename fails (e.g. .1 locked) we'll just keep growing — better
-         than dropping events */
+      /* if rename still fails (e.g. .1 locked) we keep growing — better than dropping events */
     }
     this.bytesWritten = 0;
   }
@@ -921,6 +1136,10 @@ async function main(): Promise<void> {
   const dashboard = new DashboardState({
     eventsFile: opts.eventsFile,
     sidecarDir: bodySidecarDir,
+  }, undefined, {
+    agyMonthlySubscriptionUsd: opts.agyMonthlySubscriptionUsd,
+    claudeMonthlySubscriptionUsd: opts.claudeMonthlySubscriptionUsd,
+    codexMonthlySubscriptionUsd: opts.codexMonthlySubscriptionUsd,
   });
   // Seed the "recent requests" table from the JSONL log so a process restart
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
@@ -932,7 +1151,14 @@ async function main(): Promise<void> {
     gatewayHeaders: opts.gatewayHeaders,
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
+    xaiUpstream: opts.xaiUpstream,
+    agyUpstream: opts.agyUpstream,
+    lmStudioUpstream: opts.lmStudioUpstream,
+    nimUpstream: opts.nimUpstream,
     openAIApiKey: opts.openAIApiKey,
+    xaiApiKey: opts.xaiApiKey,
+    billingLanes: opts.billingLanes,
+    captureRequestBodiesOn4xx: opts.captureRequestBodiesOn4xx,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -978,11 +1204,9 @@ async function main(): Promise<void> {
       const tag = e.info?.compressed
         ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
         : (e.info?.reason ?? '');
-      const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
-      const inputTokens = e.usage?.input_tokens ?? 0;
       const usageTag =
         e.usage !== undefined
-          ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
+          ? ` tokens=${e.usage.input_tokens ?? 'not reported'}+${e.usage.output_tokens ?? 'not reported'} cache_read=${e.usage.cache_read_input_tokens ?? 'not reported'}`
           : '';
       console.log(
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
@@ -1029,6 +1253,13 @@ async function main(): Promise<void> {
     },
   };
   const handle = createProxy(config);
+  const upstreamRoutes = resolveUpstreams(config);
+  const healthMeta = {
+    openAIUpstream: upstreamRoutes.openai,
+    anthropicUpstream: upstreamRoutes.anthropic,
+    xaiUpstream: opts.xaiUpstream,
+    xaiApiKey: opts.xaiApiKey ? 'set' : undefined,
+  };
 
   const server = createServer((req, res) => {
     Promise.resolve()
@@ -1038,17 +1269,18 @@ async function main(): Promise<void> {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const route = dashboardPath(url.pathname);
         if (route) {
-          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
+          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port, healthMeta);
           if (webRes) {
             await writeWebResponse(webRes, res);
             return;
           }
         }
-        const webReq = toWebRequest(req);
+        const webReq = toWebRequest(req, res);
         const webRes = await handle(webReq);
         await writeWebResponse(webRes, res);
       })
       .catch((err) => {
+        if (isConnectionAbort(err) && res.destroyed) return;
         console.error('[pxpipe] handler error:', err);
         if (!res.headersSent) res.statusCode = 500;
         res.end();
@@ -1068,9 +1300,8 @@ async function main(): Promise<void> {
           `Unset HOST to restrict to loopback.`,
       );
     }
-    const routes = resolveUpstreams(config);
-    console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
-    console.log(`[pxpipe] openai upstream → ${routes.openai}`);
+    console.log(`[pxpipe] anthropic upstream → ${upstreamRoutes.anthropic}`);
+    console.log(`[pxpipe] openai upstream → ${upstreamRoutes.openai}`);
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
   });

@@ -12,7 +12,7 @@
  */
 
 import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
-import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER, type RenderStyle } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
 
@@ -63,6 +63,10 @@ export interface HistoryCollapseOptions {
    *  (system-prompt + tool-docs images) so its cache_control anchor stays at the front
    *  and isn't swept into the history image as [image] placeholders. Default 0. */
   protectedPrefix: number;
+  /** Render style for the collapsed-history images. Unset = DENSE_RENDER_STYLE
+   *  (validated 5×8). Threaded per-model from transformRequest via the
+   *  PXPIPE_GPT_PROFILES env map (envStyleOverride). @jules */
+  style?: RenderStyle;
   /** Reflow the transcript before RENDERING: pack soft-wrapped lines and mark
    *  every hard newline with the ↵ sentinel — same treatment as the static slab.
    *  History text is newline-heavy (role headers, JSON args), so without this
@@ -604,7 +608,7 @@ export async function collapseHistory(
       chunkRender,
       DENSE_CONTENT_COLS,
       DENSE_CONTENT_CHARS_PER_IMAGE,
-      { ...DENSE_RENDER_STYLE, colorByRole: true },
+      { ...(o.style ?? DENSE_RENDER_STYLE), colorByRole: true },
       undefined,
       chunkSlot,
     );

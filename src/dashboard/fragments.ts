@@ -1,8 +1,11 @@
 // Server-rendered HTML dashboard — htmx polls fragments, Alpine drives the toast tray.
 // Presentation only; server code (src/dashboard.ts, src/node.ts) needs no edits.
+// Coordination: @jules
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
+import { canEnableFromDashboard, readerValidation } from '../core/applicability.js';
+import { getAllModelProfiles, resolveModelProfile, type PxpipeModelProfile } from '../core/model-registry.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -11,6 +14,7 @@ import type {
   SessionRow,
   FullStatsPayload,
   CurrentSessionPayload,
+  SubscriptionStats,
 } from './types.js';
 
 // ---- helpers --------------------------------------------------------
@@ -50,16 +54,44 @@ function shortPath(p: string | null | undefined): string {
   return parts[parts.length - 1] || p;
 }
 
+/** Format context window tokens into compact UI badge string (e.g. '1M', '2M', '262K', '128K', '524K', '500K', '200K'). */
+export function formatContextBadge(tokens: number | null | undefined): string {
+  if (tokens == null || tokens <= 0) return '';
+  const v = Math.round(Number(tokens));
+
+  // Canonical overrides for standard LLM context window bounds
+  if (v === 2_097_152) return '2M';
+  if (v === 1_048_576 || v === 1_050_000 || v === 1_000_000) return '1M';
+  if (v === 524_288) return '524K';
+  if (v === 500_000) return '500K';
+  if (v === 262_144) return '262K';
+  if (v === 200_000) return '200K';
+  if (v === 131_072 || v === 128_000) return '128K';
+
+  if (v >= 1_000_000) {
+    const m = v / 1_000_000;
+    return `${Math.round(m)}M`;
+  }
+  if (v >= 1000) {
+    if (v % 1024 === 0 && (v / 1024) <= 128) {
+      return `${v / 1024}K`;
+    }
+    const k = v / 1000;
+    return `${Math.round(k)}K`;
+  }
+  return String(v);
+}
+
 // ---- compression toggle (kill switch) ------------------------------------
 
 export function renderToggleFragment(enabled: boolean): string {
   // NOTE: "PASSTHROUGH MODE", "Disable compression", "Enable compression" are asserted by tests.
   const banner = enabled
-    ? ''
-    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Every request goes to Claude unchanged: no images, no savings. Use this to A/B test, or if the upstream API is having problems.</div>`;
+      ? ''
+    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Every inference request goes upstream unchanged: no images, no savings. Use this to A/B test, or if the upstream API is having problems.</div>`;
   // Button POSTs the OPPOSITE of current state; 2s poll keeps it fresh.
   const confirm = enabled
-    ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to Claude, unchanged. Restarting the proxy turns it back on."`
+    ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to the configured upstream, unchanged. Restarting the proxy turns it back on."`
     : '';
   return (
     banner +
@@ -73,93 +105,104 @@ export function renderToggleFragment(enabled: boolean): string {
   );
 }
 
+// Seat labels (john=Claude 20x / Codex OAuth john; orn=Claude Pro / Codex OAuth orn).
+// Wire id is unchanged — two seats can share one model id.
+const ACCOUNT_CHIP_LABEL: Record<string, string> = {
+  'claude-fable-5': 'claude-john-fable',
+  'claude-opus-5': 'claude-john|orn-opus',
+  'claude-sonnet-5': 'claude-john|orn-sonnet',
+  'gpt-5.6-sol': 'codex-john|orn-sol',
+  'gpt-5.6-terra': 'codex-john|orn-terra',
+  'gpt-5.6-luna': 'codex-john|orn-luna',
+};
+
 // ---- compress scope (which models get imaged) ----------------------------
-
-/** Chip catalog — UNION with env scope + active set, so env-var models stay toggleable. Labels are cosmetic. */
-const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'claude-fable-5', label: 'Fable 5' },
-  { id: 'claude-opus-4-8', label: 'Opus 4.8' },
-  { id: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { id: 'claude-sonnet-5', label: 'Sonnet 5' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-];
-
-const GPT_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol' },
-  { id: 'gpt-5.5', label: 'GPT 5.5' },
-];
-
-const GROK_MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
-  { id: 'grok-4.5', label: 'Grok 4.5' },
-];
 
 export function renderModelsFragment(
   active: string[],
   configured: string[],
   enabled: boolean,
 ): string {
-  const on = new Set(active);
-  const labelOf = new Map(
-    [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG].map((m) => [m.id, m.label]),
-  );
-  // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
-  // families always show as toggles, then split by family for the two sections.
-  const ids: string[] = [];
-  const seen = new Set<string>();
-  for (const id of [
-    ...MODEL_CATALOG.map((m) => m.id),
-    ...GPT_MODEL_CATALOG.map((m) => m.id),
-    ...GROK_MODEL_CATALOG.map((m) => m.id),
-    ...configured,
-    ...active,
-  ]) {
-    if (id && !seen.has(id)) {
-      seen.add(id);
-      ids.push(id);
+  const on = new Set(active.map((a) => a.toLowerCase()));
+  const registeredProfiles = getAllModelProfiles();
+
+  const profiles: PxpipeModelProfile[] = [...registeredProfiles];
+  const seen = new Set<string>(registeredProfiles.map((p) => p.canonicalId.toLowerCase()));
+
+  for (const id of [...configured, ...active]) {
+    if (!id) continue;
+    const lower = id.toLowerCase();
+    if (!seen.has(lower)) {
+      const resolved = resolveModelProfile(id);
+      if (resolved && !seen.has(resolved.canonicalId.toLowerCase())) {
+        seen.add(resolved.canonicalId.toLowerCase());
+        profiles.push(resolved);
+      }
     }
   }
-  const chipFor = (id: string): string => {
-    const lit = on.has(id);
-    const label = labelOf.get(id) ?? id;
+
+  const chipFor = (p: PxpipeModelProfile): string => {
+    const id = p.canonicalId;
+    const lowerId = id.toLowerCase();
+    const lit = on.has(lowerId);
+    const label = ACCOUNT_CHIP_LABEL[id] || p.displayName || id;
+    const badge = formatContextBadge(p.contextWindowTokens);
+    const badgeHtml = badge ? `<span class="badge-ctx">${badge}</span>` : '';
+
+    if (!lit && !canEnableFromDashboard(id)) {
+      const v = readerValidation(id);
+      return (
+        `<button class="chip locked" type="button" disabled ` +
+        `title="${escapeHtml(`${v.status}: ${v.note} — set PXPIPE_MODELS to override`)}">` +
+        `${escapeHtml(label)}${badgeHtml} 🔒</button>`
+      );
+    }
     return (
       `<button class="chip${lit ? ' on' : ''}" type="button" ` +
       `hx-post="/fragments/models" hx-target="#frag-models" ` +
-      `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
+      `hx-vals='{"model":"${escapeHtml(id)}","on":${!lit}}'>` +
+      `${escapeHtml(label)}${badgeHtml}${lit ? ' ✓' : ''}</button>`
     );
   };
-  const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
-  const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
-  const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
-  const otherChips = ids
-    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok'))
-    .map(chipFor)
-    .join('');
+
+  const claudeChips = profiles.filter((p) => p.family === 'claude').map(chipFor).join('');
+  const gptChips = profiles.filter((p) => p.family === 'openai').map(chipFor).join('');
+  const grokChips = profiles.filter((p) => p.family === 'grok').map(chipFor).join('');
+  const agyChips = profiles.filter((p) => p.family === 'agy' || p.family === 'gemini').map(chipFor).join('');
+  const nvidiaChips = profiles.filter((p) => p.family === 'nvidia').map(chipFor).join('');
+
   const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
+
   return (
     `<div class="models">` +
-    `<span class="models-label">Image Claude models</span>` +
+    `<span class="models-label">claude-john-20x / claude-orn-pro</span>` +
     claudeChips +
-    `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS</span>${moot}` +
+    `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS · 🔒 = weak/unvalidated imaged-reader (FINDINGS.md), env opt-in only</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image Grok models</span>` +
+    `<span class="models-label">codex-john / codex-orn</span>` +
+    gptChips +
+    `<span class="hint">imaging only, no Anthropic cache_control · set PXPIPE_MODELS to persist</span>${moot}` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">xai-oauth-grok</span>` +
     grokChips +
-    otherChips +
     `<span class="hint">opt-in only · OpenAI Responses path · set PXPIPE_MODELS to persist</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image GPT models</span>` +
-    gptChips +
-    `<span class="hint">imaging only, no Anthropic cache_control · one scope for all families · set PXPIPE_MODELS (CSV of bases, or off) to persist</span>${moot}` +
+    `<span class="models-label">Image AGY Proxy models</span>` +
+    agyChips +
+    `<span class="hint">imaging only · set PXPIPE_MODELS to persist</span>${moot}` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">Image NVIDIA NIM Flagships</span>` +
+    nvidiaChips +
+    `<span class="hint">imaging only · set PXPIPE_MODELS to persist</span>${moot}` +
     `</div>`
   );
 }
 
 // ---- session hero --------------------------------------------------------
-
-// Must stay in lockstep with ASSUMED_INPUT_USD_PER_MTOK in src/dashboard.ts.
-const INPUT_USD_PER_MTOK = 10.0;
-void INPUT_USD_PER_MTOK; // suppress unused-var; renderHeaderFragment uses the server's pricing block.
 
 // Lifetime hero. Reads the SAME cumulative weighted totals as the header strip
 // (serveStats), so the headline and the "$ saved" tiles can never disagree, and
@@ -173,7 +216,7 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
       `<div class="hero hero-empty">` +
       `<div class="hero-eyebrow">Since start</div>` +
       `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy and send a message. The moment a request flows through, your running savings show up right here.</div>` +
+      `<div class="hero-sub">Point a supported inference client at this proxy and send a message. The moment a measured request flows through, your running savings show up right here.</div>` +
       `</div>`
     );
   }
@@ -184,8 +227,10 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
   // Input-only: pxpipe never touches output, so lumping it in just dampened the %.
   const baselineW = s.baseline_input_weighted ?? 0; // same context as text, cache-aware
   const actualW = s.actual_input_weighted ?? 0; // what we actually sent, cache-aware
-  const outMult = s.pricing_assumptions?.output_multiplier || 5;
-  const rawOutput = (s.output_weighted ?? 0) / outMult; // reply — never compressed
+  const outMult = s.pricing_assumptions?.output_multiplier;
+  const outputNote = outMult && outMult > 0
+    ? `${kFmt((s.output_weighted ?? 0) / outMult)} output tokens untouched`
+    : 'output untouched; mixed-model output is priced per event';
   const inputPct = baselineW > 0 ? (1 - actualW / baselineW) * 100 : 0;
   const positive = inputPct >= 0;
   const bigNum = `${Math.abs(inputPct).toFixed(0)}%`;
@@ -198,11 +243,11 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
     `<div class="hero-sub">` +
     `<strong>${kFmt(actualW)}</strong> effective tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
     `stayed plain text — both counted after normal cache discounts since this proxy started. ` +
-    `Your latest messages and Claude's live output are never compressed.` +
+    `Your latest messages and the model's live output are never compressed.` +
     `</div>` +
     `<div class="hero-meta">` +
     `Cache-aware — cached reads counted at their real ~0.1× weight, not full price · ` +
-    `output untouched (${kFmt(rawOutput)}) · no $ assumptions` +
+    `${outputNote} · no cash-billing claim` +
     `</div>` +
     `</div>`
   );
@@ -211,8 +256,29 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
 // ---- stat strip + "Show the math" drawer ----------------------------------
 
 function mathRow(key: string, val: number | string | undefined, note = ''): string {
-  const v = typeof val === 'number' ? numFmt(val) : String(val ?? '-');
+  const v = typeof val === 'number' ? numFmt(val) : String(val ?? 'not available');
   return `<div><span class="k">${key}:</span> <span class="v">${escapeHtml(v)}</span> <span class="k">${note}</span></div>`;
+}
+
+function renderRateCards(s: StatsPayload): string {
+  const cards = s.pricing_assumptions.rate_cards ?? [];
+  if (cards.length === 0) {
+    return `<span class="src">No authoritative per-event rate card was resolved. Actual subscription charges are not inferred.</span>`;
+  }
+  return cards.map((card) => {
+    const rates = card.input_per_mtok !== undefined && card.output_per_mtok !== undefined
+      ? `$${card.input_per_mtok}/M input · $${card.cached_input_per_mtok ?? card.input_per_mtok}/M cached · $${card.output_per_mtok}/M output`
+      : 'cash rate unavailable';
+    const capacity = card.context_window_tokens !== undefined
+      ? ` · ${numFmt(card.context_window_tokens)} context${card.max_output_tokens !== undefined ? ` · ${numFmt(card.max_output_tokens)} max output` : ''}`
+      : '';
+    const breakEven = card.subscription_break_even_input_tokens !== undefined
+      ? `<div><span class="k">$${s.agy_subscription.monthly_usd?.toFixed(0)} subscription break-even:</span> <span class="v">${numFmt(card.subscription_break_even_input_tokens)} input · ${numFmt(card.subscription_break_even_cached_input_tokens ?? 0)} cached input · ${numFmt(card.subscription_break_even_output_tokens ?? 0)} output tokens</span></div>`
+      : '';
+    return `<div><span class="k">${escapeHtml(card.provider)} / ${escapeHtml(card.model)}:</span> <span class="v">${escapeHtml(card.cost_status)}</span> <span class="k">${escapeHtml(rates + capacity)}</span></div>` +
+      breakEven +
+      (card.note ? `<span class="src">${escapeHtml(card.note)}</span>` : '');
+  }).join('');
 }
 
 function mathBlock(title: string, body: string): string {
@@ -241,26 +307,62 @@ function statTile(
 
 export function renderHeaderFragment(s: StatsPayload, port: number): string {
   const pa = s.pricing_assumptions;
+  const hasPriced = pa.priced_requests > 0;
 
   // stat strip
   const splitReady = s.split_sufficient_sample;
   const cAvg = s.compressed_avg_usd_per_request ?? 0;
   const pAvg = s.passthrough_avg_usd_per_request ?? 0;
-  const costTile = splitReady
+  const costTile = !hasPriced
     ? statTile(
-        'Cost per request',
+        'API-equivalent / request',
+        'not priced',
+        `${numFmt(pa.unpriced_requests)} usage row${pa.unpriced_requests === 1 ? '' : 's'} lack an authoritative rate or route`,
+        'muted-val',
+        'PXPipe will not invent a cash price for OAuth subscriptions, local allocations, missing usage, or unknown routes.',
+      )
+    : splitReady
+    ? statTile(
+        'API-equivalent / request',
         `$${cAvg.toFixed(4)}`,
         `vs $${pAvg.toFixed(4)} without pxpipe`,
         cAvg <= pAvg ? 'pos' : 'neg',
-        'Average real cost of a request with imaging on vs off (passthrough), measured on your own traffic.',
+        'Public API list-price equivalent for priced rows only. This is not an OAuth subscription charge or local-compute bill.',
       )
     : statTile(
-        'Cost per request',
+        'API-equivalent / request',
         'collecting…',
-        `${numFmt(s.compressed_paid_requests)} imaged · ${numFmt(s.passthrough_paid_requests)} passthrough so far`,
+        `${numFmt(s.compressed_priced_requests)} imaged · ${numFmt(s.passthrough_priced_requests)} passthrough priced rows`,
         'muted-val',
-        `Needs at least ${s.split_min_sample_per_bucket} paid requests on each path before the comparison is trustworthy.`,
+        `Needs at least ${s.split_min_sample_per_bucket} priced requests on each path. Unpriced OAuth/local rows are excluded, not treated as zero.`,
       );
+
+  const savedValue = hasPriced ? `$${(s.api_equivalent_saved_usd ?? 0).toFixed(2)}` : 'not priced';
+  const savedSub = hasPriced
+    ? `${numFmt(pa.priced_requests)} priced · ${numFmt(pa.unpriced_requests)} unpriced usage rows`
+    : 'token savings measured; cash equivalent unavailable';
+  const subscriptionTile = (
+    label: string,
+    stats: SubscriptionStats,
+    configHint: string,
+  ) => stats.monthly_usd !== null
+    ? statTile(
+        `${label} subscription value`,
+        `${(stats.break_even_pct ?? 0).toFixed(1)}%`,
+        `$${stats.api_equivalent_used_usd.toFixed(2)} API-equivalent / $${stats.monthly_usd.toFixed(2)} fixed monthly`,
+        (stats.break_even_pct ?? 0) >= 100 ? 'pos' : '',
+        `Break-even compares measured ${label} traffic at public API list rates with the configured fixed subscription price. It is value accounting, not a per-request cash charge.`,
+      )
+    : statTile(
+        `${label} subscription value`,
+        'not configured',
+        `$${stats.api_equivalent_used_usd.toFixed(2)} API-equivalent measured · ${numFmt(stats.usage_requests)} requests`,
+        'muted-val',
+        configHint,
+      );
+  const agy = s.agy_subscription;
+  const claude = s.claude_subscription;
+  const codex = s.codex_subscription;
 
   const strip =
     `<div class="strip">` +
@@ -273,12 +375,15 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
       'Bulky context (system prompt, tool output, old turns) sent as compact images instead of text. Cache-aware, input side only — recent turns and the live output stay text.',
     ) +
     statTile(
-      'Estimated saved',
-      `$${(s.saved_usd ?? 0).toFixed(2)}`,
-      `at $${pa.input_per_mtok}/M input tokens`,
+      'API-equivalent saved',
+      savedValue,
+      savedSub,
       '',
-      'A rough dollar figure: saved tokens × the input price. Actual savings depend on your plan and caching — see the math drawer.',
+      'Sum of each priced event using its resolved public API rate card. OAuth/subscription and local-allocation costs are not inferred.',
     ) +
+    subscriptionTile('AGY Ultra', agy, 'Set PXPIPE_AGY_MONTHLY_USD or agy_monthly_subscription_usd in the PXPipe config.') +
+    subscriptionTile('Claude Max', claude, 'Set PXPIPE_CLAUDE_MONTHLY_USD or claude_max_monthly_subscription_usd in the PXPipe config.') +
+    subscriptionTile('Codex', codex, 'Set PXPIPE_CODEX_MONTHLY_USD or codex_monthly_subscription_usd in the PXPipe config.') +
     costTile +
     `</div>`;
 
@@ -293,18 +398,19 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<span class="src">output excluded — identical with/without compression</span>`;
 
   const usdMath =
-    `<div><span class="k">formula:</span> <span class="v">$ saved = saved_tokens × $${pa.input_per_mtok}/Mtok</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">API-equivalent saved = Σ event_saved_input × event_input_rate</span></div>` +
     `<div class="sp"></div>` +
-    mathRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)') +
-    mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> saved_tokens × input_rate / 1e6`) +
-    `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
+    mathRow('priced_usage_requests', pa.priced_requests, '(authoritative model rate + usage available)') +
+    mathRow('unpriced_usage_requests', pa.unpriced_requests, '(not coerced to $0)') +
+    mathRow('api_equivalent_saved_usd', hasPriced ? `$${s.api_equivalent_saved_usd.toFixed(4)}` : 'not available') +
+    `<span class="src">${escapeHtml(pa.source)}</span>`;
 
   const splitMath =
-    `<div><span class="k">formula:</span> <span class="v">bucket_$ = (Σ actual_input + Σ output × ${pa.output_multiplier}) × $${pa.input_per_mtok}/Mtok</span></div>` +
-    `<div><span class="k">why:</span> <span class="v">partition the paid-rows set by which path actually ran (compressed vs passthrough). Same $/Mtok on both sides so the rate assumption cancels in the delta. Selection bias (the gate routes each turn) does NOT cancel — read with the sample counts.</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">bucket_$ = Σ event input/cache/output tokens × that event's public API rate card</span></div>` +
+    `<div><span class="k">why:</span> <span class="v">partition priced usage rows by the path that actually ran. Selection bias does not cancel; read the result with the priced sample counts.</span></div>` +
     `<div class="sp"></div>` +
-    mathRow(`compressed (n=${s.compressed_paid_requests})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.compressed_avg_usd_per_request || 0).toFixed(4)}/req`) +
-    mathRow(`passthrough (n=${s.passthrough_paid_requests})`, `$${(s.passthrough_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.passthrough_avg_usd_per_request || 0).toFixed(4)}/req`) +
+    mathRow(`compressed priced (n=${s.compressed_priced_requests})`, hasPriced ? `$${s.compressed_api_equivalent_usd.toFixed(4)}` : 'not available', `total · avg $${s.compressed_avg_usd_per_request.toFixed(4)}/req`) +
+    mathRow(`passthrough priced (n=${s.passthrough_priced_requests})`, hasPriced ? `$${s.passthrough_api_equivalent_usd.toFixed(4)}` : 'not available', `total · avg $${s.passthrough_avg_usd_per_request.toFixed(4)}/req`) +
     mathRow(
       'compressed − passthrough',
       `$${(s.compressed_minus_passthrough_avg_usd || 0).toFixed(4)}/req`,
@@ -312,25 +418,25 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
         ? `(both buckets ≥ ${s.split_min_sample_per_bucket} — delta is meaningful)`
         : `(small sample: need ≥ ${s.split_min_sample_per_bucket} per bucket; treat as noisy)`,
     ) +
-    `<span class="src">no counterfactual, no probe gate — pure observed $/req on each path</span>`;
+    `<span class="src">API-equivalent, not actual subscription cash. Unpriced rows are disclosed and excluded.</span>`;
 
   const pctMath =
-    `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
-    `<div><span class="k">diagnostic, not the headline:</span> <span class="v">this is a counterfactual ("what you WOULD have paid"). It leans on the count_tokens probe, the cache-aware split, and an input-rate assumption. Useful as a sanity check; the real-traffic answer is the compressed-vs-passthrough split above.</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">share_of_model_relative_spend = saved / (all_baseline_equivalent + all_output_price_weighted)</span></div>` +
+    `<div><span class="k">diagnostic, not the headline:</span> <span class="v">this is a counterfactual token-equivalent diagnostic. Mixed models use their own output/input price ratios; it is not a subscription billing meter.</span></div>` +
     `<div class="sp"></div>` +
     mathRow('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
     mathRow('all_baseline_equivalent', s.all_baseline_equivalent_weighted, '(every paid request; baseline on measured + actual on the rest)') +
-    mathRow(`all_output × ${pa.output_multiplier}`, s.all_output_weighted, '(every paid request)') +
+    mathRow('all_output_price_weighted', s.all_output_weighted, '(every usage request; model-relative weighting)') +
     mathRow('share_of_spend', (s.saved_pct_of_all_spend || 0).toFixed(1) + '%', `<span class="op">=</span> saved / counterfactual_total × 100`) +
     mathRow('all_usage_requests', s.all_usage_requests, '(denominator request count — compressed + passthrough + probe-failed)') +
-    `<span class="src">measured numerator, all-rows counterfactual denominator — bounded at 100%</span>`;
+    `<span class="src">measured numerator, all-rows counterfactual denominator; not an OAuth quota claim</span>`;
 
   const tokeqMath =
-    `<div><span class="k">formula:</span> <span class="v">token_equivalent = input + output × ${pa.output_multiplier}</span></div>` +
-    `<div><span class="k">why:</span> <span class="v">matches Anthropic's per-Mtok price ratio ($${pa.input_per_mtok} input vs $${pa.input_per_mtok * pa.output_multiplier} output) — this is what the weekly-limit meter counts.</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">price_weighted_token_equivalent = input + output × event_output/input_rate_ratio</span></div>` +
+    `<div><span class="k">why:</span> <span class="v">normalizes public API input/output economics per event. Providers do not publish a universal OAuth weekly-cap formula, so this must not be read as quota usage.</span></div>` +
     `<div class="sp"></div>` +
     mathRow('actual_token_equivalent', s.actual_token_equivalent) +
-    mathRow('baseline_token_equivalent', s.baseline_token_equivalent, `(unproxied counterfactual, same ×${pa.output_multiplier} on output)`) +
+    mathRow('baseline_token_equivalent', s.baseline_token_equivalent, '(unproxied counterfactual, per-event output weighting)') +
     `<div class="sp"></div>` +
     mathRow('events_with_measurement', s.events_with_measurement, '(events where the SSE/JSON scanner produced char counts)') +
     mathRow('measured_text_chars', s.measured_text_chars, '') +
@@ -339,16 +445,39 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     mathRow('measured_redacted_blocks', s.measured_redacted_block_count, '(opaque encrypted blocks — billed but unmeasurable)') +
     `<span class="src">measured — no estimation</span>`;
 
+  const latestLimit = s.rate_limits.latest;
+  const subscriptionMathRows = (label: string, stats: SubscriptionStats) =>
+    `<div><span class="k">${escapeHtml(label)} configured monthly:</span> <span class="v">${stats.monthly_usd === null ? 'not configured' : `$${stats.monthly_usd.toFixed(2)}`}</span></div>` +
+    mathRow(`${label} API-equivalent used`, `$${stats.api_equivalent_used_usd.toFixed(4)}`) +
+    mathRow(`${label} break-even`, stats.break_even_pct === null ? 'not available' : `${stats.break_even_pct.toFixed(1)}%`) +
+    mathRow(`${label} usage requests`, stats.usage_requests);
+  const subscriptionMath =
+    `<div><span class="k">formula:</span> <span class="v">break_even_pct = measured_lane_API_equivalent_value / fixed_monthly_subscription × 100</span></div>` +
+    `<div><span class="k">meaning:</span> <span class="v">100% means measured traffic on that billing lane equals its subscription price at public API list rates. It does not claim the provider charged that amount.</span></div>` +
+    `<div class="sp"></div>` +
+    subscriptionMathRows('AGY Ultra', agy) +
+    subscriptionMathRows('Claude Max', claude) +
+    subscriptionMathRows('Codex', codex) +
+    `<div class="sp"></div>` +
+    mathRow('observed 429 responses', s.rate_limits.responses_429) +
+    mathRow('responses with limit headers', s.rate_limits.responses_with_headers) +
+    (latestLimit
+      ? mathRow('latest observed limit', latestLimit.retry_after ?? latestLimit.request_reset ?? latestLimit.token_reset ?? 'headers present', `(status ${latestLimit.status}${latestLimit.model ? ` · ${escapeHtml(latestLimit.model)}` : ''})`)
+      : '') +
+    `<span class="src">Only observed response headers and 429s are reported; unpublished quota caps are not invented.</span>`;
+
   const drawer =
     `<details class="drawer" id="math-drawer">` +
     `<summary>Show the math &amp; honesty receipts</summary>` +
     `<div class="drawer-intro">Every number above, derived from the same per-event log. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
     `<div class="math-grid">` +
     mathBlock('Input tokens saved', savedMath) +
-    mathBlock('Dollars saved', usdMath) +
-    mathBlock('Compressed vs passthrough, per request', splitMath) +
-    mathBlock('Share of total spend (diagnostic)', pctMath) +
-    mathBlock('Token-equivalent (what the weekly cap counts)', tokeqMath) +
+    mathBlock('API-equivalent dollars saved', usdMath) +
+    mathBlock('API-equivalent compressed vs passthrough', splitMath) +
+    mathBlock('Share of model-relative spend (diagnostic)', pctMath) +
+    mathBlock('API-price-weighted token equivalent', tokeqMath) +
+    mathBlock('Subscription break-even &amp; observed rate limits', subscriptionMath) +
+    mathBlock('Resolved model rate cards', renderRateCards(s)) +
     `</div></details>`;
 
   // NOTE: tests assert the header fragment contains the port number.
@@ -542,18 +671,41 @@ function statusCls(status: number): string {
   return 'good';
 }
 
+function isInferencePath(path: string): boolean {
+  const clean = (path.split('?')[0] ?? '').replace(/\/+$/, '');
+  return /\/(?:messages|responses|chat\/completions)$/.test(clean);
+}
+
+function nonInferenceRole(path: string): string {
+  const clean = (path.split('?')[0] ?? '').replace(/\/+$/, '') || '/';
+  if (/\/models$/.test(clean)) return 'not applicable (model discovery)';
+  if (/\/count_tokens$/.test(clean)) return 'not applicable (token probe)';
+  if (clean === '/' || /\/health$/.test(clean)) return 'not applicable (health check)';
+  if (/\/(?:fragments|api|proxy-)/.test(clean)) return 'not applicable (dashboard/control)';
+  return 'not applicable (non-inference)';
+}
+
 export function renderRecentFragment(p: RecentPayload): string {
-  const rows = (p.recent ?? []).slice().reverse();
+  // This panel is about "what happened to your context" — i.e. inference requests
+  // that could be imaged. Discovery/control probes (/models, /version, /api/tags,
+  // health checks from Ollama-style clients) are non-inference noise that floods the
+  // table during probe bursts; keep them out of this view so real inference is visible.
+  const rows = (p.recent ?? [])
+    .filter((e: RecentRow) => isInferencePath(e.path))
+    .slice()
+    .reverse();
   const body =
     rows.length === 0
-      ? `<tr><td colspan="10" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
+      ? `<tr><td colspan="10" class="empty-cell">No inference requests yet — they stream in here live.</td></tr>`
       : rows
           .map((e: RecentRow, i: number) => {
+            const inference = isInferencePath(e.path);
+            const notApplicable = nonInferenceRole(e.path);
             const viewId = (e.img_ids ?? (e.img_id != null ? [e.img_id] : []))[0];
             const viewLink =
               viewId != null
                 ? `<a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</a>`
-                : `<span class="muted">—</span>`;
+                : `<span class="muted">${inference ? 'not captured' : notApplicable}</span>`;
             const saved = e.session_saved_so_far_delta;
             // A loss that disappears when the newly written prefix is repriced at
             // the read rate is just the one-time cache-create premium — the
@@ -568,28 +720,89 @@ export function renderRecentFragment(p: RecentPayload): string {
             const createNote = createLoss
               ? ` <span class="mk-create" title="Cache-create turn: this loss is the one-time ${CACHE_CREATE_RATE}× premium for writing ${numFmt(cc)} tokens to cache. Later turns re-read that prefix at ${CACHE_READ_RATE}×, which typically recoups it.">create</span>`
               : '';
+            // A passthrough row has no REALISED saving — nothing was imaged, so
+            // pxpipe saved nothing and must not claim otherwise. But the
+            // admission estimator already computed what imaging WOULD have
+            // saved, and that counterfactual is the whole question the operator
+            // is asking. Show it, explicitly marked as an estimate, and never
+            // let it reach a realised-savings total. Empty-cell text is also
+            // corrected: on these rows the baseline is not "unavailable" (the
+            // probe is fine, baseline_probe_status is 'ok' on ~99.6% of rows) —
+            // the request simply was not imaged.
+            const predPct = e.shadow_predicted_savings_pct;
             const savedCell = saved == null
-              ? `<td class="num muted">—</td>`
+              ? predPct != null && inference
+                ? `<td class="num muted"><span class="mk-est" title="Estimate only — this request was NOT imaged, so nothing was actually saved. The admission estimator predicted imaging would have removed ${predPct.toFixed(1)}% of input. Not counted in any realised total.">~${predPct.toFixed(1)}% if imaged</span></td>`
+                : `<td class="num muted">${inference ? 'not imaged' : notApplicable}</td>`
               : saved > 0
                 ? `<td class="num pos">${numFmt(saved)}</td>`
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
-            const imaged = e.cc_added
-              ? `<span class="badge badge-img">image</span>`
-              : `<span class="badge badge-txt">text</span>`;
+            const reasonTitle = e.reason ? ` title="${escapeHtml(e.reason)}"` : '';
+            // "As text" — what this request would have cost as plain text.
+            // baseline_input is cache-aware but is published only on compressed
+            // rows (gated behind creditSaving). baseline_tokens is the raw
+            // text-equivalent and IS present on passthrough rows. Prefer the
+            // cache-aware figure; fall back to the raw one prefixed with ~ so
+            // the two bases are never silently conflated. Previously this cell
+            // rendered the literal 'probe unavailable' on every passthrough row
+            // — i.e. it reported a healthy probe as broken, which read as a
+            // system failure when nothing was wrong.
+            const baselineCell = e.baseline_input != null
+              ? numFmt(e.baseline_input)
+              : e.baseline_tokens != null
+                ? `<span class="mk-raw" title="Raw text-equivalent size (${numFmt(e.baseline_tokens)} tokens), not cache-adjusted. The cache-aware baseline is only computed for imaged requests, so this is the closest honest figure for a passthrough row.">~${numFmt(e.baseline_tokens)}</span>`
+                : inference
+                  ? 'not measured'
+                  : notApplicable;
+            const imaged = !inference
+              ? `<span class="muted">${notApplicable}</span>`
+              : e.cc_added
+              ? `<span class="badge badge-img"${reasonTitle}>image</span>`
+              : `<span class="badge badge-txt"${reasonTitle}>text</span>`;
+            const requestedDiffers = e.requested_model && e.actual_model && e.requested_model !== e.actual_model;
+            // A failed request (401/404/etc.) often has no resolved `model`, but the
+            // client still named one — show requested_model so no-usage rows aren't nameless.
+            const nameFallback = e.model || e.requested_model || e.actual_model || '';
+            const modelCell = inference
+              ? (nameFallback
+                  ? `<code>${escapeHtml(nameFallback)}</code>${requestedDiffers ? `<br><span class="muted">requested ${escapeHtml(e.requested_model!)}</span>` : ''}`
+                  : '<span class="muted">not reported</span>')
+              : `<span class="muted">${notApplicable}</span>`;
+            const usageCell = (value: number | undefined, missing: string): string =>
+              value != null ? numFmt(value) : (inference ? missing : notApplicable);
+            const rowSummary = [
+              `#${i + 1}`,
+              `Result: ${e.status}`,
+              `Endpoint: ${shortPath(e.path)}`,
+              `Model: ${nameFallback || 'N/A'}`,
+              `Sent as: ${!inference ? notApplicable : (e.cc_added ? 'image' : 'text')}`,
+              `Cache Hits: ${e.cache_read != null ? numFmt(e.cache_read) : 'N/A'}`,
+              `As Text: ${e.baseline_input != null ? numFmt(e.baseline_input) : 'N/A'}`,
+              `Sent: ${e.actual_input != null ? numFmt(e.actual_input) : 'N/A'}`,
+              `Saved: ${saved != null ? numFmt(saved) : 'N/A'}`,
+              ...(e.first_byte_ms != null ? [`TTFB: ${Math.round(e.first_byte_ms)}ms`] : []),
+              ...(e.reason ? [`Reason: ${e.reason}`] : []),
+              ...(e.shadow_predicted_savings_pct != null ? [`Pred Savings: ${e.shadow_predicted_savings_pct.toFixed(1)}%`] : [])
+            ].join(' | ');
+            const copyIcon = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+            const copyBtn = `<button class="btn-copy" onclick="copyReq(this)" data-row="${escapeHtml(rowSummary)}" title="Copy request row summary">${copyIcon} Copy</button>`;
+            const actionCell = viewId != null
+              ? `<div class="row-actions"><a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</a> ${copyBtn}</div>`
+              : `<div class="row-actions"><span class="muted">${inference ? 'not captured' : notApplicable}</span> ${copyBtn}</div>`;
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
               `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
               `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
-              `<td>${e.model ? `<code>${escapeHtml(e.model)}</code>` : '<span class="muted">—</span>'}</td>` +
+              `<td>${modelCell}</td>` +
               `<td>${imaged}</td>` +
-              `<td class="num">${e.cache_read != null ? numFmt(e.cache_read) : '—'}</td>` +
-              `<td class="num">${e.baseline_input != null ? numFmt(e.baseline_input) : '—'}</td>` +
-              `<td class="num">${e.actual_input != null ? numFmt(e.actual_input) : '—'}</td>` +
+              `<td class="num">${usageCell(e.cache_read, 'usage not reported')}</td>` +
+              `<td class="num">${baselineCell}</td>` +
+              `<td class="num">${usageCell(e.actual_input, 'usage not reported')}</td>` +
               savedCell +
-              `<td class="num">${viewLink}</td>` +
+              `<td class="num">${actionCell}</td>` +
               `</tr>`
             );
           })
@@ -601,7 +814,7 @@ export function renderRecentFragment(p: RecentPayload): string {
     `<th>Endpoint</th>` +
     `<th>Model</th>` +
     `<th title="Was this request's context compressed into an image?">Sent as</th>` +
-    `<th class="num" title="Tokens served from Claude's cache (cheap)">Cache hits</th>` +
+    `<th class="num" title="Tokens reported as cached by the upstream provider">Provider cache hits</th>` +
     `<th class="num" title="Billing-equivalent input if kept as plain text, after cache create/read rates">As text</th>` +
     `<th class="num" title="Actual billing-equivalent input after imaging, after cache create/read rates">Sent</th>` +
     `<th class="num" title="As-text minus Sent; negative means imaging cost more">Saved/lost</th>` +
@@ -723,7 +936,7 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
   const hitRateEv =
     s.eventsWithBaseline > 0 ? ((s.cacheHitEvents / s.eventsWithBaseline) * 100).toFixed(1) + '%' : '-';
   const charRatio =
-    s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
+    s.origCharsTotal > 0 ? (s.imageBytesTotal / s.origCharsTotal).toFixed(3) + 'x' : '-';
 
   // NOTE: the literal word "requests" is asserted by tests.
   const tr = (k: string, v: string) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`;
@@ -844,6 +1057,37 @@ const CSS = `
   .chip:hover { border-color: var(--flame); color: var(--flame-ink); }
   .chip.on { background: var(--flame-tint); color: var(--flame-ink); border-color: var(--flame);
     font-weight: 600; }
+  .chip.locked { opacity: .45; cursor: not-allowed; }
+  .chip.locked:hover { border-color: var(--border-strong); color: var(--ink-2); }
+  /* context badges inside model chips */
+  .badge-ctx {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: var(--mono);
+    line-height: 1.2;
+    padding: 1px 5px;
+    margin-left: 2px;
+    border-radius: 4px;
+    background: var(--surface-2);
+    color: var(--ink-2);
+    border: 1px solid var(--border-strong);
+    vertical-align: 1px;
+    font-variant-numeric: tabular-nums;
+  }
+  .chip.on .badge-ctx {
+    background: var(--surface);
+    color: var(--flame-ink);
+    border-color: var(--flame);
+  }
+  .chip:hover .badge-ctx {
+    border-color: var(--flame);
+  }
+  .chip.locked .badge-ctx {
+    background: var(--surface-2);
+    color: var(--muted);
+    border-color: var(--border);
+  }
 
   /* session hero */
   #frag-session { display: block; margin-bottom: 16px; }
@@ -1003,6 +1247,13 @@ const CSS = `
     border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
+  .row-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; white-space: nowrap; }
+  .btn-copy { font-size: 11px; background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
+    border-radius: 5px; padding: 2px 8px; cursor: pointer; font-weight: 600; font-family: var(--sans);
+    transition: all .15s cubic-bezier(0.16, 1, 0.3, 1); outline: none; display: inline-flex; align-items: center; gap: 4px; line-height: 1.2; }
+  .btn-copy:hover { border-color: var(--flame); color: var(--flame-ink); background: var(--surface-2); transform: translateY(-1px); }
+  .btn-copy:active { transform: translateY(0); }
+  .btn-copy.copied { background: var(--good-tint); color: var(--good); border-color: var(--good); font-weight: 700; }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -1057,6 +1308,20 @@ const CSS = `
 // Client glue: window.pp (pin+source state) → hx-vals; preserves <details> open state across swaps; routes htmx errors to toast tray.
 const GLUE_JS = `
   window.pp = { pin: null, src: false };
+  function copyReq(btn) {
+    var txt = btn.getAttribute('data-row') || '';
+    if (navigator.clipboard && txt) {
+      navigator.clipboard.writeText(txt).then(function () {
+        var oldHtml = btn.innerHTML;
+        btn.innerHTML = '✓ Copied!';
+        btn.classList.add('copied');
+        setTimeout(function () {
+          btn.innerHTML = oldHtml;
+          btn.classList.remove('copied');
+        }, 1300);
+      });
+    }
+  }
   function ppPin(id) {
     window.pp.pin = id;
     htmx.trigger('#frag-latest', 'pp-refresh');
