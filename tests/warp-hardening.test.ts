@@ -614,3 +614,53 @@ describe('P1-1 round 3: a shim is recognised as a whole template, not by substri
     });
   });
 });
+
+describe('P1-3 round 3: the directory lock never revokes a live owner and never wedges', () => {
+  it('a live owner is not taken over just because its lock is older than staleMs', () => {
+    const d = tmp();
+    const lock = join(d, 'lock');
+    mkdirSync(lock);
+    const owner = { pid: process.pid, uuid: 'live-uuid', createdAt: Date.now() - 120_000 };
+    writeFileSync(join(lock, 'owner.json'), JSON.stringify(owner));
+    utimes(lock, new Date(Date.now() - 120_000));
+    expect(() => withDirectoryLock(lock, () => 'stolen', 100, 300)).toThrow(/timed out/);
+    expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8'))).toEqual(owner);
+  });
+
+  it('a fresh but malformed owner.json is left alone and the wait is bounded by waitMs', () => {
+    const d = tmp();
+    const lock = join(d, 'lock');
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner.json'), '{not json');
+    const started = Date.now();
+    expect(() => withDirectoryLock(lock, () => 'ran', 30_000, 300)).toThrow(/timed out/);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(readdir(d)).toContain('lock');
+  });
+
+  it('a malformed owner.json older than staleMs is reclaimed instead of wedging every launch', () => {
+    const d = tmp();
+    const lock = join(d, 'lock');
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner.json'), '{not json');
+    utimes(lock, new Date(Date.now() - 120_000));
+    expect(withDirectoryLock(lock, () => 'reclaimed', 100, 2_000)).toBe('reclaimed');
+    expect(readdir(d)).not.toContain('lock');
+  });
+
+  it('a reclaim mutex left behind by a dead reclaimer does not block later acquisitions', () => {
+    const d = tmp();
+    const lock = join(d, 'lock');
+    mkdirSync(lock);
+    writeFileSync(
+      join(lock, 'owner.json'),
+      JSON.stringify({ pid: 9999999, uuid: 'dead-uuid', createdAt: Date.now() - 10_000 }),
+    );
+    const reclaim = `${lock}.reclaim`;
+    mkdirSync(reclaim);
+    utimes(reclaim, new Date(Date.now() - 120_000));
+    expect(withDirectoryLock(lock, () => 'reclaimed', 100, 2_000)).toBe('reclaimed');
+    expect(readdir(d)).not.toContain('lock');
+    expect(readdir(d)).not.toContain('lock.reclaim');
+  });
+});

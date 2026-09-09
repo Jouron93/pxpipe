@@ -273,6 +273,7 @@ export function withDirectoryLock<T>(
       // Lock directory exists: inspect owner to check liveness
       let inspectedOwner: LockOwner | null = null;
       let ownerAbsent = false;
+      let ownerUnreadable = false;
       try {
         if (existsSync(ownerFile)) {
           const raw = readFileSync(ownerFile, 'utf8');
@@ -281,21 +282,32 @@ export function withDirectoryLock<T>(
           ownerAbsent = true;
         }
       } catch {
-        // Transient read/parse collision; will check deadline and back off below
+        // Unreadable or malformed owner.json: treated like an absent owner below, so a
+        // corrupted lock ages out instead of wedging every launch until waitMs (round 3, P1-3 §1.4)
+        ownerUnreadable = true;
       }
 
       // If the owner is alive, the lock is NEVER stale. Never revoke a live process.
       if (inspectedOwner && isPidAlive(inspectedOwner.pid)) {
         // Live owner: wait for normal release
-      } else if (inspectedOwner || ownerAbsent) {
-        // Owner is confirmed dead, or owner.json has been absent
+      } else if (inspectedOwner || ownerAbsent || ownerUnreadable) {
+        // Owner is confirmed dead, or owner.json has been absent / unreadable
         // Acquire exclusive reclamation mutex to eliminate the ABA takeover race
         let gotReclaim = false;
         try {
           mkdirSync(reclaimDir);
           gotReclaim = true;
         } catch {
-          // Another contender is currently executing stale reclamation
+          // Another contender is currently executing stale reclamation. Reclamation takes
+          // milliseconds, so a mutex older than staleMs belongs to a reclaimer that died
+          // holding it; drop it so the lock does not wedge for every later launch.
+          try {
+            if (Date.now() - statSync(reclaimDir).mtimeMs > staleMs) {
+              rmSync(reclaimDir, { recursive: true, force: true });
+            }
+          } catch {
+            /* mutex vanished or is unreadable; retry below */
+          }
         }
 
         if (gotReclaim) {
@@ -315,10 +327,20 @@ export function withDirectoryLock<T>(
                   rmSync(lockDir, { recursive: true, force: true });
                 }
               }
-            } else if (ownerAbsent && existsSync(lockDir) && !existsSync(ownerFile)) {
-              // Lock directory without owner file: only reclaim if older than staleMs
+            } else if ((ownerAbsent || ownerUnreadable) && existsSync(lockDir)) {
+              // Lock directory without a readable owner: only reclaim if older than staleMs,
+              // and only if the owner is still absent / unparseable under the mutex (a
+              // contender publishing its owner between our two reads keeps its lock).
+              let stillUnowned = !existsSync(ownerFile);
+              if (!stillUnowned) {
+                try {
+                  JSON.parse(readFileSync(ownerFile, 'utf8'));
+                } catch {
+                  stillUnowned = true;
+                }
+              }
               const age = Date.now() - statSync(lockDir).mtimeMs;
-              if (age > staleMs) {
+              if (stillUnowned && age > staleMs) {
                 const staleDir = `${lockDir}.stale.${randomUUID()}`;
                 try {
                   renameSync(lockDir, staleDir);
