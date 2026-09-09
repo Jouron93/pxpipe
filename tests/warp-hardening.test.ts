@@ -545,3 +545,53 @@ function readdir(d: string): string[] {
 function utimes(p: string, when: Date): void {
   utimesSync(p, when, when);
 }
+
+describe('P1-1 round 3: a shim is recognised as a whole template, not by substring', () => {
+  it('refuses a shim that carries any command besides the template lines', () => {
+    const d = tmp();
+    mkdirSync(join(d, 'node_modules', 'tool', 'bin'), { recursive: true });
+    writeFileSync(join(d, 'node_modules', 'tool', 'bin', 'cli.js'), '');
+    writeFileSync(
+      join(d, 'extra.cmd'),
+      '@echo off\r\ndel /q "%USERPROFILE%\\secrets"\r\n"%dp0%\\node_modules\\tool\\bin\\cli.js" %*\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'extra.cmd'))).toBeNull();
+    writeFileSync(
+      join(d, 'redirect.cmd'),
+      '@echo off\r\n"%dp0%\\node_modules\\tool\\bin\\cli.js" %* > "%TEMP%\\out.txt"\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'redirect.cmd'))).toBeNull();
+    writeFileSync(
+      join(d, 'twice.cmd'),
+      '@echo off\r\n"%dp0%\\node_modules\\tool\\bin\\cli.js" %*\r\n"%dp0%\\node_modules\\tool\\bin\\cli.js" %*\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'twice.cmd'))).toBeNull();
+  });
+
+  it('refuses a %* that is not the invocation and a flag smuggled before the script', () => {
+    const d = tmp();
+    mkdirSync(join(d, 'node_modules', 'tool', 'bin'), { recursive: true });
+    writeFileSync(join(d, 'node_modules', 'tool', 'bin', 'cli.js'), '');
+    writeFileSync(join(d, 'echo.cmd'), '@echo off\r\necho %*\r\n');
+    expect(resolveShimTarget(join(d, 'echo.cmd'))).toBeNull();
+    writeFileSync(
+      join(d, 'flag.cmd'),
+      '@echo off\r\nnode --require "%dp0%\\evil.js" "%dp0%\\node_modules\\tool\\bin\\cli.js" %*\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'flag.cmd'))).toBeNull();
+  });
+
+  it('still accepts the full npm cmd-shim template including the PATHEXT branch', () => {
+    const d = tmp();
+    mkdirSync(join(d, 'node_modules', 'tool', 'bin'), { recursive: true });
+    writeFileSync(join(d, 'node_modules', 'tool', 'bin', 'cli.js'), '');
+    writeFileSync(
+      join(d, 'tool.cmd'),
+      '@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\tool\\bin\\cli.js" %*\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'tool.cmd'))).toEqual({
+      kind: 'node',
+      script: join(d, 'node_modules', 'tool', 'bin', 'cli.js'),
+    });
+  });
+});

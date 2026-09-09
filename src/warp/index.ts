@@ -132,6 +132,33 @@ export function resolveExecutable(
  * Fails closed on unrecognized batch files or arbitrary scripts to guarantee
  * that argument semantics are preserved.
  */
+/** Setup lines the npm cmd-shim and the minimal one-line shim templates are allowed to contain. */
+const SHIM_SETUP_LINES: readonly RegExp[] = [
+  /^@?echo\s+off$/i,
+  /^goto\s+start$/i,
+  /^:[A-Za-z_]\w*$/,
+  /^set\s+dp0=%~dp0$/i,
+  /^exit\s+\/b$/i,
+  /^setlocal$/i,
+  /^call\s+:find_dp0$/i,
+  /^if\s+exist\s+"%dp0%\\node\.exe"\s*\($/i,
+  /^set\s+"_prog=%dp0%\\node\.exe"$/i,
+  /^\)\s*else\s*\($/i,
+  /^set\s+"_prog=node"$/i,
+  /^set\s+pathext=%pathext:;\.js;=;%$/i,
+  /^\)$/,
+  /^endlocal$/i,
+];
+
+/**
+ * The one invocation line a shim may carry, anchored at both ends: an optional cmd-shim
+ * `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% &` prefix, an optional interpreter
+ * (`"%_prog%"`, `"%dp0%\node.exe"`, `node`), then a quoted or unquoted %dp0%-relative path,
+ * then `%*` and nothing else.
+ */
+const SHIM_INVOCATION =
+  /^(?:endlocal\s*&\s*goto\s+#_undefined_#\s+2>nul\s*\|\|\s*title\s+%comspec%\s*&\s*)?(?:(?:"%_prog%"|"%~?dp0%?\\node\.exe"|node(?:\.exe)?)\s+)?(?:"(%~?dp0%?[^"]*?)"|(%~?dp0%?[^\s"]+))\s+%\*$/i;
+
 export function resolveShimTarget(
   shimPath: string,
 ): { kind: 'node'; execPath?: string; script: string } | { kind: 'exe'; path: string } | null {
@@ -142,78 +169,32 @@ export function resolveShimTarget(
     return null;
   }
   const dp0 = dirname(shimPath);
-  const lines = text.split(/\r?\n/);
-
-  // Check if a local node.exe is present adjacent to the shim (%dp0%\node.exe)
   const localNode = join(dp0, 'node.exe');
   const hasLocalNode = existsSync(localNode);
+  let target: string | null = null;
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    // Ignore empty lines and comments
+  // Whole-template validation (Astra round 3, P1-1). A shim is recognised only when every
+  // non-comment line is either a setup line from the npm cmd-shim / minimal-shim templates
+  // or THE single invocation line, anchored at both ends. A second command, a redirect, a
+  // `%*` used anywhere else, or an invocation that is not `<dp0 path> %*` makes the file
+  // unrecognisable and warp refuses it (null) instead of guessing what to execute.
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
     if (!line || /^[@\s]*(?:rem\b|::)/i.test(line)) continue;
-
-    // Must be an execution line forwarding arguments (%*)
-    if (!/%\*/.test(line)) continue;
-
-    // Normalize forward slashes and escaped dp0 constructs
-    // Match node script invocation forwarding %*
-    const nodeMatch =
-      /(?:(?:"%_prog%"|"%~?dp0%?\\node\.exe"|node)\s+)?(?:(?:"(%~?dp0%?[\\/]?[^"]+?\.(?:js|mjs|cjs))")|(?:(%~?dp0%?[\\/]?[^\s\r\n]+?\.(?:js|mjs|cjs))))\s+%\*/i.exec(
-        line,
-      );
-    if (nodeMatch) {
-      const rawRel = nodeMatch[1] ?? nodeMatch[2];
-      if (rawRel) {
-        const cleanRel = rawRel.replace(/^%~?dp0%?/i, '').replace(/^[\\/]+/, '');
-        const full = resolvePath(dp0, cleanRel);
-        if (existsSync(full)) {
-          return hasLocalNode
-            ? { kind: 'node', execPath: localNode, script: full }
-            : { kind: 'node', script: full };
-        }
-      }
-    }
-
-    // Match direct binary exe invocation forwarding %*
-    const exeMatch =
-      /(?:(?:"(%~?dp0%?[\\/]?[^"]+?\.exe)")|(?:(%~?dp0%?[\\/]?[^\s\r\n]+?\.exe)))\s+%\*/i.exec(
-        line,
-      );
-    if (exeMatch) {
-      const rawRel = exeMatch[1] ?? exeMatch[2];
-      if (rawRel) {
-        const cleanRel = rawRel.replace(/^%~?dp0%?/i, '').replace(/^[\\/]+/, '');
-        const full = resolvePath(dp0, cleanRel);
-        if (existsSync(full)) {
-          return { kind: 'exe', path: full };
-        }
-      }
-    }
-
-    // Match cmd-shim title %COMSPEC% compound invocation
-    const titleMatch =
-      /(?:title\s+%COMSPEC%\s+&\s+)(?:(?:"%_prog%"|node)\s+)?(?:(?:"(%~?dp0%?[\\/]?[^"]+?\.(?:js|mjs|cjs|exe))")|(?:(%~?dp0%?[\\/]?[^\s\r\n]+?\.(?:js|mjs|cjs|exe))))\s+%\*/i.exec(
-        line,
-      );
-    if (titleMatch) {
-      const rawRel = titleMatch[1] ?? titleMatch[2];
-      if (rawRel) {
-        const cleanRel = rawRel.replace(/^%~?dp0%?/i, '').replace(/^[\\/]+/, '');
-        const full = resolvePath(dp0, cleanRel);
-        if (existsSync(full)) {
-          const isExe = full.toLowerCase().endsWith('.exe');
-          return isExe
-            ? { kind: 'exe', path: full }
-            : hasLocalNode
-              ? { kind: 'node', execPath: localNode, script: full }
-              : { kind: 'node', script: full };
-        }
-      }
-    }
+    if (SHIM_SETUP_LINES.some((re) => re.test(line))) continue;
+    const m = SHIM_INVOCATION.exec(line);
+    if (!m) return null;
+    if (target !== null) return null; // two invocation lines: not a template we know
+    target = m[1] ?? m[2] ?? null;
   }
-
-  return null;
+  if (!target) return null;
+  const ext = /\.(js|mjs|cjs|exe)$/i.exec(target)?.[1]?.toLowerCase();
+  if (!ext) return null;
+  const rel = target.replace(/^%~?dp0%?/i, '').replace(/^[\\/]+/, '');
+  const full = resolvePath(dp0, rel);
+  if (!existsSync(full)) return null;
+  if (ext === 'exe') return { kind: 'exe', path: full };
+  return hasLocalNode ? { kind: 'node', execPath: localNode, script: full } : { kind: 'node', script: full };
 }
 
 /**
