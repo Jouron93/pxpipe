@@ -344,7 +344,7 @@ describe('collapseHistory', () => {
     // Synthetic user message is at index 0
     expect(out[0]!.role).toBe('user');
     expect(Array.isArray(out[0]!.content)).toBe(true);
-    const content = out[0]!.content as Array<Record<string, unknown>>;
+    const content = out[0]!.content as unknown as Array<Record<string, unknown>>;
     expect(content[0]).toMatchObject({ type: 'text' });
     expect((content[0] as { text: string }).text).toContain('attribute every turn strictly by its tag');
     expect(content[content.length - 1]).toMatchObject({ type: 'text' });
@@ -376,7 +376,7 @@ describe('collapseHistory', () => {
 
     expect(info.reason).toBe(undefined);
     expect(info.collapsedTurns).toBe(12);
-    const content = out[0]!.content as Array<Record<string, unknown>>;
+    const content = out[0]!.content as unknown as Array<Record<string, unknown>>;
     const textBlocks = content.filter((c) => c.type === 'text') as Array<{ text: string }>;
     expect(textBlocks).toHaveLength(3);
     expect(textBlocks[0]!.text).toContain('do not reopen low-N turns');
@@ -404,7 +404,7 @@ describe('collapseHistory', () => {
     expect(info.collapsedImages).toBeGreaterThanOrEqual(
       Math.ceil(info.collapsedChars / DENSE_CONTENT_CHARS_PER_IMAGE),
     );
-    const content = out[0]!.content as Array<Record<string, unknown>>;
+    const content = out[0]!.content as unknown as Array<Record<string, unknown>>;
     const textBlocks = content.filter((c) => c.type === 'text');
     expect(textBlocks).toHaveLength(3);
     expect((textBlocks[0] as { text: string }).text).toContain('attribute every turn strictly by its tag');
@@ -527,7 +527,7 @@ describe('collapseHistory', () => {
       return m;
     };
     const imagesOf = (r: { messages: Message[] }) =>
-      (r.messages[0]!.content as Array<Record<string, unknown>>).filter(
+      (r.messages[0]!.content as unknown as Array<Record<string, unknown>>).filter(
         (c) => c.type === 'image',
       );
 
@@ -969,7 +969,7 @@ describe('collapseHistory — opening-turn request quarantine (regression #14)',
     //     never a clean native text block that could read as the live request.
     const head = out[0]!;
     expect(head.role).toBe('user');
-    const headContent = head.content as Array<Record<string, unknown>>;
+    const headContent = head.content as unknown as Array<Record<string, unknown>>;
     const headText = headContent.filter((c) => c.type === 'text') as Array<{ text: string }>;
     expect(headText).toHaveLength(1);
     expect(headText[0]!.text).toContain('PRIOR CONTEXT ONLY');
@@ -980,7 +980,7 @@ describe('collapseHistory — opening-turn request quarantine (regression #14)',
     const cleanOpeningSomewhere = out.some(
       (m) =>
         Array.isArray(m.content) &&
-        (m.content as Array<Record<string, unknown>>).some(
+        (m.content as unknown as Array<Record<string, unknown>>).some(
           (b) => b.type === 'text' && b.text === OPENING_REQUEST,
         ),
     );
@@ -1002,7 +1002,7 @@ describe('collapseHistory — opening-turn request quarantine (regression #14)',
     // (4) Synthetic history sits BETWEEN head and live; its recency pointer/outro
     //     points at the live text and never resurrects the opening request.
     const synth = out[1]!;
-    const synthText = (synth.content as Array<Record<string, unknown>>).filter(
+    const synthText = (synth.content as unknown as Array<Record<string, unknown>>).filter(
       (c) => c.type === 'text',
     ) as Array<{ text: string }>;
     expect(synthText.some((t) => t.text.includes('current request is the live text'))).toBe(true);
@@ -1065,14 +1065,14 @@ describe('collapseHistory — opening task carried verbatim from the demoted hea
     expect(out.length).toBe(3);
 
     // Head still tombstoned (byte-stable anchor semantics unchanged).
-    const headText = (out[0]!.content as Array<Record<string, unknown>>).filter(
+    const headText = (out[0]!.content as unknown as Array<Record<string, unknown>>).filter(
       (c) => c.type === 'text',
     ) as Array<{ text: string }>;
     expect(headText[0]!.text).toContain('PRIOR CONTEXT ONLY');
 
     // The pointer in the synthetic message carries the task VERBATIM — including
     // everything past the 300-char preview cap: the questions and the format.
-    const synthText = (out[1]!.content as Array<Record<string, unknown>>).filter(
+    const synthText = (out[1]!.content as unknown as Array<Record<string, unknown>>).filter(
       (c) => c.type === 'text',
     ) as Array<{ text: string }>;
     const pointer = synthText.find((t) => t.text.includes('Most recent collapsed user turn'));
@@ -1108,7 +1108,7 @@ describe('collapseHistory — opening task carried verbatim from the demoted hea
       protectedPrefix: 1,
     });
 
-    const synthText = (out[1]!.content as Array<Record<string, unknown>>).filter(
+    const synthText = (out[1]!.content as unknown as Array<Record<string, unknown>>).filter(
       (c) => c.type === 'text',
     ) as Array<{ text: string }>;
     const pointer = synthText.find((t) => t.text.includes('Most recent collapsed user turn'))!;

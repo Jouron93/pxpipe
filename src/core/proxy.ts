@@ -4,8 +4,9 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { isClaudeModel, isGrokModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
+import { isAgyModel, isClaudeModel, isGrokModel, isLmStudioModel, isNimModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel, minCompressBodyBytes } from './applicability.js';
+import { isAnthropicCredential, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -19,6 +20,7 @@ export type BillingLane =
   | 'agy_ultra_subscription'
   | 'claude_max_subscription'
   | 'codex_subscription'
+  | 'grok_subscription'
   | 'nvidia_build_free'
   | 'api_key'
   | 'local'
@@ -29,6 +31,7 @@ export type BillingLaneSource =
   | 'agy_bridge_origin'
   | 'anthropic_oauth_marker'
   | 'chatgpt_codex_origin'
+  | 'xai_oauth_jwt'
   | 'api_key'
   | 'local_origin'
   | 'unresolved';
@@ -51,6 +54,12 @@ export interface ProxyConfig {
    *  Selected per-request when the body model is grok-* so Codex can keep
    *  OPENAI_UPSTREAM=chatgpt.com/backend-api/codex without stealing Grok traffic. */
   xaiUpstream?: string;
+  /** AGY bridge base for Gemini/AGY models. Defaults to http://127.0.0.1:4017. */
+  agyUpstream?: string;
+  /** LM Studio base for local models. Defaults to http://127.0.0.1:1234. */
+  lmStudioUpstream?: string;
+  /** NVIDIA NIM base. Defaults to https://integrate.api.nvidia.com. */
+  nimUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
   /** xAI API key / OAuth JWT injected for all grok-* models.
@@ -756,6 +765,9 @@ function teeForUsage(res: Response): {
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
 const DEFAULT_XAI_UPSTREAM = 'https://api.x.ai';
+const DEFAULT_AGY_UPSTREAM = 'http://127.0.0.1:4017';
+const DEFAULT_LMSTUDIO_UPSTREAM = 'http://127.0.0.1:1234';
+const DEFAULT_NIM_UPSTREAM = 'https://integrate.api.nvidia.com';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -1006,20 +1018,24 @@ async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
+  signal: AbortSignal,
 ): Promise<number | null> {
   // The probe body is a replayable buffer and count_tokens is a pure read, so a
   // retry can never double-charge or double-apply anything. Budget is kept far
   // tighter than the main forward: the probe only gates telemetry, and
   // finalize() awaits it, so a slow probe delays event logging.
   for (let attempt = 0; ; attempt++) {
+    if (signal.aborted) return null;
     let res: Response;
     try {
       res = await fetch(countTokensUrl, {
         method: 'POST',
         headers,
         body: body as unknown as BodyInit,
+        signal,
       });
     } catch {
+      if (signal.aborted) return null;
       // Network-level failure (upstream unreachable / socket reset).
       if (attempt >= PROBE_MAX_RETRIES) return null;
       await sleep(retryDelayMs(attempt, null, PROBE_MAX_DELAY_MS) ?? 0);
@@ -1134,6 +1150,15 @@ export function createProxy(config: ProxyConfig = {}) {
   return async function handle(req: Request): Promise<Response> {
     const t0 = Date.now();
     const url = new URL(req.url);
+    // Route predicates compare pathnames exactly, so `/v1/chat/completions/` (one trailing
+    // slash) missed every OpenAI predicate and landed on the Anthropic upstream carrying the
+    // client's OpenAI bearer (Gemini 3.8 census, 2026-09-05). ROUTE on a normalised copy —
+    // do NOT mutate url.pathname: `path` below is what gets FORWARDED, and rewriting it
+    // would silently change the request an upstream sees (`/anthropic/messages/` ->
+    // `/anthropic/messages`), which is not ours to decide (astra review, 2026-09-05).
+    const routePath = url.pathname.length > 1 && url.pathname.endsWith('/')
+      ? url.pathname.replace(/\/+$/, '') || '/'
+      : url.pathname;
     const path = url.pathname + url.search;
 
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
@@ -1267,28 +1292,56 @@ export function createProxy(config: ProxyConfig = {}) {
     };
 
     // Transform only known shapes; everything else passes through.
-    const providerPrefixed = isProviderPrefixedPath(url.pathname);
-    const isMessages = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
-    const isOpenAIChat = req.method === 'POST' && isOpenAIChatPath(url.pathname);
-    const isOpenAIResponses = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const providerPrefixed = isProviderPrefixedPath(routePath);
+    const isMessages = req.method === 'POST' && isAnthropicMessagesPath(routePath);
+    const isOpenAIChat = req.method === 'POST' && isOpenAIChatPath(routePath);
+    const isOpenAIResponses = req.method === 'POST' && isOpenAIResponsesPath(routePath);
     const isOpenAIPath = isCanonicalOpenAIPath(
-      url.pathname,
+      routePath,
       req.headers,
       config.openAIApiKey !== undefined,
     );
-    // Mutable: Grok models on OpenAI-shaped paths re-route to api.x.ai after
-    // the body model is known (Codex keeps OPENAI_UPSTREAM; Grok must not).
-    let upstreamBase = providerPrefixed ? passthroughUpstream : isOpenAIPath ? openAIUpstream : upstream;
-    let stripOpenAIV1ForRequest = routes.stripOpenAIV1;
-    let isGrokLane = false;
+    const xaiUpstream = (config.xaiUpstream
+      ?? (typeof process !== 'undefined' ? process.env?.XAI_UPSTREAM : undefined)
+      ?? DEFAULT_XAI_UPSTREAM).replace(/\/+$/, '');
+    const agyUpstream = (config.agyUpstream
+      ?? (typeof process !== 'undefined' ? process.env?.AGY_UPSTREAM : undefined)
+      ?? DEFAULT_AGY_UPSTREAM).replace(/\/+$/, '');
+    const lmStudioUpstream = (config.lmStudioUpstream
+      ?? (typeof process !== 'undefined' ? process.env?.LMSTUDIO_UPSTREAM : undefined)
+      ?? DEFAULT_LMSTUDIO_UPSTREAM).replace(/\/+$/, '');
+    const nimUpstream = (config.nimUpstream
+      ?? (typeof process !== 'undefined' ? process.env?.NIM_UPSTREAM : undefined)
+      ?? DEFAULT_NIM_UPSTREAM).replace(/\/+$/, '');
+    const initialUa = (req.headers.get('user-agent') || '').toLowerCase();
+    const isGrokCallerInitial = initialUa.includes('grok');
+    let upstreamBase = providerPrefixed
+      ? passthroughUpstream
+      : isGrokCallerInitial
+        ? xaiUpstream
+        : isOpenAIPath
+          ? openAIUpstream
+          : upstream;
+    let stripOpenAIV1ForRequest = isGrokCallerInitial ? false : routes.stripOpenAIV1;
+    let isGrokLane = isGrokCallerInitial;
+    let isAgyLane = false;
+    let isLmStudioLane = false;
+    let isNimLane = false;
+    let grokCacheKey: string | undefined;
+    // Set when an OpenAI-shaped request is rerouted to Anthropic because the body model is
+    // claude-*: the auth branch below must then follow Anthropic rules, not OpenAI's.
+    let claudeRerouted = false;
+    // A Claude Max OAuth SESSION = the marker header AND an actual Anthropic bearer. Both
+    // are required: the marker alone is not a credential, and treating it as one starved
+    // keyless requests of the configured key.
+    const hasAnthropicOAuthMarker = !!req.headers.get('anthropic-beta')?.toLowerCase().includes('oauth-2025-04-20');
+    const hasAnthropicOAuthSession = hasAnthropicOAuthMarker
+      && isAnthropicCredential(req.headers.get('authorization'));
     let routeKey: 'passthrough' | 'openai' | 'anthropic' = providerPrefixed
       ? 'passthrough'
       : isOpenAIPath
         ? 'openai'
         : 'anthropic';
-    const xaiUpstream = (config.xaiUpstream
-      ?? (typeof process !== 'undefined' ? process.env?.XAI_UPSTREAM : undefined)
-      ?? DEFAULT_XAI_UPSTREAM).replace(/\/+$/, '');
 
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
@@ -1313,11 +1366,37 @@ export function createProxy(config: ProxyConfig = {}) {
 
         // Grok on /v1/responses|/v1/chat/completions → compress here, forward to
         // api.x.ai with the client's xAI bearer. Never use Codex/OpenAI upstream.
-        if ((isOpenAIChat || isOpenAIResponses) && isGrokModel(model)) {
+        const callerUa = (req.headers.get('user-agent') || '').toLowerCase();
+        const isGrokCaller = isGrokCallerInitial || callerUa.includes('grok') || isGrokModel(model);
+        if ((isOpenAIChat || isOpenAIResponses) && isGrokCaller) {
           isGrokLane = true;
           upstreamBase = xaiUpstream;
           stripOpenAIV1ForRequest = false;
           routeKey = 'openai';
+        } else if ((isOpenAIChat || isOpenAIResponses) && isClaudeModel(model)) {
+          // Claude models on OpenAI endpoints route to Anthropic upstream
+          upstreamBase = upstream;
+          stripOpenAIV1ForRequest = false;
+          routeKey = 'anthropic';
+          claudeRerouted = true;
+        } else if ((isOpenAIChat || isOpenAIResponses) && isAgyModel(model)) {
+          // AGY/Gemini models on OpenAI endpoints route to AGY proxy bridge (:4017)
+          upstreamBase = agyUpstream;
+          stripOpenAIV1ForRequest = false;
+          routeKey = 'openai';
+          isAgyLane = true;
+        } else if ((isOpenAIChat || isOpenAIResponses) && isLmStudioModel(model)) {
+          // Local models (Qwen, Nemotron) route to LM Studio (:1234)
+          upstreamBase = lmStudioUpstream;
+          stripOpenAIV1ForRequest = false;
+          routeKey = 'openai';
+          isLmStudioLane = true;
+        } else if ((isOpenAIChat || isOpenAIResponses) && isNimModel(model)) {
+          // NVIDIA NIM models route to integrate.api.nvidia.com
+          upstreamBase = nimUpstream;
+          stripOpenAIV1ForRequest = false;
+          routeKey = 'openai';
+          isNimLane = true;
         }
 
         // /v1/messages is only a wire schema: Claude Code can target a non-
@@ -1359,6 +1438,19 @@ export function createProxy(config: ProxyConfig = {}) {
         }
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
+        if (isGrokLane) {
+          try {
+            const parsed = JSON.parse(new TextDecoder().decode(r.body)) as Record<string, unknown>;
+            const existing = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : '';
+            const modelTag = String(model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_');
+            grokCacheKey = existing || `pxpipe-grok-${modelTag}`;
+            if (!existing) parsed.prompt_cache_key = grokCacheKey;
+            r.body = new TextEncoder().encode(JSON.stringify(parsed));
+            bodyOut = r.body as unknown as BodyInit;
+          } catch {
+            grokCacheKey = `pxpipe-grok-${String(model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_')}`;
+          }
+        }
         reqBodyBytes = r.body;
         if (r.body.byteLength > 0) {
           reqBodySha8 = await sha8Bytes(r.body);
@@ -1378,7 +1470,7 @@ export function createProxy(config: ProxyConfig = {}) {
             // `/anthropic/messages` probe `/anthropic/messages/count_tokens`.
             const ctBase = providerPrefixed ? passthroughUpstream : upstream;
             const ctUrl = ctBase + url.pathname + '/count_tokens';
-            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
+            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders, req.signal);
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
             if (ctCacheableBody) {
@@ -1386,6 +1478,7 @@ export function createProxy(config: ProxyConfig = {}) {
                 ctUrl,
                 ctCacheableBody,
                 new Headers(ctHeaders),
+                req.signal,
               );
             }
           }
@@ -1423,8 +1516,15 @@ export function createProxy(config: ProxyConfig = {}) {
         billingLane = configuredLane;
         billingLaneSource = 'configured_route';
       } else if (isGrokLane) {
-        billingLane = 'api_key';
-        billingLaneSource = 'api_key';
+        const auth = req.headers.get('authorization') || '';
+        const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
+        if (bearer.startsWith('eyJ')) {
+          billingLane = 'grok_subscription';
+          billingLaneSource = 'xai_oauth_jwt';
+        } else {
+          billingLane = 'api_key';
+          billingLaneSource = 'api_key';
+        }
       } else if (upstreamOrigin === 'http://127.0.0.1:4017') {
         billingLane = 'agy_ultra_subscription';
         billingLaneSource = 'agy_bridge_origin';
@@ -1437,35 +1537,103 @@ export function createProxy(config: ProxyConfig = {}) {
       } else if (isOpenAIPath && config.openAIApiKey) {
         billingLane = 'api_key';
         billingLaneSource = 'api_key';
+      } else if (!isOpenAIPath && hasAnthropicOAuthSession) {
+        // Checked BEFORE the configured-key branch: with a proxy apiKey set, every OAuth
+        // session used to be labelled api_key (Gemini 3.8 census, 2026-09-05).
+        billingLane = 'claude_max_subscription';
+        billingLaneSource = 'anthropic_oauth_marker';
       } else if (!isOpenAIPath && (config.apiKey || req.headers.has('x-api-key'))) {
         billingLane = 'api_key';
         billingLaneSource = 'api_key';
-      } else if (
-        !isOpenAIPath
-        && req.headers.get('authorization')?.toLowerCase().startsWith('bearer ')
-        && req.headers.get('anthropic-beta')?.toLowerCase().includes('oauth-2025-04-20')
-      ) {
-        billingLane = 'claude_max_subscription';
-        billingLaneSource = 'anthropic_oauth_marker';
       }
     }
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-    // Grok lane: always inject the configured XAI_API_KEY (or xaiApiKey).
-    // This prevents Codex/ChatGPT OAuth tokens from being forwarded to api.x.ai.
-    // Non-Grok lanes keep their normal key injection behavior.
+    // Grok lane: keep the client's SuperGrok JWT. Do not overwrite with a
+    // console XAI_API_KEY. prompt_cache_key + x-grok-conv-id coalesce cache.
     if (isGrokLane) {
-      if (config.xaiApiKey) {
+      // OAuth JWT from the client is the SuperGrok product. Do not overwrite
+      // it with XAI_API_KEY (console keys 400 and bust cache). Only fill a
+      // missing Authorization for console-key clients.
+      //
+      // But a bearer that is NOT an xAI credential must never reach api.x.ai: the lane is
+      // also selected by body model, so a Codex client asking for grok-* arrives with its
+      // ChatGPT JWT (same `eyJ` prefix as a SuperGrok JWT). Shape check on the exact
+      // issuer host (credential-shape.ts); strip and fail closed — x.ai answers 401
+      // without ever seeing the foreign token. Grok 4.6 / Gemini 3.8 reviews, 2026-09-05.
+      const clientAuth = outHeaders.get('authorization');
+      if (clientAuth && !isXaiCredential(clientAuth)) {
+        outHeaders.delete('authorization');
+      }
+      // `x-api-key` is a credential too, and nothing shape-checked it: an Anthropic key
+      // sent alongside a grok-* body reached api.x.ai untouched. x.ai does not read this
+      // header at all, so dropping it costs nothing (astra + grok reviews, 2026-09-05).
+      outHeaders.delete('x-api-key');
+      const hasAuth = !!outHeaders.get('authorization');
+      if (!hasAuth && config.xaiApiKey) {
         outHeaders.set('authorization', `Bearer ${config.xaiApiKey}`);
       }
-      // If no xaiApiKey is configured we still forward the client's header
-      // (may 401, but at least we don't silently break a working setup).
+      if (grokCacheKey) {
+        outHeaders.set('x-grok-conv-id', grokCacheKey);
+      }
+    } else if (claudeRerouted) {
+      // OpenAI-shaped request rerouted to Anthropic because the body model is claude-*.
+      // `isOpenAIPath` is still true, so without this branch the proxy's OpenAI key (or
+      // the client's ChatGPT JWT) was sent to api.anthropic.com. Anthropic rules apply:
+      // forward the bearer only if it is an Anthropic credential (`sk-ant-` key or
+      // Claude OAuth token); otherwise strip it, and inject the configured key only
+      // when nothing else authenticates and no OAuth marker is present.
+      const clientAuth = outHeaders.get('authorization');
+      if (clientAuth && !isAnthropicCredential(clientAuth)) {
+        outHeaders.delete('authorization');
+      }
+      if (
+        !outHeaders.get('authorization')
+        && !outHeaders.get('x-api-key')
+        && config.apiKey
+        && !hasAnthropicOAuthSession
+      ) {
+        outHeaders.set('x-api-key', config.apiKey);
+      }
     } else if (isOpenAIPath) {
       if (config.openAIApiKey) outHeaders.set('authorization', `Bearer ${config.openAIApiKey}`);
-    } else if (!isOpenAIPath && config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
+    } else if (
+      !isOpenAIPath
+      && config.apiKey
+      && !hasAnthropicOAuthSession
+      && (!providerPrefixed || routePath.startsWith('/anthropic/'))
+    ) {
+      // A Claude Max OAuth session's own bearer is its credential; injecting the
+      // configured key over it would bill a flat-rate subscription as API usage.
+      // Keyed on the SESSION (marker + a real Anthropic bearer), never the marker alone:
+      // a request carrying only the header and no credential still needs the key, and
+      // suppressing it there produced a 401 (astra review, 2026-09-05).
       outHeaders.set('x-api-key', config.apiKey);
     }
 
+    // A model reroute can change the credential owner despite the original request path;
+    // check the final lane after key injection so foreign headers cannot escape to it.
+    // A configured gateway is the operator's OWN infrastructure at a URL they chose, and it
+    // authenticates however they set it up — the built-in provider policies do not describe
+    // it. `cloudflare-ai-gateway` rewrites the upstream to {base}/anthropic|{base}/openai
+    // while the CLIENT still calls /v1/messages, so `providerPrefixed` is false and the
+    // anthropic policy was being applied to the gateway, stripping the very keys the proxy
+    // injects for it (3 gateway tests, caught by the full suite — the implementer ran only
+    // its own three files).
+    const provider: UpstreamProvider = config.provider === 'cloudflare-ai-gateway'
+      ? 'passthrough'
+      : isGrokLane
+        ? 'xai'
+        : claudeRerouted
+          ? 'anthropic'
+          : (isAgyLane || isLmStudioLane)
+            ? 'passthrough'
+            : providerPrefixed
+              ? 'passthrough'
+              : isOpenAIPath
+                ? isChatGptCodexUpstream(openAIUpstream) ? 'chatgpt' : 'openai'
+                : 'anthropic';
+    sanitizeCredentialHeaders(outHeaders, provider);
     applyGatewayHeaders(outHeaders);
 
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
@@ -1480,20 +1648,24 @@ export function createProxy(config: ProxyConfig = {}) {
     let attempted: Response | undefined;
     for (let attempt = 0; ; attempt++) {
       try {
+        req.signal.throwIfAborted();
         attempted = await fetch(upstreamUrl, {
           method: req.method,
           headers: outHeaders,
           body: bodyOut,
+          signal: req.signal,
           // duplex is required by spec when sending a stream as body
           ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
         } as RequestInit);
       } catch (e) {
+        req.signal.throwIfAborted();
         // Deliberately NOT retried. A transport failure is ambiguous: the
         // request may already have reached the upstream and been applied, and
         // pxpipe cannot distinguish that from a request that never landed.
         // Replaying it could duplicate non-idempotent work. Fail loud instead.
-        fire(502, info, `upstream_error: ${(e as Error).message}`);
-        return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
+        const causeMsg = (e as any)?.cause ? ` [cause: ${(e as any).cause?.message || (e as any).cause?.code || (e as any).cause}]` : '';
+        fire(502, info, `upstream_error: ${(e as Error).message} to ${upstreamUrl}${causeMsg}`);
+        return new Response(JSON.stringify({ error: `pxpipe upstream unreachable: ${(e as Error).message}${causeMsg}`, url: upstreamUrl }), {
           status: 502,
           headers: { 'content-type': 'application/json' },
         });
@@ -1590,14 +1762,16 @@ export function createProxy(config: ProxyConfig = {}) {
       ),
     );
 
-    const isModelsReq = url.pathname === '/v1/models'
-      || url.pathname.startsWith('/v1/models/')
-      || url.pathname === '/openai/v1/models'
-      || url.pathname.startsWith('/openai/v1/models/');
+    let consumedBody: string | undefined;
+    const isModelsReq = routePath === '/v1/models'
+      || routePath.startsWith('/v1/models/')
+      || routePath === '/openai/v1/models'
+      || routePath.startsWith('/openai/v1/models/');
 
     if (isModelsReq && upstreamRes.status === 200) {
       try {
         const text = await teed.text();
+        consumedBody = text;
         const json = JSON.parse(text) as Record<string, unknown>;
         if (json && typeof json === 'object') {
           let modified = false;
@@ -1612,7 +1786,7 @@ export function createProxy(config: ProxyConfig = {}) {
             const outText = JSON.stringify(json);
             const resHeaders = filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS);
             resHeaders.set('content-type', 'application/json; charset=utf-8');
-            resHeaders.set('content-length', String(Buffer.byteLength(outText)));
+            resHeaders.set('content-length', String(new TextEncoder().encode(outText).byteLength));
             return new Response(outText, {
               status: upstreamRes.status,
               statusText: upstreamRes.statusText,
@@ -1625,6 +1799,22 @@ export function createProxy(config: ProxyConfig = {}) {
       }
     }
 
+    if (consumedBody !== undefined) {
+      // The body was read for the models augmentation but not modified (a single model
+      // object on `/v1/models/<id>`, or a list that already had both keys). A disturbed
+      // stream cannot be handed to `new Response` — that was a TypeError and a 500 for a
+      // valid request. Return the text already read, with headers describing THAT body.
+      // STRIP_RES_HEADERS already drops content-encoding and content-length; set the
+      // length for the decoded text we are actually returning. TextEncoder, not Buffer:
+      // this file is shared with the Workers build (astra review, 2026-09-05).
+      const resHeaders = filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS);
+      resHeaders.set('content-length', String(new TextEncoder().encode(consumedBody).byteLength));
+      return new Response(consumedBody, {
+        status: upstreamRes.status,
+        statusText: upstreamRes.statusText,
+        headers: resHeaders,
+      });
+    }
     return new Response(teed.body, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,

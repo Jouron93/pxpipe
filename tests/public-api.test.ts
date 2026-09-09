@@ -111,17 +111,19 @@ describe('public library API', () => {
     expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
   });
 
-  it('keeps Grok and Sol opt-in by default', () => {
-    // Grok remains opt-in because its arithmetic, gist, and state results are
-    // below the Fable bar.
+  it('keeps Grok 4.5 and Sol opt-in by default; Grok 4.6 is default-enabled', () => {
+    // Grok 4.5 remains opt-in because its arithmetic, gist, and state results
+    // are below the Fable bar. Grok 4.6 is registered enabledByDefault (AUG2026
+    // stack map lane: 500k ctx streaming via pxpipe).
     const prev = process.env.PXPIPE_MODELS;
     try {
       delete process.env.PXPIPE_MODELS;
       expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
       expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4.6')).toBe(true);
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
-      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-3-7-sonnet', 'claude-3-5-sonnet', 'claude-haiku-4-5']);
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-3-7-sonnet', 'claude-3-5-sonnet', 'claude-haiku-4-5', 'grok-4.6']);
 
       process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
       expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);

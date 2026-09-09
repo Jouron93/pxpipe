@@ -58,6 +58,7 @@ const SUBSCRIPTION_LANES = new Set([
   'agy_ultra_subscription',
   'claude_max_subscription',
   'codex_subscription',
+  'grok_subscription',
 ]);
 
 /** Normalize display names, provider prefixes, effort suffixes, and context
@@ -69,12 +70,12 @@ export function normalizeModelName(model: string | undefined): string {
     .replace(/^models\//, '')
     .replace(/^(openai|anthropic|google|x-ai|xai|moonshot|zhipu|kimi|nvidia)[/:]/, '')
     .replace(/\[1m\]$/g, '')
-    .replace(/\((thinking|high|medium|med|low)\)/g, '')
+    .replace(/\((thinking|xhigh|high|medium|med|low|max)\)/g, '')
     .replace(/[ _]+/g, '-')
     .replace(/[^a-z0-9.:-]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
-    .replace(/-(thinking|high|medium|med|low|fast|stable|low-context|long-context|reason|nonreason|reasoning|reasoner|effort|thought|extended-thinking|extended|high-effort|medium-effort|low-effort|high-thinking|medium-thinking|low-thinking)$/, '');
+    .replace(/-(thinking|xhigh|high|medium|med|low|max|fast|stable|low-context|long-context|reason|nonreason|reasoning|reasoner|effort|thought|extended-thinking|extended|xhigh-effort|high-effort|medium-effort|low-effort|xhigh-thinking|high-thinking|medium-thinking|low-thinking)$/, '');
 }
 
 function priced(
@@ -100,15 +101,17 @@ function priced(
   };
 }
 
-function subscriptionPrefixForLane(lane?: string): 'claude' | 'codex' | 'agy' {
+function subscriptionPrefixForLane(lane?: string): 'claude' | 'codex' | 'agy' | 'grok' {
   if (lane === 'claude_max_subscription') return 'claude';
   if (lane === 'codex_subscription') return 'codex';
+  if (lane === 'grok_subscription') return 'grok';
   return 'agy';
 }
 
 function subscriptionDisplayNameForLane(lane?: string): string {
   if (lane === 'claude_max_subscription') return 'Claude Max';
   if (lane === 'codex_subscription') return 'Codex';
+  if (lane === 'grok_subscription') return 'SuperGrok';
   return 'AGY';
 }
 

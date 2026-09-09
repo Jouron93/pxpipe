@@ -80,6 +80,7 @@ import {
   getConfiguredModelBases,
   setAllowedModelBases,
 } from './core/applicability.js';
+import { getAllModelProfiles } from './core/model-registry.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -1676,9 +1677,30 @@ export class DashboardState {
     setAllowedModelBases([...next]);
   }
 
-  /** GET /v1/models — serve standard OpenAI-compatible models list. */
+  /** GET /v1/models — serve standard OpenAI-compatible models list.
+   *
+   *  ADVERTISING IS NOT THE COMPRESSION SCOPE. This used to return
+   *  `getAllowedModelBases()` alone, conflating "pxpipe may image this model"
+   *  with "a client may select this model". A model was therefore invisible to
+   *  Codex's `/model` picker unless imaging was also enabled for it — and
+   *  enabling imaging on a GPT lane costs -294% token bleed (config `_meta`),
+   *  so the only way to list a model was to make it more expensive. The list is
+   *  now the union of the compression scope and every model carrying a
+   *  registry/config profile, so a profile alone makes a model selectable while
+   *  `model_scope` stays untouched.
+   *
+   *  Every entry carries `slug`. codex 0.153.3's models manager decodes this
+   *  response into a struct with a REQUIRED `slug` field and fails the entire
+   *  refresh without it ("failed to refresh available models: missing field
+   *  `slug`"), silently falling back to its built-in model list — which is why
+   *  the picker showed five stale models regardless of what pxpipe served. */
   serveModelsJson(): Response {
-    const modelBases = getAllowedModelBases();
+    const modelBases = [
+      ...new Set([
+        ...getAllowedModelBases(),
+        ...getAllModelProfiles().map((p) => p.canonicalId),
+      ]),
+    ].sort();
     const defaultModels = [
       'claude-fable-5',
       'claude-opus-5',
@@ -1697,6 +1719,8 @@ export class DashboardState {
     const activeModels = modelBases.length > 0 ? modelBases : defaultModels;
     const data = activeModels.map((id) => ({
       id,
+      // Required by codex's models manager; absent = whole refresh fails.
+      slug: id,
       object: 'model',
       created: 1700000000,
       owned_by: id.startsWith('claude') ? 'anthropic' : 'openai',

@@ -226,7 +226,7 @@ describe('proxy usage extraction', () => {
   it('never calls Anthropic count_tokens for Sol Responses', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(JSON.stringify({
         id: 'resp_sol_1', object: 'response', status: 'completed',
         output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
@@ -255,7 +255,7 @@ describe('proxy usage extraction', () => {
   it('transforms OpenCode /anthropic/messages (no /v1) and records the model', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       const url = req.url;
       if (url.endsWith('/count_tokens')) {
         return new Response(JSON.stringify({ input_tokens: 9000 }), {
@@ -316,7 +316,7 @@ describe('proxy usage extraction', () => {
   it('passes Claude Code Messages + Sol through without Anthropic count_tokens', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(JSON.stringify({
         id: 'msg_sol', type: 'message', role: 'assistant',
         content: [{ type: 'text', text: 'ok' }], model: 'gpt-5.6-sol',
@@ -351,7 +351,7 @@ describe('proxy usage extraction', () => {
   it('routes GPT 5.6 Sol chat completions to OpenAI, transforms once, and normalizes usage', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(
         JSON.stringify({
           id: 'chatcmpl_1',
@@ -419,7 +419,7 @@ describe('proxy usage extraction', () => {
   it('transforms provider-prefixed OpenAI chat but forwards through the generic upstream', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(
         JSON.stringify({
           id: 'chatcmpl_1',
@@ -466,7 +466,7 @@ describe('proxy usage extraction', () => {
   it('transforms OpenCode /openai/responses requests and records the model', async () => {
     const upstreamRequests: Request[] = [];
     const restore = mockUpstream(async (req) => {
-      upstreamRequests.push(req.clone());
+      upstreamRequests.push(req.clone() as unknown as Request);
       return new Response(
         JSON.stringify({
           id: 'resp_1',

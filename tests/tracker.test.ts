@@ -24,6 +24,7 @@ describe('toTrackEvent', () => {
       info: {
         compressed: true,
         origChars: 16000,
+        compressedChars: 16000,
         imageCount: 1,
         imageBytes: 2103,
         staticChars: 14000,
@@ -90,6 +91,7 @@ describe('toTrackEvent', () => {
   it('persists Responses completed-pair imageability telemetry', () => {
     const out = toTrackEvent({
       method: 'POST', path: '/v1/responses', status: 200, durationMs: 1,
+      billingLane: 'local', billingLaneSource: 'local_origin',
       info: {
         compressed: true, origChars: 1, compressedChars: 1,
         imageCount: 1, imageBytes: 1, staticChars: 1, dynamicChars: 0,
@@ -129,6 +131,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 100,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       usage: {
         input_tokens: 10,
         output_tokens: 250,
@@ -159,6 +163,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 100,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       usage: {
         input_tokens: 10,
         output_tokens: 5,
@@ -166,8 +172,8 @@ describe('toTrackEvent', () => {
         cache_read_input_tokens: 0,
       },
     });
-    expect(out.cache_creation_5m_tokens).toBeUndefined();
-    expect(out.cache_creation_1h_tokens).toBeUndefined();
+    expect(out.cache_create_5m_tokens).toBeUndefined();
+    expect(out.cache_create_1h_tokens).toBeUndefined();
     expect(out.web_search_requests).toBeUndefined();
   });
 
@@ -182,9 +188,17 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 50,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       info: {
         compressed: true,
         origChars: 30000,
+        compressedChars: 30000,
+        imageCount: 0,
+        imageBytes: 0,
+        staticChars: 0,
+        dynamicChars: 0,
+        dynamicBlockCount: 0,
         bucketChars: {
           static_slab: 27000,
           reminder: 1500,
@@ -216,7 +230,13 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
-      info: { compressed: false, reason: 'compress=false', origChars: 0 },
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
+      info: {
+        compressed: false, reason: 'compress=false', origChars: 0,
+        compressedChars: 0, imageCount: 0, imageBytes: 0,
+        staticChars: 0, dynamicChars: 0, dynamicBlockCount: 0,
+      },
     });
     expect(noBuckets.bucket_chars).toBeUndefined();
     expect(noBuckets.history_text_chars).toBeUndefined();
@@ -226,7 +246,13 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
-      info: { compressed: true, origChars: 100, bucketChars: {} },
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
+      info: {
+        compressed: true, origChars: 100, bucketChars: {},
+        compressedChars: 0, imageCount: 0, imageBytes: 0,
+        staticChars: 0, dynamicChars: 0, dynamicBlockCount: 0,
+      },
     });
     expect(emptyBucketMap.bucket_chars).toBeUndefined();
   });
@@ -237,6 +263,8 @@ describe('toTrackEvent', () => {
       path: '/health',
       status: 200,
       durationMs: 4,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
     });
     expect(out.method).toBe('GET');
     expect(out.compressed).toBeUndefined();
@@ -250,6 +278,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
       stopReason: 'end_turn',
     });
     expect(out.stop_reason).toBe('end_turn');
@@ -264,6 +294,8 @@ describe('toTrackEvent', () => {
         path: '/v1/messages',
         status: 200,
         durationMs: 10,
+        billingLane: 'local',
+        billingLaneSource: 'local_origin',
         stopReason: reason,
       });
       expect(out.stop_reason).toBe(reason);
@@ -277,6 +309,8 @@ describe('toTrackEvent', () => {
       path: '/v1/messages',
       status: 200,
       durationMs: 10,
+      billingLane: 'local',
+      billingLaneSource: 'local_origin',
     });
     expect('stop_reason' in out).toBe(false);
     expect('safety_flagged' in out).toBe(false);

@@ -271,6 +271,19 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
 
   // --- GROK FAMILY ---
   {
+    canonicalId: 'grok-4.6',
+    displayName: 'Grok 4.6',
+    family: 'grok',
+    status: 'validated',
+    enabledByDefault: true,
+    pricing: { inputPerMtok: 2, cacheWritePerMtok: 2.5, cacheReadPerMtok: 0.5, outputPerMtok: 6 },
+    renderProfile: DEFAULT_GROK_RENDER,
+    contextWindowTokens: 500_000,
+    maxOutputTokens: 128_000,
+    factsheetEnabled: true,
+    aliases: ['grok-4.6-latest', 'grok-latest'],
+  },
+  {
     canonicalId: 'grok-4.5',
     displayName: 'Grok 4.5',
     family: 'grok',
@@ -311,15 +324,68 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
   },
 
   // --- AGY PROXY FAMILY ---
+  // Gemini Flash 3.5-3.8 pricing/context sourced 2026-09-05 (Google Cloud pricing page,
+  // DeepMind model cards): 3.6/3.7/3.8 share the $0.75/$3.75 introductory rate through
+  // 2026-12-31 ($1.50/$7.50 after), cached $0.075; all four are 1,048,576 ctx / 65,536 out.
+  // The 0.15/0.60 + 2,097,152 that 3.6/3.7 carried before were Gemini 2.x Flash numbers.
+  // 3.8 tiers are defined HERE rather than via config `modelProfiles` on purpose.
+  // applyProfileMap() resolves a config key through normalizeModelId(), which
+  // strips the trailing `-high|-medium|-low`, so all three tiers normalize to the
+  // same `agy-gemini-3.8-flash`: the first one processed registers, and the other
+  // two find it via aliasMap and MERGE INTO it instead of creating their own
+  // entries. Measured 2026-09-04 — adding all three by config yielded exactly one
+  // registry entry (`...-medium`) wearing the `(high)` displayName. Builtin
+  // entries bypass that collision entirely, which is why 3.5/3.6/3.7 are here too.
+  // Pricing = Google's published introductory rate ($0.75/$3.75, cached $0.075)
+  // which runs to 2026-12-31 and then rises to $1.50/$7.50 — revisit on that date.
+  {
+    canonicalId: 'agy-gemini-3.8-flash-high',
+    displayName: 'AGY Gemini 3.8 Flash (High)',
+    family: 'agy',
+    status: 'validated',
+    enabledByDefault: false,
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
+    renderProfile: DEFAULT_GPT_RENDER,
+    contextWindowTokens: 1_048_576,
+    maxOutputTokens: 65_536,
+    factsheetEnabled: false,
+    aliases: ['agy/gemini-3.8-flash-high', 'gemini-3.8-flash-high', 'gemini-3.8-flash'],
+  },
+  {
+    canonicalId: 'agy-gemini-3.8-flash-medium',
+    displayName: 'AGY Gemini 3.8 Flash (Medium)',
+    family: 'agy',
+    status: 'validated',
+    enabledByDefault: false,
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
+    renderProfile: DEFAULT_GPT_RENDER,
+    contextWindowTokens: 1_048_576,
+    maxOutputTokens: 65_536,
+    factsheetEnabled: false,
+    aliases: ['agy/gemini-3.8-flash-medium', 'gemini-3.8-flash-medium'],
+  },
+  {
+    canonicalId: 'agy-gemini-3.8-flash-low',
+    displayName: 'AGY Gemini 3.8 Flash (Low)',
+    family: 'agy',
+    status: 'validated',
+    enabledByDefault: false,
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
+    renderProfile: DEFAULT_GPT_RENDER,
+    contextWindowTokens: 1_048_576,
+    maxOutputTokens: 65_536,
+    factsheetEnabled: false,
+    aliases: ['agy/gemini-3.8-flash-low', 'gemini-3.8-flash-low'],
+  },
   {
     canonicalId: 'agy-gemini-3.7-flash-high',
     displayName: 'AGY Gemini 3.7 Flash (High)',
     family: 'agy',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 0.15, cacheWritePerMtok: 0.1875, cacheReadPerMtok: 0.0375, outputPerMtok: 0.60 },
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.7-flash-high', 'gemini-3.7-flash-high', 'gemini-3.7-flash'],
@@ -330,9 +396,9 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'agy',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 0.15, cacheWritePerMtok: 0.1875, cacheReadPerMtok: 0.0375, outputPerMtok: 0.60 },
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.7-flash-medium', 'gemini-3.7-flash-medium'],
@@ -343,9 +409,9 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'agy',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 0.15, cacheWritePerMtok: 0.1875, cacheReadPerMtok: 0.0375, outputPerMtok: 0.60 },
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.7-flash-low', 'gemini-3.7-flash-low'],
@@ -356,9 +422,9 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'agy',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 0.15, cacheWritePerMtok: 0.1875, cacheReadPerMtok: 0.0375, outputPerMtok: 0.60 },
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.6-flash-high', 'gemini-3.6-flash-high', 'gemini-3.6-flash'],
@@ -369,9 +435,9 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'agy',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 0.15, cacheWritePerMtok: 0.1875, cacheReadPerMtok: 0.0375, outputPerMtok: 0.60 },
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.6-flash-medium', 'gemini-3.6-flash-medium'],
@@ -382,9 +448,9 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'agy',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 0.15, cacheWritePerMtok: 0.1875, cacheReadPerMtok: 0.0375, outputPerMtok: 0.60 },
+    pricing: { inputPerMtok: 0.75, cacheWritePerMtok: 0.9375, cacheReadPerMtok: 0.075, outputPerMtok: 3.75 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.6-flash-low', 'gemini-3.6-flash-low'],
@@ -397,7 +463,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     enabledByDefault: false,
     pricing: { inputPerMtok: 1.5, cacheWritePerMtok: 1.875, cacheReadPerMtok: 0.15, outputPerMtok: 9 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.5-flash-high', 'gemini-3.5-flash-high'],
@@ -410,7 +476,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     enabledByDefault: false,
     pricing: { inputPerMtok: 1.5, cacheWritePerMtok: 1.875, cacheReadPerMtok: 0.15, outputPerMtok: 9 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.5-flash-medium', 'gemini-3.5-flash-medium'],
@@ -423,7 +489,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     enabledByDefault: false,
     pricing: { inputPerMtok: 1.5, cacheWritePerMtok: 1.875, cacheReadPerMtok: 0.15, outputPerMtok: 9 },
     renderProfile: DEFAULT_GPT_RENDER,
-    contextWindowTokens: 2_097_152,
+    contextWindowTokens: 1_048_576,
     maxOutputTokens: 65_536,
     factsheetEnabled: false,
     aliases: ['agy/gemini-3.5-flash-low', 'gemini-3.5-flash-low'],
@@ -861,9 +927,9 @@ export function normalizeModelId(modelId: string | undefined): string {
     .toLowerCase()
     .replace(/^models\//, '')
     .replace(/\[[^\]]*\]/g, '')
-    .replace(/\((thinking|high|medium|med|low)\)/g, '')
+    .replace(/\((thinking|xhigh|high|medium|med|low|max)\)/g, '')
     .replace(/[ _]+/g, '-')
-    .replace(/-(thinking|high|medium|med|low)$/, '');
+    .replace(/-(thinking|xhigh|high|medium|med|low|max|xhigh-thinking|high-thinking|medium-thinking|low-thinking)$/, '');
 }
 
 /** Providers publish dated snapshot IDs alongside the short alias
@@ -1039,8 +1105,32 @@ export function applyRuntimeConfigOverrides(config: Record<string, any>): void {
   if (!config || typeof config !== 'object') return;
 
   const profilesConfig = config.modelProfiles || config.models || config.PXPIPE_MODELS_CONFIG;
-  if (!profilesConfig || typeof profilesConfig !== 'object') return;
+  if (profilesConfig && typeof profilesConfig === 'object' && !Array.isArray(profilesConfig)) {
+    applyProfileMap(profilesConfig as Record<string, unknown>);
+  }
 
+  const imaging = config.imaging_profiles;
+  if (imaging && typeof imaging === 'object' && !Array.isArray(imaging)) {
+    for (const [key, raw] of Object.entries(imaging as Record<string, unknown>)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const rec = raw as { style?: Record<string, unknown>; cellWBonus?: number; cellHBonus?: number; stripCols?: number; maxHeightPx?: number };
+      const style = rec.style && typeof rec.style === 'object' ? rec.style : rec;
+      applyProfileMap({
+        [key]: {
+          renderProfile: {
+            cellWBonus: rec.cellWBonus ?? (style as { cellWBonus?: number }).cellWBonus,
+            cellHBonus: rec.cellHBonus ?? (style as { cellHBonus?: number }).cellHBonus,
+            stripCols: rec.stripCols,
+            maxHeightPx: rec.maxHeightPx,
+            style,
+          },
+        },
+      });
+    }
+  }
+}
+
+function applyProfileMap(profilesConfig: Record<string, unknown>): void {
   for (const [key, rawOverride] of Object.entries(profilesConfig)) {
     if (!rawOverride || typeof rawOverride !== 'object') continue;
 
@@ -1048,7 +1138,18 @@ export function applyRuntimeConfigOverrides(config: Record<string, any>): void {
     const rawKey = key.trim().toLowerCase();
     const normKey = normalizeModelId(key);
 
-    const targetCanonical = aliasMap.get(rawKey) || aliasMap.get(normKey) || rawKey;
+    // A COMPLETE profile (own canonicalId + family) names its own identity and is looked
+    // up by that exact id. Only a PARTIAL override may resolve through the normalized
+    // alias. normalizeModelId() strips `-high|-medium|-low|...`, so routing complete
+    // profiles through it collapses every tier of a new model onto whichever registered
+    // first: the rest resolve to it via aliasMap, take the merge branch below, and never
+    // get entries of their own. Measured 2026-09-04 with agy-gemini-3.8-flash-{high,
+    // medium,low} from config: ONE registry entry, keyed `-medium`, displayName `(High)`.
+    // Pinned by tests/model-registry-tier-collision.test.ts.
+    const isCompleteProfile = Boolean(override.canonicalId && override.family);
+    const targetCanonical = isCompleteProfile
+      ? (override.canonicalId as string).trim().toLowerCase()
+      : aliasMap.get(rawKey) || aliasMap.get(normKey) || rawKey;
     const existingProfile = profileRegistry.get(targetCanonical.toLowerCase());
 
     if (!existingProfile) {

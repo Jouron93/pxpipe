@@ -12,9 +12,9 @@ describe('Empirical Verification Challenger Milestone 3-1: renderModelsFragment'
     expect(containers!.length).toBe(5);
 
     // Verify each expected family section label is present inside the HTML fragment
-    expect(html).toContain('<span class="models-label">Image Claude models</span>');
-    expect(html).toContain('<span class="models-label">Image OpenAI / Codex models</span>');
-    expect(html).toContain('<span class="models-label">Image Grok models</span>');
+    expect(html).toContain('<span class="models-label">claude-john-20x / claude-orn-pro</span>');
+    expect(html).toContain('<span class="models-label">codex-john / codex-orn</span>');
+    expect(html).toContain('<span class="models-label">xai-oauth-grok</span>');
     expect(html).toContain('<span class="models-label">Image AGY Proxy models</span>');
     expect(html).toContain('<span class="models-label">Image NVIDIA NIM Flagships</span>');
   });
@@ -36,19 +36,22 @@ describe('Empirical Verification Challenger Milestone 3-1: renderModelsFragment'
 
     // Verify exact badge matches for specific models across all families:
     // 1. Claude Family (1M)
-    expect(html).toContain('Claude 5 Fable<span class="badge-ctx">1M</span>');
-    expect(html).toContain('Claude 5 Opus<span class="badge-ctx">1M</span>');
+    expect(html).toContain('claude-john-fable<span class="badge-ctx">1M</span>');
+    expect(html).toContain('claude-john|orn-opus<span class="badge-ctx">1M</span>');
 
     // 2. OpenAI / Codex Family (262K, 1M)
-    expect(html).toContain('GPT 5.6 Sol<span class="badge-ctx">262K</span>');
+    expect(html).toContain('codex-john|orn-sol<span class="badge-ctx">262K</span>');
     expect(html).toContain('GPT 5.5<span class="badge-ctx">1M</span>');
 
     // 3. Grok Family (524K, 1M, 500K)
     expect(html).toContain('Grok 4.5<span class="badge-ctx">524K</span>');
     expect(html).toContain('Grok 4.3<span class="badge-ctx">1M</span>');
 
-    // 4. AGY Proxy Family (2M, 1M, 128K)
-    expect(html).toContain('AGY Gemini 3.6 Flash (High)<span class="badge-ctx">2M</span>');
+    // 4. AGY Proxy Family (1M Flash, 2M Pro, 1M, 128K). Flash 3.5-3.8 are 1,048,576 ctx
+    //    (DeepMind model cards, 2026-09-05); the 2M badge belongs to 3.1 Pro.
+    expect(html).toContain('AGY Gemini 3.6 Flash (High)<span class="badge-ctx">1M</span>');
+    expect(html).toContain('AGY Gemini 3.8 Flash (High)<span class="badge-ctx">1M</span>');
+    expect(html).toContain('AGY Gemini 3.1 Pro (High)<span class="badge-ctx">2M</span>');
     expect(html).toContain('AGY Claude Opus 4.6 Thinking<span class="badge-ctx">1M</span>');
     expect(html).toContain('AGY GPT-OSS 120B (Medium)<span class="badge-ctx">128K</span>');
 

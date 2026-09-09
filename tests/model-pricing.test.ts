@@ -217,7 +217,7 @@ describe('provider-aware model pricing', () => {
   describe('model-registry integration in rate resolution', () => {
     it('propagates exact context window sizes from model-registry profiles', () => {
       expect(resolveModelRate('claude-opus-4-8').contextWindowTokens).toBe(1_048_576);
-      expect(resolveModelRate('agy-gemini-3.6-flash-high').contextWindowTokens).toBe(2_097_152);
+      expect(resolveModelRate('agy-gemini-3.6-flash-high').contextWindowTokens).toBe(1_048_576);
       expect(resolveModelRate('nvidia/nemotron-3-ultra-550b-a55b', 0, {
         billingLaneSource: 'configured_route',
         billingLane: 'nvidia_build_free',

@@ -5,7 +5,6 @@ import {
   getAllModelProfiles,
   normalizeModelId,
   resolveModelProfile,
-  type PxpipeModelProfile,
 } from '../src/core/model-registry.js';
 
 describe('src/core/model-registry.ts', () => {
@@ -82,15 +81,18 @@ describe('src/core/model-registry.ts', () => {
     });
 
     it('verifies AGY Proxy family profiles', () => {
+      // Sourced 2026-09-05: DeepMind 3.6 model card (1,048,576 ctx / 65,536 out) and Google
+      // Cloud pricing ($0.75 / $3.75 intro, cached $0.075). The 0.15 / 0.60 + 2,097,152 this
+      // pinned before were Gemini 2.x Flash numbers carried forward.
       const agyGemini = resolveModelProfile('agy-gemini-3.6-flash-high');
       expect(agyGemini.canonicalId).toBe('agy-gemini-3.6-flash-high');
       expect(agyGemini.family).toBe('agy');
-      expect(agyGemini.contextWindowTokens).toBe(2_097_152);
+      expect(agyGemini.contextWindowTokens).toBe(1_048_576);
       expect(agyGemini.pricing).toEqual({
-        inputPerMtok: 0.15,
-        cacheWritePerMtok: 0.1875,
-        cacheReadPerMtok: 0.0375,
-        outputPerMtok: 0.60,
+        inputPerMtok: 0.75,
+        cacheWritePerMtok: 0.9375,
+        cacheReadPerMtok: 0.075,
+        outputPerMtok: 3.75,
       });
     });
 
@@ -159,11 +161,15 @@ describe('src/core/model-registry.ts', () => {
       expect(resolveModelProfile('nvidia/nemotron-4-340b-instruct').contextWindowTokens).toBe(1_048_576);
     });
 
-    it('returns 2M (2,097,152) context for AGY Gemini 3.6 Flash, 3.5 Flash, and 3.1 Pro', () => {
-      expect(resolveModelProfile('agy-gemini-3.6-flash-high').contextWindowTokens).toBe(2_097_152);
-      expect(resolveModelProfile('agy-gemini-3.6-flash-medium').contextWindowTokens).toBe(2_097_152);
-      expect(resolveModelProfile('agy-gemini-3.6-flash-low').contextWindowTokens).toBe(2_097_152);
-      expect(resolveModelProfile('agy-gemini-3.5-flash-high').contextWindowTokens).toBe(2_097_152);
+    it('returns 1M (1,048,576) context for every AGY Gemini Flash tier 3.5 through 3.8', () => {
+      for (const ver of ['3.5', '3.6', '3.7', '3.8']) {
+        for (const tier of ['high', 'medium', 'low']) {
+          expect(resolveModelProfile(`agy-gemini-${ver}-flash-${tier}`).contextWindowTokens).toBe(1_048_576);
+        }
+      }
+    });
+
+    it('returns 2M (2,097,152) context for AGY Gemini 3.1 Pro', () => {
       expect(resolveModelProfile('agy-gemini-3.1-pro-high').contextWindowTokens).toBe(2_097_152);
     });
 

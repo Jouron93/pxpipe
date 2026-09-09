@@ -34,7 +34,7 @@ describe('normalizeCacheControlTtlOrder', () => {
       ],
     };
     expect(normalizeCacheControlTtlOrder(req)).toBe(1);
-    expect((req.messages[1].content[0] as { cache_control: { ttl: string } }).cache_control.ttl).toBe('5m');
+    expect((req.messages[1]!.content[0] as { cache_control: { ttl: string } }).cache_control.ttl).toBe('5m');
   });
 
   it('leaves a correctly ordered request untouched', () => {
@@ -45,7 +45,7 @@ describe('normalizeCacheControlTtlOrder', () => {
       ],
     };
     expect(normalizeCacheControlTtlOrder(req)).toBe(0);
-    expect((req.messages[0].content[0] as { cache_control: { ttl: string } }).cache_control.ttl).toBe('1h');
+    expect((req.messages[0]!.content[0] as { cache_control: { ttl: string } }).cache_control.ttl).toBe('1h');
   });
 
   it('reaches a NESTED block -- the exact shape that wedged the live session', () => {

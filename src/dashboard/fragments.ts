@@ -105,6 +105,17 @@ export function renderToggleFragment(enabled: boolean): string {
   );
 }
 
+// Seat labels (john=Claude 20x / Codex OAuth john; orn=Claude Pro / Codex OAuth orn).
+// Wire id is unchanged — two seats can share one model id.
+const ACCOUNT_CHIP_LABEL: Record<string, string> = {
+  'claude-fable-5': 'claude-john-fable',
+  'claude-opus-5': 'claude-john|orn-opus',
+  'claude-sonnet-5': 'claude-john|orn-sonnet',
+  'gpt-5.6-sol': 'codex-john|orn-sol',
+  'gpt-5.6-terra': 'codex-john|orn-terra',
+  'gpt-5.6-luna': 'codex-john|orn-luna',
+};
+
 // ---- compress scope (which models get imaged) ----------------------------
 
 export function renderModelsFragment(
@@ -134,7 +145,7 @@ export function renderModelsFragment(
     const id = p.canonicalId;
     const lowerId = id.toLowerCase();
     const lit = on.has(lowerId);
-    const label = p.displayName || id;
+    const label = ACCOUNT_CHIP_LABEL[id] || p.displayName || id;
     const badge = formatContextBadge(p.contextWindowTokens);
     const badgeHtml = badge ? `<span class="badge-ctx">${badge}</span>` : '';
 
@@ -164,17 +175,17 @@ export function renderModelsFragment(
 
   return (
     `<div class="models">` +
-    `<span class="models-label">Image Claude models</span>` +
+    `<span class="models-label">claude-john-20x / claude-orn-pro</span>` +
     claudeChips +
     `<span class="hint">everything else is sent as normal text · runtime only · persist with PXPIPE_MODELS · 🔒 = weak/unvalidated imaged-reader (FINDINGS.md), env opt-in only</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image OpenAI / Codex models</span>` +
+    `<span class="models-label">codex-john / codex-orn</span>` +
     gptChips +
     `<span class="hint">imaging only, no Anthropic cache_control · set PXPIPE_MODELS to persist</span>${moot}` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">Image Grok models</span>` +
+    `<span class="models-label">xai-oauth-grok</span>` +
     grokChips +
     `<span class="hint">opt-in only · OpenAI Responses path · set PXPIPE_MODELS to persist</span>${moot}` +
     `</div>` +

@@ -129,6 +129,21 @@ export function isGrokModel(model: string | null | undefined): boolean {
   return m.startsWith('grok') || m.startsWith('xai/');
 }
 
+export function isAgyModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('agy') || m.includes('gemini') || m.startsWith('google/');
+}
+
+export function isLmStudioModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('qwen') || m.startsWith('nemotron') || m.includes('local') || m.includes('obliterated');
+}
+
+export function isNimModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase();
+  return m.startsWith('nim/') || m.startsWith('nvidia/');
+}
+
 /** Measured 2026-07-09 on grok-4.5: image-token delta ≈ 1000 per megapixel
  *  across several page sizes (768x336 → 268, 764x980 → 748, etc.). */
 export const GROK_TOKENS_PER_MEGAPIXEL = 1000;

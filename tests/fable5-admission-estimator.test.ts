@@ -14,7 +14,7 @@ describe('T-232 PXPIPE Fable-5 Admission Estimator & Diagnostics', () => {
     const f96k = negativeFixtures.find((f: any) => f.line === 67780);
     expect(f96k).toBeDefined();
 
-    const ev = f96k.event;
+    const ev = f96k!.event;
     // History text is 898,038 chars
     const historyText = 'A'.repeat(ev.orig_chars);
     const admission = evaluateCandidateBlockAdmission(
@@ -97,11 +97,10 @@ describe('T-232 PXPIPE Fable-5 Admission Estimator & Diagnostics', () => {
       cacheStateBeforeTransform: 'cold',
       decision: expect.stringMatching(/^(IMAGE|TEXT)$/),
     });
-    expect(dummyInfo.candidateBlocks![0].sourceChars).toBeGreaterThan(0);
-    expect(dummyInfo.candidateBlocks![0].sourceTextTokens).toBeGreaterThan(0);
+    expect(dummyInfo.candidateBlocks![0]!.sourceChars).toBeGreaterThan(0);
+    expect(dummyInfo.candidateBlocks![0]!.sourceTextTokens).toBeGreaterThan(0);
 
     const trackEvent = toTrackEvent({
-      ts: new Date().toISOString(),
       method: 'POST',
       path: '/v1/messages',
       status: 200,

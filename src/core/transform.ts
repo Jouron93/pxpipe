@@ -936,6 +936,8 @@ const KNOWN_STATIC_TAGS = [
   'examples',
   'rules',
   'task',
+  'reason',
+  'block',
   // copilot-gpt-5.txt
   'codeSearchInstructions',
   'codeSearchToolUseInstructions',

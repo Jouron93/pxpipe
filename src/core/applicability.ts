@@ -25,12 +25,12 @@ function baseModelId(model: string): string {
     .trim()
     .toLowerCase()
     .replace(/\[[^\]]*\]/g, '')
-    .replace(/\((thinking|high|medium|med|low)\)/g, '')
+    .replace(/\((thinking|xhigh|high|medium|med|low|max)\)/g, '')
     .replace(/^models\//, '')
     .replace(/^(openai|anthropic|google|x-ai|xai|agy|codex)[/:-]/, '')
     .replace(/^(moonshot|zhipu|kimi|nvidia|hermes|deepseek)[/:]/, '')
     .replace(/[ _]+/g, '-')
-    .replace(/-(thinking|high|medium|med|low|fast|stable|low-context|long-context|reason|nonreason|reasoning|reasoner|effort|thought|extended-thinking|extended|high-effort|medium-effort|low-effort|high-thinking|medium-thinking|low-thinking)$/, '')
+    .replace(/-(thinking|xhigh|high|medium|med|low|max|fast|stable|low-context|long-context|reason|nonreason|reasoning|reasoner|effort|thought|extended-thinking|extended|xhigh-effort|high-effort|medium-effort|low-effort|xhigh-thinking|high-thinking|medium-thinking|low-thinking)$/, '')
     .replace(/^-|-$/g, '');
 }
 

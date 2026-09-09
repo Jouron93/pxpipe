@@ -38,6 +38,7 @@ import {
   type DashboardRoute,
 } from './dashboard.js';
 import { applyRuntimeConfigOverrides } from './core/model-registry.js';
+import { fetchUpstreamCodexModels } from './core/codex-models.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -52,6 +53,9 @@ interface RuntimeConfig {
   upstream: string;
   openAIUpstream: string;
   xaiUpstream: string;
+  agyUpstream?: string;
+  lmStudioUpstream?: string;
+  nimUpstream?: string;
   openAIApiKey?: string;
   xaiApiKey?: string;
   provider?: 'cloudflare-ai-gateway';
@@ -160,6 +164,7 @@ const BILLING_LANES = new Set<BillingLane>([
   'agy_ultra_subscription',
   'claude_max_subscription',
   'codex_subscription',
+  'grok_subscription',
   'nvidia_build_free',
   'api_key',
   'local',
@@ -202,6 +207,9 @@ function parseCli(argv: string[]): RuntimeConfig {
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
     xaiUpstream: process.env.XAI_UPSTREAM ?? 'https://api.x.ai',
+    agyUpstream: process.env.AGY_UPSTREAM ?? 'http://127.0.0.1:4017',
+    lmStudioUpstream: process.env.LMSTUDIO_UPSTREAM ?? 'http://127.0.0.1:1234',
+    nimUpstream: process.env.NIM_UPSTREAM ?? 'https://integrate.api.nvidia.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
     xaiApiKey: process.env.XAI_API_KEY,
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
@@ -338,7 +346,11 @@ function printVersion(): void {
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
 
-function toWebRequest(req: IncomingMessage): Request {
+function toWebRequest(req: IncomingMessage, res: ServerResponse): Request {
+  const controller = new AbortController();
+  res.once('close', () => {
+    if (!res.writableFinished) controller.abort();
+  });
   const proto = (req.headers['x-forwarded-proto'] as string) ?? 'http';
   const host = req.headers.host ?? 'localhost';
   const url = `${proto}://${host}${req.url ?? '/'}`;
@@ -370,6 +382,7 @@ function toWebRequest(req: IncomingMessage): Request {
     method,
     headers,
     body,
+    signal: controller.signal,
     // @ts-expect-error — duplex is required for streamed request bodies in Node 18+
     duplex: hasBody ? 'half' : undefined,
   });
@@ -401,10 +414,20 @@ function isConnectionAbort(err: unknown): boolean {
 }
 
 async function waitForDrain(out: ServerResponse): Promise<void> {
-  const event = await Promise.race([
-    once(out, 'drain').then(() => 'drain'),
-    once(out, 'close').then(() => 'close'),
-  ]);
+  // `once()` installs a listener per call and the race's loser was never removed, so a
+  // long backpressured stream stacked one dangling 'close' listener per chunk
+  // (MaxListenersExceededWarning). Abort the loser; its rejection is swallowed on purpose.
+  const ac = new AbortController();
+  const drain = once(out, 'drain', { signal: ac.signal }).then(
+    () => 'drain' as const,
+    () => 'aborted' as const,
+  );
+  const close = once(out, 'close', { signal: ac.signal }).then(
+    () => 'close' as const,
+    () => 'aborted' as const,
+  );
+  const event = await Promise.race([drain, close]);
+  ac.abort();
   if (event === 'close') throw new Error('client response closed');
 }
 
@@ -516,7 +539,8 @@ async function dispatchDashboard(
     }
     case 'models': {
       if (method !== 'GET' && method !== 'HEAD') return undefined;
-      return dashboard.serveModelsJson();
+      const upstream = await fetchUpstreamCodexModels(req, url, healthMeta?.openAIUpstream);
+      return upstream ?? dashboard.serveModelsJson();
     }
     case 'png': {
       if (method !== 'GET') return undefined;
@@ -670,10 +694,19 @@ class FileTracker implements Tracker {
       this.fd = null;
     }
     try {
-      fs.renameSync(this.filePath, this.filePath + '.1');
+      // POSIX rename overwrites the target; Windows refuses (EEXIST/EPERM) when `.1`
+      // already exists, which every rotation after the first does. That left the log
+      // growing past its cap forever (Gemini 3.8 census, 2026-09-05). Remove the previous
+      // generation first — single-backup rotation is what this always intended.
+      const rotated = this.filePath + '.1';
+      try {
+        fs.rmSync(rotated, { force: true });
+      } catch {
+        /* fall through to the rename attempt */
+      }
+      fs.renameSync(this.filePath, rotated);
     } catch {
-      /* if rename fails (e.g. .1 locked) we'll just keep growing — better
-         than dropping events */
+      /* if rename still fails (e.g. .1 locked) we keep growing — better than dropping events */
     }
     this.bytesWritten = 0;
   }
@@ -1119,6 +1152,9 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     xaiUpstream: opts.xaiUpstream,
+    agyUpstream: opts.agyUpstream,
+    lmStudioUpstream: opts.lmStudioUpstream,
+    nimUpstream: opts.nimUpstream,
     openAIApiKey: opts.openAIApiKey,
     xaiApiKey: opts.xaiApiKey,
     billingLanes: opts.billingLanes,
@@ -1239,11 +1275,12 @@ async function main(): Promise<void> {
             return;
           }
         }
-        const webReq = toWebRequest(req);
+        const webReq = toWebRequest(req, res);
         const webRes = await handle(webReq);
         await writeWebResponse(webRes, res);
       })
       .catch((err) => {
+        if (isConnectionAbort(err) && res.destroyed) return;
         console.error('[pxpipe] handler error:', err);
         if (!res.headersSent) res.statusCode = 500;
         res.end();

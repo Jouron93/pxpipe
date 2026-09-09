@@ -32,6 +32,8 @@ function ev(p: Partial<TrackEvent>): TrackEvent {
     path: '/v1/messages',
     status: 200,
     duration_ms: 100,
+    billing_lane: 'local',
+    billing_lane_source: 'local_origin',
     ...p,
   };
 }
@@ -105,7 +107,7 @@ describe('serveSessionsJson', () => {
     ]);
     const res = await dash.serveSessionsJson();
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await res.json() as any;
     expect(body.count).toBe(2);
     expect(body.sessions).toHaveLength(2);
     // Most-recent-first
@@ -120,7 +122,7 @@ describe('serveSessionsJson', () => {
       ev({ first_user_sha8: 'bbbbbbbb', cwd: '/Users/me/code/other' }),
     ]);
     const res = await dash.serveSessionsJson({ project: 'pxpipe' });
-    const body = await res.json();
+    const body = await res.json() as any;
     expect(body.count).toBe(1);
     expect(body.sessions[0].id).toBe('aaaaaaaa');
   });
@@ -143,7 +145,7 @@ describe('serveApiStats', () => {
     ]);
     const res = await dash.serveApiStats();
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await res.json() as any;
     expect(body.parsed).toBe(3);
     expect(body.summary.total).toBe(3);
     expect(body.summary.ok2xx).toBe(2);
@@ -188,15 +190,15 @@ describe('serveFragment', () => {
       delete process.env.PXPIPE_MODELS;
       setAllowedModelBases(null); // reset to built-in Fable-only default
       const off = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(off).toContain('Image OpenAI / Codex models');
+      expect(off).toContain('codex-john / codex-orn');
       expect(off).not.toContain('<div class="models" style="display:none">');
       // Weak/unvalidated readers render locked: disabled, no hx-post, 🔒 marker.
-      expect(off).toContain('GPT 5.6 Sol<span class="badge-ctx">262K</span> 🔒</button>');
+      expect(off).toContain('codex-john|orn-sol<span class="badge-ctx">262K</span> 🔒</button>');
       expect(off).toContain('GPT 5.5<span class="badge-ctx">1M</span> 🔒</button>');
       // Sol remains visible and ordered before GPT 5.5.
-      expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
+      expect(off.indexOf('codex-john|orn-sol')).toBeLessThan(off.indexOf('GPT 5.5'));
       // Validated Fable 5 stays a live, lit toggle.
-      expect(off).toContain('Claude 5 Fable<span class="badge-ctx">1M</span> ✓');
+      expect(off).toContain('claude-john-fable<span class="badge-ctx">1M</span> ✓');
       expect(getAllowedModelBases()).toContain('claude-fable-5');
       expect(getAllowedModelBases()).not.toContain('grok-4.5');
 
@@ -211,7 +213,7 @@ describe('serveFragment', () => {
       setAllowedModelBases(null); // drop runtime override so env scope is read
       const envScoped = await (await dash.serveFragment('models', url, 1234)).text();
       expect(envScoped).toContain('GPT 5.5<span class="badge-ctx">1M</span> ✓');
-      expect(envScoped).toContain('GPT 5.6 Sol<span class="badge-ctx">262K</span> 🔒</button>');
+      expect(envScoped).toContain('codex-john|orn-sol<span class="badge-ctx">262K</span> 🔒</button>');
       dash.handleModelsToggle('gpt-5.5', false); // OFF is never gated
       expect(getAllowedModelBases()).not.toContain('gpt-5.5');
       dash.handleModelsToggle('gpt-5.5', true); // env-configured → ON allowed
@@ -225,9 +227,9 @@ describe('serveFragment', () => {
 
   it('renders per-family toggle chip sections with context badges across all 5 model families', async () => {
     const html = await (await dash.serveFragment('models', url, 1234)).text();
-    expect(html).toContain('Image Claude models');
-    expect(html).toContain('Image OpenAI / Codex models');
-    expect(html).toContain('Image Grok models');
+    expect(html).toContain('claude-john-20x / claude-orn-pro');
+    expect(html).toContain('codex-john / codex-orn');
+    expect(html).toContain('xai-oauth-grok');
     expect(html).toContain('Image AGY Proxy models');
     expect(html).toContain('Image NVIDIA NIM Flagships');
 
@@ -256,6 +258,7 @@ describe('serveFragment', () => {
     dash.update({
       method: 'POST', path: '/v1/responses', model: 'gpt-5.6-sol', status: 200,
       durationMs: 1,
+      billingLane: 'local', billingLaneSource: 'local_origin',
       usage: { input_tokens: 500000, output_tokens: 10, cached_tokens: 490000 },
       info: {
         compressed: true, imageCount: 1, imagePngs: [new Uint8Array([1])],

@@ -50,10 +50,10 @@ async function expectIdenticalRender(
 
   // Byte-for-byte identical PNG per page, and matching pixel dimensions.
   for (let i = 0; i < exported.pages.length; i++) {
-    const page = exported.pages[i];
+    const page = exported.pages[i]!;
     expect(
-      bytesEqual(proxied.pngs[i], page.png),
-      `page ${i}: proxy PNG (${proxied.pngs[i].length}B) must equal export PNG (${page.png.length}B)`,
+      bytesEqual(proxied.pngs[i]!, page.png),
+      `page ${i}: proxy PNG (${proxied.pngs[i]!.length}B) must equal export PNG (${page.png.length}B)`,
     ).toBe(true);
     expect(proxied.dims[i]).toEqual({ width: page.width, height: page.height });
   }
