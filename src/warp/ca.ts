@@ -22,7 +22,17 @@ import {
 } from 'node:crypto';
 import { createSecureContext, rootCertificates, type SecureContext } from 'node:tls';
 import { isIP } from 'node:net';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -156,6 +166,62 @@ function privateKeyPem(key: KeyObject): string {
 }
 
 /**
+ * Write-to-temp-then-rename, so a reader (another `pxpipe warp` starting at
+ * the same moment) sees either the previous file or the complete new one,
+ * never a partial write. rename replaces atomically on POSIX and on NTFS.
+ */
+export function writeFileAtomic(path: string, data: string, mode: number): void {
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  writeFileSync(tmp, data, { mode });
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing to clean */
+    }
+    throw err;
+  }
+}
+
+/**
+ * A directory is the one thing every platform creates atomically, so it serves
+ * as the mutex around minting a CA: two concurrent launches on an empty
+ * `~/.pxpipe` would otherwise each mint their own root and interleave the two
+ * cert/key pairs on disk. A lock older than `staleMs` belongs to a process that
+ * died mid-mint and is taken over.
+ */
+export function withDirectoryLock<T>(lockDir: string, fn: () => T, staleMs = 30_000, waitMs = 10_000): T {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      mkdirSync(lockDir);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      let age = 0;
+      try {
+        age = Date.now() - statSync(lockDir).mtimeMs;
+      } catch {
+        continue; // vanished between our attempt and the stat: retry immediately
+      }
+      if (age > staleMs) {
+        rmSync(lockDir, { recursive: true, force: true });
+        continue;
+      }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${lockDir}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
+/**
  * Where the OS keeps its public root bundle. `SSL_CERT_FILE`,
  * `CURL_CA_BUNDLE` and `REQUESTS_CA_BUNDLE` REPLACE the trust store rather
  * than extend it, so a file holding only our CA would make every non-pxpipe
@@ -223,7 +289,7 @@ export class CertificateAuthority {
       const fallbackPath = join(dir, 'node-root-certificates.pem');
       const fallbackRoots = rootCertificates.join('\n') + '\n';
       try {
-        writeFileSync(fallbackPath, fallbackRoots, { mode: 0o644 });
+        writeFileAtomic(fallbackPath, fallbackRoots, 0o644);
         roots = fallbackRoots;
         systemRootsPath = fallbackPath;
       } catch {
@@ -231,8 +297,26 @@ export class CertificateAuthority {
       }
     }
     const sep = roots && !roots.endsWith('\n') ? '\n' : '';
-    writeFileSync(bundlePath, certPem + roots + sep, { mode: 0o644 });
+    writeFileAtomic(bundlePath, certPem + roots + sep, 0o644);
     return { bundlePath, systemRootsPath: roots ? systemRootsPath : null };
+  }
+
+  /**
+   * A cert and key that were written by two different launches are each valid
+   * on their own and useless together: leaves signed with that key would not
+   * chain to that root. Only a pair that provably belongs together is loaded.
+   */
+  private static loadPersisted(certPath: string, keyPath: string): { certPem: string; caKey: KeyObject } | null {
+    try {
+      const certPem = readFileSync(certPath, 'utf8');
+      const parsed = new X509Certificate(certPem);
+      if (new Date(parsed.validTo).getTime() <= Date.now()) return null;
+      const caKey = createPrivateKey(readFileSync(keyPath, 'utf8'));
+      if (!parsed.checkPrivateKey(caKey)) return null;
+      return { certPem, caKey };
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -246,65 +330,56 @@ export class CertificateAuthority {
     const certPath = join(dir, 'warp-ca.pem');
     const keyPath = join(dir, 'warp-ca-key.pem');
 
-    try {
-      const certPem = readFileSync(certPath, 'utf8');
-      const keyPem = readFileSync(keyPath, 'utf8');
-      const parsed = new X509Certificate(certPem);
-      if (new Date(parsed.validTo).getTime() > Date.now()) {
-        const caKey = createPrivateKey(keyPem);
-        const leaf = newKeyPair();
-        const bundle = CertificateAuthority.writeBundle(dir, certPem);
-        return new CertificateAuthority(
-          certPem,
-          caKey,
-          leaf.publicKey,
-          privateKeyPem(leaf.privateKey),
-          certPath,
-          bundle.bundlePath,
-          bundle.systemRootsPath,
-        );
+    const build = (certPem: string, caKey: KeyObject): CertificateAuthority => {
+      const leaf = newKeyPair();
+      const bundle = CertificateAuthority.writeBundle(dir, certPem);
+      return new CertificateAuthority(
+        certPem,
+        caKey,
+        leaf.publicKey,
+        privateKeyPem(leaf.privateKey),
+        certPath,
+        bundle.bundlePath,
+        bundle.systemRootsPath,
+      );
+    };
+
+    const existing = CertificateAuthority.loadPersisted(certPath, keyPath);
+    if (existing) return build(existing.certPem, existing.caKey);
+
+    return withDirectoryLock(join(dir, 'warp-ca.lock'), () => {
+      // Another launch may have minted while we waited for the lock.
+      const minted = CertificateAuthority.loadPersisted(certPath, keyPath);
+      if (minted) return build(minted.certPem, minted.caKey);
+
+      const ca = newKeyPair();
+      const name = distinguishedName(CA_COMMON_NAME, CA_ORGANIZATION);
+      const now = Date.now();
+      const der = buildCertificate({
+        subject: name,
+        issuer: name,
+        subjectPublicKey: ca.publicKey,
+        signingKey: ca.privateKey,
+        notBefore: new Date(now - 60 * 60 * 1000),
+        notAfter: new Date(now + 10 * 365 * 24 * 60 * 60 * 1000),
+        extensions: [
+          // pathLen 0: this root may sign leaves, never intermediates.
+          extension(OID_BASIC_CONSTRAINTS, true, seq(bool(true), integer(0))),
+          keyUsageExtension([0, 5, 6]),
+        ],
+      });
+
+      const certPem = pem('CERTIFICATE', der);
+      // Key first, then cert: a reader that finds the cert also finds its key.
+      writeFileAtomic(keyPath, privateKeyPem(ca.privateKey), 0o600);
+      try {
+        chmodSync(keyPath, 0o600);
+      } catch {
+        /* chmod is a no-op on Windows NTFS, ignore */
       }
-    } catch {
-      // fall through and mint a fresh CA
-    }
-
-    const ca = newKeyPair();
-    const name = distinguishedName(CA_COMMON_NAME, CA_ORGANIZATION);
-    const now = Date.now();
-    const der = buildCertificate({
-      subject: name,
-      issuer: name,
-      subjectPublicKey: ca.publicKey,
-      signingKey: ca.privateKey,
-      notBefore: new Date(now - 60 * 60 * 1000),
-      notAfter: new Date(now + 10 * 365 * 24 * 60 * 60 * 1000),
-      extensions: [
-        // pathLen 0: this root may sign leaves, never intermediates.
-        extension(OID_BASIC_CONSTRAINTS, true, seq(bool(true), integer(0))),
-        keyUsageExtension([0, 5, 6]),
-      ],
+      writeFileAtomic(certPath, certPem, 0o644);
+      return build(certPem, ca.privateKey);
     });
-
-    const certPem = pem('CERTIFICATE', der);
-    writeFileSync(certPath, certPem, { mode: 0o644 });
-    writeFileSync(keyPath, privateKeyPem(ca.privateKey), { mode: 0o600 });
-    try {
-      chmodSync(keyPath, 0o600);
-    } catch {
-      /* chmod is a no-op on Windows NTFS, ignore */
-    }
-
-    const leaf = newKeyPair();
-    const bundle = CertificateAuthority.writeBundle(dir, certPem);
-    return new CertificateAuthority(
-      certPem,
-      ca.privateKey,
-      leaf.publicKey,
-      privateKeyPem(leaf.privateKey),
-      certPath,
-      bundle.bundlePath,
-      bundle.systemRootsPath,
-    );
   }
 
   /**

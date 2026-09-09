@@ -37,6 +37,14 @@ export interface Route {
    * every rewrite emit a doubled "//v1/messages".
    */
   readonly prefix: string;
+  /**
+   * When the target path ends in "*", the literal path prefix of the pattern
+   * (everything before its first "*") is REPLACED by `prefix` instead of being
+   * kept under it. `chatgpt.com/backend-api/codex/*=http://127.0.0.1:47821/v1/*`
+   * sends `/backend-api/codex/responses` to `/v1/responses`. `null` keeps the
+   * original path whole (the default, wardex semantics).
+   */
+  readonly substitute: string | null;
 }
 
 function quoteMeta(s: string): string {
@@ -81,9 +89,12 @@ export function parseRoute(spec: string): Route {
     throw new Error(`route ${JSON.stringify(spec)}: bad pattern: ${(err as Error).message}`);
   }
 
+  // A trailing "*" on the target asks for path substitution: strip it before the
+  // URL parser sees it (it would otherwise survive as a literal "*" segment).
+  const substituting = rawTarget.endsWith('*');
   let target: URL;
   try {
-    target = new URL(rawTarget);
+    target = new URL(substituting ? rawTarget.slice(0, -1) : rawTarget);
   } catch {
     throw new Error(`route ${JSON.stringify(spec)}: bad target: ${rawTarget}`);
   }
@@ -97,7 +108,20 @@ export function parseRoute(spec: string): Route {
   const hostRe = new RegExp(`^${hostGlob.toLowerCase().split('*').map(quoteMeta).join('.*')}$`, 'i');
   const hasPort = /:\d/.test(hostGlob);
 
-  return { pattern, re, hostRe, hasPort, target, prefix };
+  let substitute: string | null = null;
+  if (substituting) {
+    const slash = pattern.indexOf('/');
+    const patternPath = slash < 0 ? '' : pattern.slice(slash);
+    const star = patternPath.indexOf('*');
+    if (star < 0) {
+      throw new Error(`route ${JSON.stringify(spec)}: a "*" target needs a "*" in the pattern path`);
+    }
+    // The literal request-path prefix that the target prefix replaces, with the
+    // trailing slash kept so "/v1/" + "responses" and not "/v1" + "/responses".
+    substitute = patternPath.slice(0, star);
+  }
+
+  return { pattern, re, hostRe, hasPort, target, prefix, substitute };
 }
 
 /** Drop a trailing ":port", leaving IPv6 literals in brackets intact. */
@@ -138,6 +162,12 @@ export function hostCouldMatch(routes: readonly Route[], hostPort: string): bool
  * the downstream sees the same request the agent made.
  */
 export function rewriteUrl(route: Route, requestUri: string): string {
+  if (route.substitute !== null) {
+    // matchRoute already proved the literal prefix is there (case-insensitively).
+    const rest = requestUri.slice(route.substitute.length);
+    const joiner = route.substitute.endsWith('/') ? '/' : '';
+    return `${route.target.protocol}//${route.target.host}${route.prefix}${joiner}${rest}`;
+  }
   return `${route.target.protocol}//${route.target.host}${route.prefix}${requestUri}`;
 }
 

@@ -7,6 +7,42 @@ behavioral changes, patch = fixes).
 ## Unreleased
 
 ### Security
+- `pxpipe warp` hardening, from the 2026-09-09 adversarial audit of 6a7a828..116bd27
+  (`tests/warp-hardening.test.ts` pins each item):
+  - **Shell interpretation (P1-1).** A `.cmd`/`.bat` on PATH was spawned with `shell: true`,
+    and an unresolved command fell back to `cmd.exe /d /s /c ...args`, so `&`, `|`, `<`, `>`,
+    `^`, `%VAR%` and `!` inside a prompt were parsed by cmd.exe. npm-style shims are now
+    unwrapped (`resolveShimTarget`) and their `.js`/`.exe` target is spawned directly with no
+    shell. A batch file with no recognisable target still goes through cmd.exe, but with a
+    fully quoted command line, and any argument carrying a metacharacter is refused
+    (`PXPIPE_WARP_ALLOW_SHELL_ARGS=1` overrides).
+  - **CONNECT / SNI / Host binding (P2-1).** Each hijacked connection remembers its CONNECT
+    authority; a decrypted request whose TLS SNI or `Host` names another host, or another
+    port, is answered 400 instead of being sent wherever `Host` pointed.
+  - **Command-line logging (P2-13).** `warp exec →` logs the program and an argument count;
+    `PXPIPE_WARP_DEBUG=1` restores the full line.
+
+### Fixed
+- `pxpipe warp`: codex on a ChatGPT login talks to `chatgpt.com/backend-api/codex`, which no
+  default route covered, so it tunnelled past warp as raw TCP (P1-4). A default route now maps
+  `/backend-api/codex/*` onto pxpipe `/v1/*` — routes gained `*`-target substitution for it —
+  and `OPENAI_BASE_URL`, `OPENAI_API_BASE`, `CODEX_BASE_URL` and `XAI_BASE_URL` are stripped
+  from the child like `ANTHROPIC_BASE_URL` already was, so a stale shim port cannot survive
+  into it.
+- `pxpipe warp`: CA cert, key and bundles are written to a temp file and renamed, the mint is
+  serialised behind a directory lock, and a cert whose on-disk key does not match it is
+  replaced instead of loaded (P1-3: concurrent launches interleaved two pairs in place).
+- `pxpipe warp`: a wrapper that exited while its descendants ran left them pointing at a dead
+  proxy port (P1-2). On Windows the tree is also swept by `ParentProcessId` after the wrapper
+  exits, which still identifies orphans of a dead PID.
+- `pxpipe warp`: a CONNECT (or Host) naming port 0, 70000 or a non-number made `net.connect`
+  throw synchronously, which reached the process-wide handler and exited warp with the agent
+  inside it (P2-2). Authorities are validated first and answered 400.
+- `pxpipe warp`: an upstream error after the response headers were on the wire appended
+  `pxpipe warp: upstream error: ...` to a live SSE/JSON body (P2-5); the connection is cut
+  instead. The same path never ended the client response when the upstream dropped mid-stream
+  (pipe() does not end its destination on a source error), so the agent waited forever.
+
 - Client credentials are no longer forwarded across providers. A bearer now reaches an
   upstream only when its SHAPE proves it belongs there (`src/core/credential-shape.ts`:
   `sk-ant-` for Anthropic, `xai-` or an auth.x.ai-issued JWT for xAI, an

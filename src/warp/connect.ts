@@ -20,7 +20,7 @@ import {
   createServer as createHttpsServer,
   request as httpsRequest,
 } from 'node:https';
-import { connect as netConnect, type Socket } from 'node:net';
+import { connect as netConnect, isIP, type Socket } from 'node:net';
 import { connect as tlsConnect, type TLSSocket } from 'node:tls';
 
 import type { CertificateAuthority } from './ca.js';
@@ -77,6 +77,35 @@ function splitHostPort(value: string, fallbackPort: string): { host: string; por
   const i = value.lastIndexOf(':');
   if (i < 0) return { host: value, port: fallbackPort };
   return { host: value.slice(0, i), port: value.slice(i + 1) };
+}
+
+/** A hostname (or IP literal) with no path, scheme, userinfo or whitespace. */
+const HOST_RE = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.?$/i;
+
+/**
+ * Validated `host:port`. `net.connect` THROWS synchronously on a port outside
+ * 1..65535 (ERR_SOCKET_BAD_PORT), and inside handleConnect that throw reached
+ * the process-wide uncaughtException handler, which exits: one malformed
+ * CONNECT line from the child took the whole proxy — and the agent — down.
+ * Returns null for anything that must be answered with 400 instead.
+ */
+export function parseAuthority(
+  value: string,
+  fallbackPort: string,
+): { host: string; port: number } | null {
+  const { host, port } = splitHostPort(value.trim(), fallbackPort);
+  if (!host || host.length > 253) return null;
+  if (!/^\d{1,5}$/.test(port)) return null;
+  const n = Number(port);
+  if (n < 1 || n > 65535) return null;
+  const isIpv6 = host.includes(':');
+  if (isIpv6 ? isIP(host) !== 6 : !HOST_RE.test(host)) return null;
+  return { host, port: n };
+}
+
+/** Hostnames compare case-insensitively and a trailing dot is the same name. */
+function canonicalHost(host: string): string {
+  return host.toLowerCase().replace(/\.$/, '');
 }
 
 /** `host:port`, bracketing IPv6 literals so the result is URL-parseable. */
@@ -160,12 +189,25 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       // Streamed, never buffered: /v1/messages is SSE and must arrive token by
       // token or the agent appears to hang until the response completes.
       upstream.pipe(res);
+      // Once the response has started, a dropped upstream surfaces here, not on
+      // `outbound`. pipe() does not end the destination on a source error, so
+      // without this the agent waited forever on a stream nobody would finish.
+      upstream.on('error', () => {
+        if (!res.writableEnded && !res.destroyed) res.destroy();
+      });
     });
     outbound.on('error', (err) => {
       // Our own teardown below surfaces here as ECONNRESET; the client is
       // already gone, so writing a 502 into it would throw.
       if (res.writableEnded || res.destroyed) return;
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+      if (res.headersSent) {
+        // The status and headers are already on the wire. Appending a text
+        // line to a half-delivered SSE or JSON body would be parsed as part of
+        // it; a cut connection is the only honest signal left.
+        res.destroy();
+        return;
+      }
+      res.writeHead(502, { 'content-type': 'text/plain' });
       res.end(`pxpipe warp: upstream error: ${err.message}`);
     });
     // An SSE completion only ends when the model stops. If the agent is killed
@@ -180,12 +222,46 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     req.pipe(outbound);
   };
 
-  const handleDecrypted = (req: IncomingMessage, res: ServerResponse): void => {
+  /**
+   * The CONNECT authority each hijacked connection was opened for, keyed by the
+   * client's loopback port (unique while the connection lives). Three names
+   * arrive on every decrypted request — the CONNECT host, the TLS SNI and the
+   * HTTP Host — and each one used to pick something different: the SNI chose
+   * the leaf we minted, the Host chose where the bytes went. A client could
+   * CONNECT to an intercepted host and then ask, by Host, for any other. Now
+   * all three must agree.
+   */
+  const connectAuthority = new Map<number, { host: string; port: number }>();
+
+  const boundAuthority = (
+    req: IncomingMessage,
+  ): { host: string; port: number; reason?: undefined } | { reason: string } => {
+    const remotePort = req.socket.remotePort;
+    const bound = remotePort === undefined ? undefined : connectAuthority.get(remotePort);
+    if (!bound) return { reason: 'no CONNECT authority for this connection' };
     const servername = (req.socket as TLSSocket).servername || '';
-    // A client that CONNECTed to a non-443 port repeats it in Host, which is
-    // the only place the original port survives the hijack into mitmServer.
-    const { host, port } = splitHostPort(req.headers.host || servername, '443');
-    forward(req, res, authority(host, port), req.url ?? '/', `https://${authority(host, port)}`);
+    if (servername && canonicalHost(servername) !== canonicalHost(bound.host)) {
+      return { reason: `TLS SNI ${servername} does not match CONNECT host ${bound.host}` };
+    }
+    if (req.headers.host) {
+      const parsed = parseAuthority(req.headers.host, String(bound.port));
+      if (!parsed) return { reason: `bad Host header ${JSON.stringify(req.headers.host)}` };
+      if (canonicalHost(parsed.host) !== canonicalHost(bound.host) || parsed.port !== bound.port) {
+        return { reason: `Host ${req.headers.host} does not match CONNECT authority ${authority(bound.host, String(bound.port))}` };
+      }
+    }
+    return { host: bound.host, port: bound.port };
+  };
+
+  const handleDecrypted = (req: IncomingMessage, res: ServerResponse): void => {
+    const bound = boundAuthority(req);
+    if (bound.reason !== undefined) {
+      res.writeHead(400, { 'content-type': 'text/plain', connection: 'close' });
+      res.end(`pxpipe warp: ${bound.reason}`);
+      return;
+    }
+    const target = authority(bound.host, String(bound.port));
+    forward(req, res, target, req.url ?? '/', `https://${target}`);
   };
 
   /**
@@ -196,20 +272,30 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
    * never produce a 101).
    */
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
-    const servername = (req.socket as TLSSocket).servername || '';
-    const { host, port } = splitHostPort(req.headers.host || servername, '443');
+    const bound = boundAuthority(req);
+    if (bound.reason !== undefined) {
+      clientSocket.end(`HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\npxpipe warp: ${bound.reason}\r\n`);
+      return;
+    }
+    const { host, port } = bound;
 
-    const upstream = tlsConnect({ host, port: Number(port), servername: host }, () => {
-      const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
-      for (const [key, value] of Object.entries(req.headers)) {
-        for (const v of Array.isArray(value) ? value : [value]) {
-          if (v !== undefined) lines.push(`${key}: ${v}`);
+    let upstream: TLSSocket;
+    try {
+      upstream = tlsConnect({ host, port, servername: host }, () => {
+        const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
+        for (const [key, value] of Object.entries(req.headers)) {
+          for (const v of Array.isArray(value) ? value : [value]) {
+            if (v !== undefined) lines.push(`${key}: ${v}`);
+          }
         }
-      }
-      upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
-      if (head?.length) upstream.write(head);
-      pipeSockets(clientSocket, upstream);
-    });
+        upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
+        if (head?.length) upstream.write(head);
+        pipeSockets(clientSocket, upstream);
+      });
+    } catch {
+      clientSocket.destroy();
+      return;
+    }
     upstream.on('error', () => clientSocket.destroy());
     clientSocket.on('error', () => upstream.destroy());
   };
@@ -236,17 +322,38 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
       return;
     }
-    const { host, port } = splitHostPort(req.url ?? '', '443');
+    const parsed = parseAuthority(req.url ?? '', '443');
+    if (!parsed) {
+      clientSocket.end(
+        `HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\npxpipe warp: bad CONNECT authority ${JSON.stringify(req.url ?? '')}\r\n`,
+      );
+      return;
+    }
+    const { host, port } = parsed;
 
-    if (!hostCouldMatch(routes, authority(host, port))) {
-      const upstream = netConnect({ host, port: Number(port) }, () => {
-        clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
-        if (head?.length) upstream.write(head);
-        pipeSockets(clientSocket, upstream);
-      });
+    if (!hostCouldMatch(routes, authority(host, String(port)))) {
+      let upstream: Socket;
+      try {
+        upstream = netConnect({ host, port }, () => {
+          clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
+          if (head?.length) upstream.write(head);
+          pipeSockets(clientSocket, upstream);
+        });
+      } catch {
+        clientSocket.end('HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n');
+        return;
+      }
       upstream.on('error', () => clientSocket.destroy());
       clientSocket.on('error', () => upstream.destroy());
       return;
+    }
+
+    // Remember what this connection was opened for; every decrypted request on
+    // it is checked against this, not against whatever Host or SNI it carries.
+    const remotePort = clientSocket.remotePort;
+    if (remotePort !== undefined) {
+      connectAuthority.set(remotePort, { host, port });
+      clientSocket.once('close', () => connectAuthority.delete(remotePort));
     }
 
     clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');

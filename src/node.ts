@@ -268,6 +268,14 @@ Usage:
                         run CMD behind a transparent CONNECT proxy without a
                         custom base URL, so client-side first-party gates
                         (/remote-control, claude.ai connectors) keep working.
+                        Default routes cover api.anthropic.com, api.openai.com,
+                        chatgpt.com/backend-api/codex (mapped onto /v1),
+                        api.x.ai and the Gemini hosts. A TARGET ending in "*"
+                        replaces the pattern's path prefix instead of keeping
+                        it. Provider *_BASE_URL variables are removed from CMD's
+                        environment. PXPIPE_WARP_DEBUG=1 logs CMD's arguments;
+                        PXPIPE_WARP_ALLOW_SHELL_ARGS=1 lets a .bat run with
+                        cmd.exe metacharacters in its arguments.
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via

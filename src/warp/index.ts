@@ -14,11 +14,11 @@
  *   HTTPS_PROXY=http://127.0.0.1:8080 NODE_EXTRA_CA_CERTS=~/.mitmproxy/mitmproxy-ca-cert.pem claude
  */
 
-import { execSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { accessSync, constants, existsSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join, resolve as resolvePath } from 'node:path';
 
 import { CertificateAuthority } from './ca.js';
 import { createWarpHandlers } from './connect.js';
@@ -47,11 +47,17 @@ const isWindows = process.platform === 'win32';
  * telemetry, the control plane — is re-originated untouched, which is what
  * keeps the agent's client-side gates satisfied.
  */
-function defaultRoutes(port: number): Route[] {
+export function defaultRoutes(port: number): Route[] {
   return [
     parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`),
     parseRoute(`api.openai.com/v1/responses*=http://127.0.0.1:${port}`),
     parseRoute(`api.openai.com/v1/chat/completions*=http://127.0.0.1:${port}`),
+    // codex on a ChatGPT login never touches api.openai.com: it speaks to the
+    // codex backend on chatgpt.com, where pxpipe serves the same requests under
+    // /v1 (OPENAI_UPSTREAM=https://chatgpt.com/backend-api/codex strips the /v1
+    // again on the way out). Without this rule that client tunnelled straight
+    // past warp as raw TCP and nothing was imaged.
+    parseRoute(`chatgpt.com/backend-api/codex/*=http://127.0.0.1:${port}/v1/*`),
     parseRoute(`api.x.ai/v1/chat/completions*=http://127.0.0.1:${port}`),
     parseRoute(`api.x.ai/v1/responses*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
@@ -114,15 +120,79 @@ export function resolveExecutable(
   return null;
 }
 
+/**
+ * What an npm-style Windows shim ultimately runs. `claude.cmd` ends in
+ * `"%dp0%\node_modules\...\bin\claude.exe" %*` and `codex.cmd` in
+ * `"%_prog%" "%dp0%\node_modules\...\bin\codex.js" %*`. Running that target
+ * directly, with `shell: false`, keeps every argument intact: handed to
+ * cmd.exe via the shim, `&`, `|`, `<`, `>`, `^`, `%VAR%` and `!` inside a prompt
+ * are re-parsed as shell syntax.
+ */
+export function resolveShimTarget(
+  shimPath: string,
+): { kind: 'node'; script: string } | { kind: 'exe'; path: string } | null {
+  let text: string;
+  try {
+    text = readFileSync(shimPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const dp0 = dirname(shimPath);
+  const found: Array<{ kind: 'node'; script: string } | { kind: 'exe'; path: string }> = [];
+  // Every quoted %dp0%-relative program the shim names, in order; the last one
+  // on the final command line is the program that actually receives %*.
+  const re = /"%(?:~)?dp0%?\\([^"]+?\.(js|mjs|cjs|exe))"/gi;
+  for (const m of text.matchAll(re)) {
+    const rel = m[1]!;
+    const full = resolvePath(dp0, rel);
+    if (!existsSync(full)) continue;
+    const ext = (m[2] ?? '').toLowerCase();
+    found.push(ext === 'exe' ? { kind: 'exe', path: full } : { kind: 'node', script: full });
+  }
+  return found.length > 0 ? found[found.length - 1]! : null;
+}
+
+/**
+ * Characters cmd.exe interprets even inside double quotes, or that break the
+ * quoting itself. An argument carrying one cannot be passed through a batch
+ * file safely, so warp refuses rather than let a prompt become shell syntax.
+ */
+const CMD_METACHARACTERS = /[&|<>^%!"\r\n]/;
+
+export function findUnsafeCmdArgument(args: readonly string[]): string | null {
+  for (const arg of args) if (CMD_METACHARACTERS.test(arg)) return arg;
+  return null;
+}
+
+/**
+ * Descendants of a Windows process keep its PID as their ParentProcessId after
+ * it exits, so they stay enumerable even though `taskkill /T` on the dead PID
+ * can no longer walk to them. Without this, a wrapper that spawned background
+ * workers and returned left them alive, pointed at a proxy port that was about
+ * to close.
+ */
+function reapWindowsOrphans(parentPid: number): void {
+  const script =
+    `Get-CimInstance Win32_Process -Filter "ParentProcessId = ${parentPid}" | ` +
+    `ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }`;
+  for (const shell of ['pwsh.exe', 'powershell.exe']) {
+    const r = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+      stdio: 'ignore',
+      timeout: 5000,
+      windowsHide: true,
+    });
+    if (!r.error) return;
+  }
+}
+
 /** Reaps a process and its entire child tree on Windows / POSIX. */
 function killProcessTree(child: ChildProcess): void {
   if (!child.pid) return;
   if (isWindows) {
-    try {
-      execSync(`taskkill /pid ${child.pid} /T /F`, { stdio: 'ignore' });
-    } catch {
-      /* process may already have terminated */
-    }
+    // Argument array, no shell: the PID is ours, but there is no reason to
+    // hand cmd.exe a string here either.
+    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    reapWindowsOrphans(child.pid);
   } else {
     try {
       child.kill('SIGTERM');
@@ -130,6 +200,39 @@ function killProcessTree(child: ChildProcess): void {
       /* ignore */
     }
   }
+}
+
+/**
+ * The environment the child runs in. Every provider base URL is removed so the
+ * agent talks to its first-party host and warp does the diversion; an
+ * inherited OPENAI_BASE_URL pointing at a retired shim port would otherwise
+ * send codex somewhere warp never sees. Exported so a test can pin the list.
+ */
+export function childEnvironment(
+  base: NodeJS.ProcessEnv,
+  proxyUrl: string,
+  ca: { certPath: string; bundlePath: string },
+): NodeJS.ProcessEnv {
+  const env = { ...base };
+  for (const name of [
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_UNIX_SOCKET',
+    'OPENAI_BASE_URL',
+    'OPENAI_API_BASE',
+    'CODEX_BASE_URL',
+    'XAI_BASE_URL',
+  ]) {
+    delete env[name];
+  }
+  env.HTTP_PROXY = proxyUrl;
+  env.http_proxy = proxyUrl;
+  env.HTTPS_PROXY = proxyUrl;
+  env.https_proxy = proxyUrl;
+  env.NODE_EXTRA_CA_CERTS = ca.certPath;
+  env.SSL_CERT_FILE = ca.bundlePath;
+  env.CURL_CA_BUNDLE = ca.bundlePath;
+  env.REQUESTS_CA_BUNDLE = ca.bundlePath;
+  return env;
 }
 
 export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
@@ -162,21 +265,60 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const shellQuote = (arg: string): string =>
     isWindows ? `"${arg.replaceAll('"', '""')}"` : `'${arg.replaceAll("'", `'\\''`)}'`;
 
+  /**
+   * Last resort on Windows: a batch file with no recognisable program inside, or
+   * a command that is not on PATH at all. cmd.exe gets ONE pre-quoted command
+   * line (windowsVerbatimArguments) instead of the space-joined, unquoted line
+   * `shell: true` would build. Arguments that cmd.exe would still interpret are
+   * refused unless PXPIPE_WARP_ALLOW_SHELL_ARGS=1 says the caller accepts that.
+   */
+  const spawnThroughCmd = (
+    program: string,
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+    direct: { stdio: 'inherit'; env: NodeJS.ProcessEnv },
+  ): ChildProcess => {
+    const unsafe = findUnsafeCmdArgument(args);
+    if (unsafe !== null && env.PXPIPE_WARP_ALLOW_SHELL_ARGS !== '1') {
+      console.error(
+        `[pxpipe] warp: refusing to run ${program} through cmd.exe: an argument contains ` +
+          `shell metacharacters (${JSON.stringify(unsafe.slice(0, 40))}). Run the program's ` +
+          `.exe/.js directly, or set PXPIPE_WARP_ALLOW_SHELL_ARGS=1 to accept cmd.exe parsing it.`,
+      );
+      process.exit(2);
+    }
+    const comspec = env.COMSPEC || 'cmd.exe';
+    const line = [program, ...args].map((a) => `"${a}"`).join(' ');
+    return spawn(comspec, ['/d', '/s', '/c', `"${line}"`], {
+      ...direct,
+      windowsVerbatimArguments: true,
+    });
+  };
+
   const spawnResolved = (command: string[], env: NodeJS.ProcessEnv): ChildProcess => {
     const direct = { stdio: 'inherit', env } as const;
     const resolved = resolveExecutable(command[0]!, env);
 
+    const args = command.slice(1);
+
     if (resolved) {
-      if (resolved.isShellScript) {
-        return spawn(resolved.path, command.slice(1), { ...direct, shell: true });
+      if (!resolved.isShellScript) return spawn(resolved.path, args, direct);
+
+      // A .cmd/.bat can only be run by cmd.exe. Prefer the program the shim
+      // wraps and run it without any shell at all.
+      const target = resolveShimTarget(resolved.path);
+      if (target?.kind === 'node') {
+        return spawn(process.execPath, [target.script, ...args], direct);
       }
-      return spawn(resolved.path, command.slice(1), direct);
+      if (target?.kind === 'exe') {
+        return spawn(target.path, args, direct);
+      }
+      return spawnThroughCmd(resolved.path, args, env, direct);
     }
 
     if (isWindows) {
-      const comspec = env.COMSPEC || 'cmd.exe';
       console.error(`[pxpipe] warp: resolving ${command[0]} via Windows command shell fallback`);
-      return spawn(comspec, ['/d', '/s', '/c', ...command], direct);
+      return spawnThroughCmd(command[0]!, args, env, direct);
     }
 
     const shell = env.SHELL || '/bin/sh';
@@ -193,22 +335,15 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   };
 
   const spawnChild = (command: string[], proxyUrl: string): void => {
-    const env = { ...process.env };
-    delete env.ANTHROPIC_BASE_URL;
-    delete env.ANTHROPIC_UNIX_SOCKET;
-    env.HTTP_PROXY = proxyUrl;
-    env.http_proxy = proxyUrl;
-    env.HTTPS_PROXY = proxyUrl;
-    env.https_proxy = proxyUrl;
-    env.NODE_EXTRA_CA_CERTS = ca.certPath;
-    env.SSL_CERT_FILE = ca.bundlePath;
-    env.CURL_CA_BUNDLE = ca.bundlePath;
-    env.REQUESTS_CA_BUNDLE = ca.bundlePath;
+    const env = childEnvironment(process.env, proxyUrl, ca);
 
     const child = spawnResolved(command, env);
     let childLive = true;
     child.on('exit', () => {
       childLive = false;
+      // The wrapper is gone; anything it left behind is an orphan of a dead
+      // PID, and the proxy port it was handed dies with this process.
+      if (isWindows && child.pid) reapWindowsOrphans(child.pid);
     });
 
     process.on('exit', () => {
@@ -291,7 +426,15 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
           `non-pxpipe HTTPS in the child may fail verification — set SSL_CERT_FILE to your OS bundle before warp)`,
       );
     }
-    console.error(`[pxpipe] warp exec → ${command.join(' ')}`);
+    // Arguments are prompts and flags, which may carry tokens; stderr is
+    // captured by CI and service logs. Only the program is logged by default.
+    if (process.env.PXPIPE_WARP_DEBUG === '1') {
+      console.error(`[pxpipe] warp exec → ${command.join(' ')}`);
+    } else {
+      console.error(
+        `[pxpipe] warp exec → ${command[0]} (+${command.length - 1} argument(s); PXPIPE_WARP_DEBUG=1 to log them)`,
+      );
+    }
 
     proxy.on('error', (err) => {
       console.error(`[pxpipe] warp: proxy listener failed: ${err.message}`);
