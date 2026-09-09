@@ -12,6 +12,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { createWarpRuntime } from './warp/index.js';
 import {
   createProxy,
   parseGatewayHeaders,
@@ -263,6 +264,10 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
+  pxpipe warp [--route PATTERN=TARGET]... -- CMD
+                        run CMD behind a transparent CONNECT proxy without a
+                        custom base URL, so client-side first-party gates
+                        (/remote-control, claude.ai connectors) keep working.
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -1084,9 +1089,45 @@ async function main(): Promise<void> {
     await runExport(argv.slice(1));
     return; // server never starts
   }
-  // No subcommands — pxpipe is just the proxy. Stats / sessions / cleanup
-  // tools live in the dashboard (see http://127.0.0.1:${port}/).
-  const opts = parseCli(argv);
+
+  // `warp` runs an agent behind a CONNECT proxy and redirects its inference
+  // traffic into the pxpipe already running. It starts no proxy of its own, so
+  // it exits through its own branch below rather than falling through here.
+  let warpCommand: string[] | undefined;
+  const warpRoutes: string[] = [];
+  let cliArgv = argv;
+  if (argv[0] === 'warp') {
+    const sep = argv.indexOf('--');
+    warpCommand = sep < 0 ? [] : argv.slice(sep + 1);
+    const warpArgv = argv.slice(1, sep < 0 ? argv.length : sep);
+    const rest: string[] = [];
+    for (let i = 0; i < warpArgv.length; i += 1) {
+      const a = warpArgv[i]!;
+      if (a === '--route') {
+        const spec = warpArgv[i + 1];
+        if (spec === undefined) {
+          console.error('[pxpipe] warp: --route needs PATTERN=TARGET');
+          process.exit(2);
+        }
+        warpRoutes.push(spec);
+        i += 1;
+        continue;
+      }
+      if (a.startsWith('--route=')) {
+        warpRoutes.push(a.slice('--route='.length));
+        continue;
+      }
+      rest.push(a);
+    }
+    cliArgv = rest;
+  }
+
+  const opts = parseCli(cliArgv);
+
+  if (warpCommand) {
+    createWarpRuntime({ port: opts.port, routes: warpRoutes }).launch(warpCommand);
+    return;
+  }
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
   if (forcePassthrough) {
