@@ -173,15 +173,39 @@ function privateKeyPem(key: KeyObject): string {
 export function writeFileAtomic(path: string, data: string, mode: number): void {
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   writeFileSync(tmp, data, { mode });
-  try {
-    renameSync(tmp, path);
-  } catch (err) {
+  let renamed = false;
+  for (let attempt = 0; attempt < 10; attempt++) {
     try {
-      unlinkSync(tmp);
-    } catch {
-      /* nothing to clean */
+      renameSync(tmp, path);
+      renamed = true;
+      break;
+    } catch (err) {
+      // If another concurrent process already published the exact same content, we succeeded.
+      try {
+        if (existsSync(path) && readFileSync(path, 'utf8') === data) {
+          renamed = true;
+          break;
+        }
+      } catch {
+        /* proceed to retry */
+      }
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt < 9 && (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES')) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        continue;
+      }
+      try {
+        unlinkSync(tmp);
+      } catch {
+        /* nothing to clean */
+      }
+      throw err;
     }
-    throw err;
+  }
+  try {
+    if (existsSync(tmp)) unlinkSync(tmp);
+  } catch {
+    /* nothing to clean */
   }
 }
 
@@ -217,7 +241,11 @@ export function withDirectoryLock<T>(lockDir: string, fn: () => T, staleMs = 30_
   try {
     return fn();
   } finally {
-    rmSync(lockDir, { recursive: true, force: true });
+    try {
+      rmSync(lockDir, { recursive: true, force: true });
+    } catch {
+      /* ignore directory removal delay */
+    }
   }
 }
 
@@ -289,7 +317,9 @@ export class CertificateAuthority {
       const fallbackPath = join(dir, 'node-root-certificates.pem');
       const fallbackRoots = rootCertificates.join('\n') + '\n';
       try {
-        writeFileAtomic(fallbackPath, fallbackRoots, 0o644);
+        if (!existsSync(fallbackPath) || readFileSync(fallbackPath, 'utf8') !== fallbackRoots) {
+          writeFileAtomic(fallbackPath, fallbackRoots, 0o644);
+        }
         roots = fallbackRoots;
         systemRootsPath = fallbackPath;
       } catch {
@@ -297,7 +327,15 @@ export class CertificateAuthority {
       }
     }
     const sep = roots && !roots.endsWith('\n') ? '\n' : '';
-    writeFileAtomic(bundlePath, certPem + roots + sep, 0o644);
+    const content = certPem + roots + sep;
+    try {
+      if (existsSync(bundlePath) && readFileSync(bundlePath, 'utf8') === content) {
+        return { bundlePath, systemRootsPath: roots ? systemRootsPath : null };
+      }
+    } catch {
+      /* proceed to write */
+    }
+    writeFileAtomic(bundlePath, content, 0o644);
     return { bundlePath, systemRootsPath: roots ? systemRootsPath : null };
   }
 

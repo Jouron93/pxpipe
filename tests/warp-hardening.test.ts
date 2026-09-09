@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { connect as netConnect, type Socket } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPrivateKey, X509Certificate } from 'node:crypto';
@@ -26,7 +26,10 @@ import { createWarpHandlers, parseAuthority } from '../src/warp/connect.js';
 import {
   childEnvironment,
   defaultRoutes,
+  escapeCmdArg,
   findUnsafeCmdArgument,
+  killProcessTree,
+  reapWindowsOrphans,
   resolveShimTarget,
 } from '../src/warp/index.js';
 import { matchRoute, parseRoute, rewriteUrl } from '../src/warp/route.js';
@@ -104,13 +107,49 @@ describe('P1-4: codex on chatgpt.com is diverted, provider base URLs are strippe
       'http://127.0.0.1:5',
       { certPath: '/ca.pem', bundlePath: '/bundle.pem' },
     );
-    for (const k of ['ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'XAI_BASE_URL']) {
+    for (const k of ['ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'CODEX_BASE_URL', 'XAI_BASE_URL']) {
       expect(env[k], k).toBeUndefined();
     }
     expect(env.KEEP_ME).toBe('yes');
     expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:5');
     expect(env.NODE_EXTRA_CA_CERTS).toBe('/ca.pem');
     expect(env.SSL_CERT_FILE).toBe('/bundle.pem');
+  });
+
+  it('maps chatgpt.com/backend-api/codex without trailing slash and with query parameters', () => {
+    const routes = defaultRoutes(47821);
+    const route = matchRoute(routes, 'chatgpt.com:443', '/backend-api/codex');
+    expect(route).not.toBeNull();
+    expect(rewriteUrl(route!, '/backend-api/codex')).toBe('http://127.0.0.1:47821/v1');
+    expect(rewriteUrl(route!, '/backend-api/codex?client_version=1')).toBe(
+      'http://127.0.0.1:47821/v1?client_version=1',
+    );
+  });
+
+  it('removes provider base URLs case-insensitively and sanitizes NO_PROXY', () => {
+    const env = childEnvironment(
+      {
+        PATH: 'x',
+        openai_base_url: 'http://127.0.0.1:47822/v1',
+        CODEX_BASE_URL: 'http://127.0.0.1:47822/v1',
+        codex_api_base: 'http://127.0.0.1:47822/v1',
+        OPENAI_BASE_PATH: '/v1',
+        NO_PROXY: 'localhost,127.0.0.1,api.openai.com,chatgpt.com,internal.corp',
+        no_proxy: '*',
+        Keep_Me: 'ok',
+      },
+      'http://127.0.0.1:5',
+      { certPath: '/ca.pem', bundlePath: '/bundle.pem' },
+    );
+    expect(env.openai_base_url).toBeUndefined();
+    expect(env.OPENAI_BASE_URL).toBeUndefined();
+    expect(env.CODEX_BASE_URL).toBeUndefined();
+    expect(env.codex_api_base).toBeUndefined();
+    expect(env.OPENAI_BASE_PATH).toBeUndefined();
+    expect(env.Keep_Me).toBe('ok');
+    // Sanitize NO_PROXY: removed wildcard and intercepted domains, preserved other hosts
+    expect(env.NO_PROXY).toBe('localhost,127.0.0.1,internal.corp');
+    expect(env.no_proxy).toBeUndefined();
   });
 });
 
@@ -148,11 +187,89 @@ describe('P1-1: .cmd shims are unwrapped instead of run through cmd.exe', () => 
     expect(resolveShimTarget(join(d, 'absent.cmd'))).toBeNull();
   });
 
+  it('finds node scripts in shims using forward slashes, parent paths, or unquoted %~dp0', () => {
+    const d = tmp();
+    mkdirSync(join(d, 'node_modules', 'tool', 'bin'), { recursive: true });
+    writeFileSync(join(d, 'node_modules', 'tool', 'bin', 'cli.mjs'), '');
+    writeFileSync(
+      join(d, 'tool-slash.cmd'),
+      '@echo off\r\n"%dp0%/node_modules/tool/bin/cli.mjs" %*\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'tool-slash.cmd'))).toEqual({
+      kind: 'node',
+      script: join(d, 'node_modules', 'tool', 'bin', 'cli.mjs'),
+    });
+
+    writeFileSync(
+      join(d, 'tool-unquoted.cmd'),
+      '@echo off\r\nnode %~dp0\\node_modules\\tool\\bin\\cli.mjs %*\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'tool-unquoted.cmd'))).toEqual({
+      kind: 'node',
+      script: join(d, 'node_modules', 'tool', 'bin', 'cli.mjs'),
+    });
+
+    // Parent directory traversal: %~dp0..\node_modules\...
+    const sub = join(d, 'sub');
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(
+      join(sub, 'tool-parent.cmd'),
+      '@echo off\r\n"%~dp0..\\node_modules\\tool\\bin\\cli.mjs" %*\r\n',
+    );
+    expect(resolveShimTarget(join(sub, 'tool-parent.cmd'))).toEqual({
+      kind: 'node',
+      script: join(d, 'node_modules', 'tool', 'bin', 'cli.mjs'),
+    });
+
+    // Shim without separator after %~dp0: "%~dp0node_modules\..."
+    writeFileSync(
+      join(d, 'tool-nosep.cmd'),
+      '@echo off\r\n"%~dp0node_modules\\tool\\bin\\cli.mjs" %*\r\n',
+    );
+    expect(resolveShimTarget(join(d, 'tool-nosep.cmd'))).toEqual({
+      kind: 'node',
+      script: join(d, 'node_modules', 'tool', 'bin', 'cli.mjs'),
+    });
+  });
+
   it('names the argument cmd.exe would reinterpret', () => {
     expect(findUnsafeCmdArgument(['-p', 'plain prompt with spaces'])).toBeNull();
     expect(findUnsafeCmdArgument(['-p', 'run this & del *'])).toBe('run this & del *');
     expect(findUnsafeCmdArgument(['--x', '%USERPROFILE%'])).toBe('%USERPROFILE%');
     expect(findUnsafeCmdArgument(['say "hi"'])).toBe('say "hi"');
+    expect(findUnsafeCmdArgument(['pipe | bad'])).toBe('pipe | bad');
+    expect(findUnsafeCmdArgument(['redirect < in'])).toBe('redirect < in');
+    expect(findUnsafeCmdArgument(['redirect > out'])).toBe('redirect > out');
+    expect(findUnsafeCmdArgument(['caret ^ test'])).toBe('caret ^ test');
+    expect(findUnsafeCmdArgument(['exclamation ! test'])).toBe('exclamation ! test');
+    expect(findUnsafeCmdArgument(['parenthesis (bad)'])).toBe('parenthesis (bad)');
+    expect(findUnsafeCmdArgument(['line1\r\nline2'])).toBe('line1\r\nline2');
+  });
+
+  it('escapes arguments following Windows CommandLineToArgvW standards', () => {
+    expect(escapeCmdArg('')).toBe('""');
+    expect(escapeCmdArg('simple')).toBe('"simple"');
+    expect(escapeCmdArg('with spaces')).toBe('"with spaces"');
+    expect(escapeCmdArg('trailing\\')).toBe('"trailing\\\\"');
+    expect(escapeCmdArg('trailing two\\\\')).toBe('"trailing two\\\\\\\\"');
+    expect(escapeCmdArg('say "hi"')).toBe('"say \\"hi\\""');
+    expect(escapeCmdArg('back\\slash"quote\\')).toBe('"back\\slash\\"quote\\\\"');
+  });
+});
+
+describe('P1-2: process tree cleanup on launcher exit and orphan reaping', () => {
+  it('killProcessTree handles already-exited child process without throwing', () => {
+    const fakeChild = { pid: 9999999, kill: () => true } as unknown as import('node:child_process').ChildProcess;
+    expect(() => killProcessTree(fakeChild)).not.toThrow();
+  });
+
+  it('reapWindowsOrphans runs cleanly without throwing', () => {
+    expect(() => reapWindowsOrphans(9999999)).not.toThrow();
+  });
+
+  it('reapWindowsOrphans handles invalid or non-existent pid gracefully', () => {
+    expect(() => reapWindowsOrphans(0)).not.toThrow();
+    expect(() => reapWindowsOrphans(-1)).not.toThrow();
   });
 });
 
@@ -166,6 +283,14 @@ describe('P1-3: CA persistence is atomic, locked and self-consistent', () => {
     expect(readFileSync(p, 'utf8')).not.toContain('one');
     const leftovers = readdir(d).filter((n) => n.endsWith('.tmp'));
     expect(leftovers).toEqual([]);
+  });
+
+  it('writeFileAtomic succeeds when destination file already contains identical content', () => {
+    const d = tmp();
+    const target = join(d, 'atomic.txt');
+    writeFileSync(target, 'same content');
+    writeFileAtomic(target, 'same content', 0o644);
+    expect(readFileSync(target, 'utf8')).toBe('same content');
   });
 
   it('a cert whose key on disk belongs to another CA is replaced, not loaded', () => {
@@ -198,6 +323,17 @@ describe('P1-3: CA persistence is atomic, locked and self-consistent', () => {
     utimes(lock, past);
     expect(withDirectoryLock(lock, () => 'ran', 30_000, 200)).toBe('ran');
     expect(readdir(d)).not.toContain('lock');
+  });
+
+  it('writeBundle avoids re-writing bundle when disk content already matches', () => {
+    const d = tmp();
+    const ca = CertificateAuthority.loadOrCreate(d);
+    const bundlePath = ca.bundlePath;
+    const initialMtime = statSync(bundlePath).mtimeMs;
+    // Calling loadOrCreate again should find the existing CA and bundle without modifying mtime
+    const ca2 = CertificateAuthority.loadOrCreate(d);
+    expect(ca2.certPath).toBe(ca.certPath);
+    expect(statSync(bundlePath).mtimeMs).toBe(initialMtime);
   });
 });
 
