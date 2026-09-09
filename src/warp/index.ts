@@ -242,6 +242,8 @@ export function escapeCmdArg(a: string): string {
  * - CreationDate verification: ignores reused PIDs created before the root process.
  * - Multi-generational ancestor seeding: seeds with root PID and any known intermediate child PIDs.
  * - PowerShell status checking: only accepts exit status 0 without errors.
+ * - Known intermediates die too: an extra seed is a live descendant we tracked, so it goes
+ *   on the kill list itself (Astra round 3, P1-2 §2.2: seeds were only ever expanded).
  */
 export function reapWindowsOrphans(parentPid: number, extraSeedPids: readonly number[] = []): void {
   if (!parentPid || parentPid <= 0) return;
@@ -252,8 +254,10 @@ export function reapWindowsOrphans(parentPid: number, extraSeedPids: readonly nu
     `$procs = Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate; ` +
     `$queue = [System.Collections.Generic.Queue[int]]::new(); ` +
     `$visited = [System.Collections.Generic.HashSet[int]]::new(); ` +
-    `foreach ($id in @(${seedList})) { if ($visited.Add($id)) { $queue.Enqueue($id); } } ` +
     `$toKill = [System.Collections.Generic.List[int]]::new(); ` +
+    `foreach ($id in @(${seedList})) { if ($visited.Add($id)) { $queue.Enqueue($id); ` +
+      `if ($id -ne ${parentPid}) { $live = $procs | Where-Object { $_.ProcessId -eq $id }; ` +
+      `if ($live -and $live.CreationDate -ge $minDate) { $toKill.Add($id); } } } } ` +
     `while ($queue.Count -gt 0) { ` +
       `$cur = $queue.Dequeue(); ` +
       `foreach ($p in $procs) { ` +

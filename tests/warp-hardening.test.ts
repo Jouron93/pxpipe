@@ -12,6 +12,7 @@
  *
  * Run just this file:  pnpm vitest run tests/warp-hardening.test.ts
  */
+import { spawn } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { connect as netConnect, type Socket } from 'node:net';
@@ -271,6 +272,24 @@ describe('P1-2: process tree cleanup on launcher exit and orphan reaping', () =>
   it('reapWindowsOrphans runs cleanly without throwing', () => {
     expect(() => reapWindowsOrphans(9999999)).not.toThrow();
   });
+
+  it.skipIf(process.platform !== 'win32')(
+    'reapWindowsOrphans kills a tracked intermediate that is passed as an extra seed',
+    async () => {
+      // A known live descendant with no children of its own: before round 3 the seed loop
+      // only expanded seeds, so this process was never put on the kill list.
+      const child = spawn('ping.exe', ['-n', '30', '127.0.0.1'], { stdio: 'ignore', windowsHide: true });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(child.exitCode).toBeNull();
+      reapWindowsOrphans(9999999, [child.pid!]);
+      await new Promise<void>((r) => {
+        if (child.exitCode !== null) return r();
+        child.once('exit', () => r());
+        setTimeout(r, 4000);
+      });
+      expect(child.exitCode).not.toBeNull();
+    },
+  );
 
   it('reapWindowsOrphans handles invalid or non-existent pid gracefully', () => {
     expect(() => reapWindowsOrphans(0)).not.toThrow();
