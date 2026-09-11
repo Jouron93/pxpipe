@@ -126,7 +126,9 @@ export function isClaudeModel(model: string | null | undefined): boolean {
 
 export function isGrokModel(model: string | null | undefined): boolean {
   const m = (model ?? '').toLowerCase();
-  return m.startsWith('grok') || m.startsWith('xai/');
+  if (m.startsWith('grok') || m.startsWith('xai/')) return true;
+  const profile = resolveModelProfile(model ?? '');
+  return profile.family === 'grok';
 }
 
 export function isAgyModel(model: string | null | undefined): boolean {
@@ -879,6 +881,9 @@ export async function transformOpenAIChatCompletions(
     info.modelCanonicalId = profile.canonicalId;
     info.contextWindowTokens = profile.contextWindowTokens;
     info.maxOutputTokens = profile.maxOutputTokens;
+    if (profile.family === 'grok' && profile.canonicalId) {
+      req.model = profile.canonicalId;
+    }
   }
   info.shadowAdmission = estimateAdmission({
     model: req.model,
@@ -1091,6 +1096,9 @@ export async function transformOpenAIResponses(
     info.modelCanonicalId = profile.canonicalId;
     info.contextWindowTokens = profile.contextWindowTokens;
     info.maxOutputTokens = profile.maxOutputTokens;
+    if (profile.family === 'grok' && profile.canonicalId) {
+      req.model = profile.canonicalId;
+    }
   }
   info.shadowAdmission = estimateAdmission({
     model: req.model,

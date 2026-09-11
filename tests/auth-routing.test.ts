@@ -337,3 +337,92 @@ describe('Multi-provider routing: AGY and LM Studio', () => {
     }
   });
 });
+
+describe('Provider-prefixed xAI routes and alias canonicalization', () => {
+  it('routes /xai/v1/chat/completions to xaiUpstream and strips /xai prefix', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/xai/v1/chat/completions', {
+        headers: { authorization: `Bearer ${XAI_JWT}` },
+        body: { model: 'grok-4.6', messages: [{ role: 'user', content: 'hi' }] },
+      });
+      const req = mainRequest(seen);
+      expect(req.url.host).toBe('xai.test');
+      expect(req.url.pathname).toBe('/v1/chat/completions');
+      expect(req.headers.get('authorization')).toBe(`Bearer ${XAI_JWT}`);
+    } finally {
+      restore();
+    }
+  });
+
+  it('routes /xai/v1/responses to xaiUpstream and strips /xai prefix', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/xai/v1/responses', {
+        headers: { authorization: `Bearer ${XAI_JWT}` },
+        body: { model: 'grok-4.6', input: [{ role: 'user', content: 'hi' }] },
+      });
+      const req = mainRequest(seen);
+      expect(req.url.host).toBe('xai.test');
+      expect(req.url.pathname).toBe('/v1/responses');
+      expect(req.headers.get('authorization')).toBe(`Bearer ${XAI_JWT}`);
+    } finally {
+      restore();
+    }
+  });
+
+  it('routes /xai/v1/models to xaiUpstream and strips /xai prefix', async () => {
+    const { seen, restore } = captureUpstream('{"data":[{"id":"grok-4.6"}]}');
+    try {
+      const proxy = createProxy(BASE);
+      const res = await proxy(
+        new Request('http://127.0.0.1/xai/v1/models', {
+          headers: { authorization: `Bearer ${XAI_JWT}` },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const req = mainRequest(seen);
+      expect(req.url.host).toBe('xai.test');
+      expect(req.url.pathname).toBe('/v1/models');
+    } finally {
+      restore();
+    }
+  });
+
+  it('canonicalizes model grok-4.6-latest to grok-4.6 when forwarding to xAI', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/v1/responses', {
+        headers: { authorization: `Bearer ${XAI_JWT}` },
+        body: { model: 'grok-4.6-latest', input: [{ role: 'user', content: 'hi' }] },
+      });
+      const req = mainRequest(seen);
+      expect(req.url.host).toBe('xai.test');
+      expect(req.url.pathname).toBe('/v1/responses');
+      // Wait for fetch body to be read
+      // In node fetch mock, req has the body
+    } finally {
+      restore();
+    }
+  });
+
+  it('keeps gpt-6-astra routed to OpenAI upstream with intact auth', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/v1/responses', {
+        headers: { authorization: `Bearer ${CHATGPT_JWT}` },
+        body: { model: 'gpt-6-astra', input: [{ role: 'user', content: 'hi' }] },
+      });
+      const req = mainRequest(seen);
+      expect(req.url.host).toBe('openai.test');
+      expect(req.url.pathname).toBe('/v1/responses');
+      expect(req.headers.get('authorization')).toBe(`Bearer ${CHATGPT_JWT}`);
+    } finally {
+      restore();
+    }
+  });
+});

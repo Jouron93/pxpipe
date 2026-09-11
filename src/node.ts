@@ -39,6 +39,7 @@ import {
   type DashboardRoute,
 } from './dashboard.js';
 import { applyRuntimeConfigOverrides } from './core/model-registry.js';
+import { applyModelScopeFromConfig } from './core/model-scope-config.js';
 import { fetchUpstreamCodexModels } from './core/codex-models.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
@@ -72,14 +73,9 @@ interface RuntimeConfig {
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
 
-function normalizeModelsConfig(value: unknown): string | undefined {
-  if (Array.isArray(value)) {
-    const models = value.map((v) => String(v).trim()).filter(Boolean);
-    return models.length > 0 ? models.join(',') : 'off';
-  }
-  if (typeof value === 'string') return value.trim() || 'off';
-  return undefined;
-}
+// normalizeModelsConfig + the scope fill live in ./core/model-scope-config.js so
+// they are testable: node.ts calls main() at import time, so a test importing
+// this file would start the proxy.
 
 function applyConfigFileDefaults(): void {
   const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
@@ -107,11 +103,9 @@ function applyConfigFileDefaults(): void {
   applyRuntimeConfigOverrides(cfg);
 
   // Env wins over file config. The dashboard can still override the scope at
-  // runtime (in-memory) for an emergency live flip.
-  if (process.env.PXPIPE_MODELS === undefined) {
-    const models = normalizeModelsConfig(cfg.models);
-    if (models !== undefined) process.env.PXPIPE_MODELS = models;
-  }
+  // runtime (in-memory) for an emergency live flip. A set-but-blank env counts
+  // as absent — see applyModelScopeFromConfig for the measured regression.
+  applyModelScopeFromConfig(cfg);
   if (process.env.PXPIPE_AGY_MONTHLY_USD === undefined) {
     const monthly = cfg.agy_monthly_subscription_usd;
     if (typeof monthly === 'number' || typeof monthly === 'string') {

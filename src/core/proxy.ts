@@ -7,6 +7,7 @@ import { transformRequest, type TransformOptions, type TransformInfo } from './t
 import { isAgyModel, isClaudeModel, isGrokModel, isLmStudioModel, isNimModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel, minCompressBodyBytes } from './applicability.js';
 import { isAnthropicCredential, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
+import { resolveModelProfile } from './model-registry.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -187,15 +188,25 @@ function readRateLimitTelemetry(headers: Headers): RateLimitTelemetry | undefine
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
 
-/** Read the top-level `model` field from a /v1/messages body without parsing the full JSON.
- *  Returns null when not found — callers treat null as outside supported scope (fail-closed). */
+/** Read the top-level `model` field from a request body.
+ *  Returns null when not found — callers treat null as outside supported scope (fail-closed).
+ *
+ *  Do NOT reintroduce a "scan the first N bytes with a regex" fast path. Two ways
+ *  it silently costs money, both observed in ~/.pxpipe/events.jsonl:
+ *    1. Truncation. A window (we shipped 128 KiB) drops `model` on any body that
+ *       serializes it past the cap. JSON.parse of the truncated slice then throws,
+ *       readModelField returns null, the gate fails closed to
+ *       reason:"unsupported_model", and the request is forwarded UNCOMPRESSED —
+ *       i.e. the fallback charges full price on exactly the largest requests.
+ *    2. False positives. /"model"\s*:\s*"..."/ takes the FIRST match anywhere in
+ *       the slice, including a `"model": "..."` string sitting inside message
+ *       content, so a pasted log could pick the gate's model for it.
+ *  Parsing the whole body and reading only the top-level key avoids both. The
+ *  cost is a JSON.parse the transform path performs anyway. */
 function readModelField(body: Uint8Array): string | null {
   try {
-    const text = new TextDecoder().decode(body.subarray(0, 131072));
-    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(text);
-    if (m) return m[1]!;
-    const j = JSON.parse(text) as { model?: unknown };
-    return typeof j?.model === 'string' ? j.model : null;
+    const value = JSON.parse(new TextDecoder().decode(body)) as { model?: unknown };
+    return typeof value.model === 'string' && value.model.length <= 200 ? value.model : null;
   } catch {
     return null;
   }
@@ -812,13 +823,17 @@ function isProviderPrefixedPath(pathname: string): boolean {
 }
 
 function isOpenAIChatPath(pathname: string): boolean {
-  return pathname === '/v1/chat/completions' || pathname === '/openai/v1/chat/completions';
+  return pathname === '/v1/chat/completions'
+    || pathname === '/openai/v1/chat/completions'
+    || pathname === '/xai/v1/chat/completions';
 }
 
 function isOpenAIResponsesPath(pathname: string): boolean {
   return pathname === '/v1/responses'
     || pathname === '/openai/v1/responses'
-    || pathname === '/openai/responses';
+    || pathname === '/openai/responses'
+    || pathname === '/xai/v1/responses'
+    || pathname === '/xai/responses';
 }
 
 /** True when the client's Authorization bearer is unambiguously an Anthropic
@@ -834,7 +849,12 @@ function isAnthropicBearer(headers: Headers): boolean {
 }
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
-  const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
+  const isModelsPath = pathname === '/v1/models'
+    || pathname.startsWith('/v1/models/')
+    || pathname === '/openai/v1/models'
+    || pathname.startsWith('/openai/v1/models/')
+    || pathname === '/xai/v1/models'
+    || pathname.startsWith('/xai/v1/models/');
   // `hasOpenAIKey` stays an independent signal: in that case the proxy REPLACES
   // the client's Authorization with its own OpenAI key, so the client's
   // credential shape is irrelevant. The client-bearer signal is only trusted
@@ -846,6 +866,12 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
+    || pathname === '/openai/v1/chat/completions'
+    || pathname === '/openai/v1/responses'
+    || pathname === '/openai/responses'
+    || pathname === '/xai/v1/chat/completions'
+    || pathname === '/xai/v1/responses'
+    || pathname === '/xai/responses'
     || (isModelsPath && looksOpenAIAuth);
 }
 
@@ -1314,16 +1340,19 @@ export function createProxy(config: ProxyConfig = {}) {
       ?? (typeof process !== 'undefined' ? process.env?.NIM_UPSTREAM : undefined)
       ?? DEFAULT_NIM_UPSTREAM).replace(/\/+$/, '');
     const initialUa = (req.headers.get('user-agent') || '').toLowerCase();
-    const isGrokCallerInitial = initialUa.includes('grok');
-    let upstreamBase = providerPrefixed
-      ? passthroughUpstream
-      : isGrokCallerInitial
-        ? xaiUpstream
-        : isOpenAIPath
-          ? openAIUpstream
-          : upstream;
-    let stripOpenAIV1ForRequest = isGrokCallerInitial ? false : routes.stripOpenAIV1;
-    let isGrokLane = isGrokCallerInitial;
+    const isXaiPrefixed = routePath.startsWith('/xai/');
+    const isGrokCallerInitial = initialUa.includes('grok') || isXaiPrefixed;
+    let upstreamBase = isXaiPrefixed
+      ? (config.provider === 'cloudflare-ai-gateway' ? passthroughUpstream : xaiUpstream)
+      : providerPrefixed
+        ? passthroughUpstream
+        : isGrokCallerInitial
+          ? xaiUpstream
+          : isOpenAIPath
+            ? openAIUpstream
+            : upstream;
+    let stripOpenAIV1ForRequest = (isGrokCallerInitial || isXaiPrefixed) ? false : routes.stripOpenAIV1;
+    let isGrokLane = isGrokCallerInitial || isXaiPrefixed;
     let isAgyLane = false;
     let isLmStudioLane = false;
     let isNimLane = false;
@@ -1441,8 +1470,14 @@ export function createProxy(config: ProxyConfig = {}) {
         if (isGrokLane) {
           try {
             const parsed = JSON.parse(new TextDecoder().decode(r.body)) as Record<string, unknown>;
+            if (typeof parsed.model === 'string') {
+              const prof = resolveModelProfile(parsed.model);
+              if (prof.family === 'grok' && prof.canonicalId) {
+                parsed.model = prof.canonicalId;
+              }
+            }
             const existing = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : '';
-            const modelTag = String(model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_');
+            const modelTag = String(model || parsed.model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_');
             grokCacheKey = existing || `pxpipe-grok-${modelTag}`;
             if (!existing) parsed.prompt_cache_key = grokCacheKey;
             r.body = new TextEncoder().encode(JSON.stringify(parsed));
@@ -1640,7 +1675,10 @@ export function createProxy(config: ProxyConfig = {}) {
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
     // Grok → api.x.ai keeps `/v1` (stripOpenAIV1ForRequest=false).
-    const outPath = isOpenAIPath && stripOpenAIV1ForRequest ? path.replace(/^\/v1(?=\/)/, '') : path;
+    let outPath = isOpenAIPath && stripOpenAIV1ForRequest ? path.replace(/^\/v1(?=\/)/, '') : path;
+    if (upstreamBase === xaiUpstream && config.provider !== 'cloudflare-ai-gateway') {
+      outPath = outPath.replace(/^\/xai(?=\/)/, '').replace(/^\/openai(?=\/)/, '');
+    }
     const upstreamUrl = upstreamBase + outPath;
     // A streamed request body is consumed by the first attempt and cannot be
     // replayed, so those requests are never retried regardless of status.
@@ -1766,7 +1804,9 @@ export function createProxy(config: ProxyConfig = {}) {
     const isModelsReq = routePath === '/v1/models'
       || routePath.startsWith('/v1/models/')
       || routePath === '/openai/v1/models'
-      || routePath.startsWith('/openai/v1/models/');
+      || routePath.startsWith('/openai/v1/models/')
+      || routePath === '/xai/v1/models'
+      || routePath.startsWith('/xai/v1/models/');
 
     if (isModelsReq && upstreamRes.status === 200) {
       try {

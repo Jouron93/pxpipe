@@ -305,9 +305,9 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
   const registryProfile = resolveModelProfile(model ?? '');
   return {
     vision: builtin.vision,
-    stripCols: registryProfile.renderProfile.stripCols,
-    maxHeightPx: registryProfile.renderProfile.maxHeightPx,
-    style: registryProfile.renderProfile.style,
+    stripCols: registryProfile.renderProfile.stripCols ?? builtin.stripCols,
+    maxHeightPx: registryProfile.renderProfile.maxHeightPx ?? builtin.maxHeightPx,
+    style: registryProfile.renderProfile.style ?? builtin.style,
   };
 }
 

@@ -268,6 +268,19 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     factsheetEnabled: true,
     aliases: ['gpt-5.3-codex-spark', 'codex-5.3', 'codex-spark'],
   },
+  {
+    canonicalId: 'gpt-6-astra',
+    displayName: 'GPT-6 Astra',
+    family: 'openai',
+    status: 'validated',
+    enabledByDefault: false,
+    pricing: { inputPerMtok: 10, cacheWritePerMtok: 12.5, cacheReadPerMtok: 1, outputPerMtok: 50 },
+    renderProfile: DEFAULT_GPT_RENDER,
+    contextWindowTokens: 1_050_000,
+    maxOutputTokens: 128_000,
+    factsheetEnabled: true,
+    aliases: ['gpt-6-astra-2026-06-01', 'codex-astra', 'astra', 'gpt-6'],
+  },
 
   // --- GROK FAMILY ---
   {
@@ -1044,6 +1057,10 @@ export function resolveModelProfile(modelId: string, _route?: PricingRouteOverri
     const profile = profileRegistry.get('gpt-5.6-luna');
     if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };
   }
+  if (norm.startsWith('gpt-6-astra') || norm.startsWith('gpt-6') || norm === 'astra' || norm.startsWith('codex-astra')) {
+    const profile = profileRegistry.get('gpt-6-astra');
+    if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };
+  }
   if (norm.startsWith('gpt-5.5') || norm.startsWith('gpt-5-5')) {
     const profile = profileRegistry.get('gpt-5.5');
     if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };
@@ -1115,15 +1132,16 @@ export function applyRuntimeConfigOverrides(config: Record<string, any>): void {
       if (!raw || typeof raw !== 'object') continue;
       const rec = raw as { style?: Record<string, unknown>; cellWBonus?: number; cellHBonus?: number; stripCols?: number; maxHeightPx?: number };
       const style = rec.style && typeof rec.style === 'object' ? rec.style : rec;
+      const renderProfile: Partial<ModelRenderProfile> = { style: style as unknown as GptRenderStyle };
+      const cellWBonus = rec.cellWBonus ?? (style as { cellWBonus?: number }).cellWBonus;
+      if (cellWBonus !== undefined) renderProfile.cellWBonus = cellWBonus;
+      const cellHBonus = rec.cellHBonus ?? (style as { cellHBonus?: number }).cellHBonus;
+      if (cellHBonus !== undefined) renderProfile.cellHBonus = cellHBonus;
+      if (rec.stripCols !== undefined) renderProfile.stripCols = rec.stripCols;
+      if (rec.maxHeightPx !== undefined) renderProfile.maxHeightPx = rec.maxHeightPx;
       applyProfileMap({
         [key]: {
-          renderProfile: {
-            cellWBonus: rec.cellWBonus ?? (style as { cellWBonus?: number }).cellWBonus,
-            cellHBonus: rec.cellHBonus ?? (style as { cellHBonus?: number }).cellHBonus,
-            stripCols: rec.stripCols,
-            maxHeightPx: rec.maxHeightPx,
-            style,
-          },
+          renderProfile,
         },
       });
     }
@@ -1191,8 +1209,10 @@ function applyProfileMap(profilesConfig: Record<string, unknown>): void {
 
     if (override.renderProfile && typeof override.renderProfile === 'object') {
       existingProfile.renderProfile = {
-        ...existingProfile.renderProfile,
-        ...override.renderProfile,
+        cellWBonus: override.renderProfile.cellWBonus ?? existingProfile.renderProfile.cellWBonus,
+        cellHBonus: override.renderProfile.cellHBonus ?? existingProfile.renderProfile.cellHBonus,
+        stripCols: override.renderProfile.stripCols ?? existingProfile.renderProfile.stripCols,
+        maxHeightPx: override.renderProfile.maxHeightPx ?? existingProfile.renderProfile.maxHeightPx,
         style: {
           ...existingProfile.renderProfile.style,
           ...(override.renderProfile.style || {}),

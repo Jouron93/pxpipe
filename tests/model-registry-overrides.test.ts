@@ -127,4 +127,79 @@ describe('model-registry runtime overrides', () => {
     expect(customProfile.displayName).toBe('Custom Brand New Model');
     expect(customProfile.contextWindowTokens).toBe(500_000);
   });
+
+  it('preserves stripCols and maxHeightPx when imaging_profiles contains only style', () => {
+    applyRuntimeConfigOverrides({
+      imaging_profiles: {
+        'grok-4.6': {
+          style: {
+            cellWBonus: 0,
+            cellHBonus: 0,
+            aa: true,
+            grid: false,
+          },
+        },
+        'gpt-6-astra': {
+          style: {
+            cellWBonus: 0,
+            cellHBonus: 0,
+            aa: true,
+            grid: false,
+          },
+        },
+      },
+    });
+
+    const grok = resolveModelProfile('grok-4.6');
+    expect(grok.renderProfile.stripCols).toBe(152);
+    expect(grok.renderProfile.maxHeightPx).toBe(512);
+
+    const astra = resolveModelProfile('gpt-6-astra');
+    expect(astra.renderProfile.stripCols).toBe(152);
+    expect(astra.renderProfile.maxHeightPx).toBe(1932);
+  });
+
+  it('compresses static instructions for grok-4.6 on Responses endpoint', async () => {
+    const { transformOpenAIResponses } = await import('../src/core/openai.js');
+    const lines: string[] = [];
+    for (let i = 1; i <= 350; i++) {
+      lines.push(`Section ${i}: Ensure that system module ${i} operates according to standard guidelines and processes user requests gracefully without failing.`);
+    }
+    const instructions = '# SYSTEM CODING RULES\n' + lines.join('\n');
+    const req = {
+      model: 'grok-4.6',
+      instructions,
+      input: [{ role: 'user', content: 'Hello' }],
+    };
+    const body = new TextEncoder().encode(JSON.stringify(req));
+    const res = await transformOpenAIResponses(body, { compress: true });
+    expect(res.info.compressed).toBe(true);
+    expect(res.info.imageCount).toBe(6);
+    expect(res.info.imageTokens).toBe(2057);
+    expect(res.info.modelCanonicalId).toBe('grok-4.6');
+    expect(res.info.gateEval?.profitable).toBe(true);
+  });
+
+  it('canonicalizes grok-4.6-latest and compresses static instructions', async () => {
+    const { transformOpenAIResponses } = await import('../src/core/openai.js');
+    const { isPxpipeSupportedGptModel } = await import('../src/core/applicability.js');
+    expect(isPxpipeSupportedGptModel('grok-4.6-latest')).toBe(true);
+
+    const lines: string[] = [];
+    for (let i = 1; i <= 350; i++) {
+      lines.push(`Section ${i}: Ensure that system module ${i} operates according to standard guidelines.`);
+    }
+    const instructions = '# RULES\n' + lines.join('\n');
+    const req = {
+      model: 'grok-4.6-latest',
+      instructions,
+      input: [{ role: 'user', content: 'Hello' }],
+    };
+    const body = new TextEncoder().encode(JSON.stringify(req));
+    const res = await transformOpenAIResponses(body, { compress: true });
+    expect(res.info.compressed).toBe(true);
+    expect(res.info.modelCanonicalId).toBe('grok-4.6');
+    const transformed = JSON.parse(new TextDecoder().decode(res.body));
+    expect(transformed.model).toBe('grok-4.6');
+  });
 });
