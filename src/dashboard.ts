@@ -1764,6 +1764,7 @@ export type DashboardRoute =
   | { kind: 'png' } // /proxy-latest-png
   | { kind: 'health' } // /health, /v1/health — liveness probe
   | { kind: 'version' } // /version, /api/version
+  | { kind: 'build-info' } // /build-info, /api/build-info, /v1/build-info — immutable build provenance
   | { kind: 'props' } // /v1/props
   | { kind: 'models' } // /v1/models, /api/v1/models, /models, /models.json, /api/tags
   | { kind: 'api-sessions' } // /api/sessions.json
@@ -1781,6 +1782,7 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
   if (pathname === '/health' || pathname === '/v1/health') return { kind: 'health' };
   if (pathname === '/version' || pathname === '/api/version') return { kind: 'version' };
+  if (pathname === '/build-info' || pathname === '/api/build-info' || pathname === '/v1/build-info') return { kind: 'build-info' };
   if (pathname === '/v1/props') return { kind: 'props' };
   if (
     pathname === '/v1/models' ||

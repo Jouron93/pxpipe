@@ -82,6 +82,12 @@ describe('dashboardPath()', () => {
     expect(dashboardPath('/v1/health')?.kind).toBe('health');
   });
 
+  it('matches immutable build-info routes', () => {
+    expect(dashboardPath('/build-info')?.kind).toBe('build-info');
+    expect(dashboardPath('/api/build-info')?.kind).toBe('build-info');
+    expect(dashboardPath('/v1/build-info')?.kind).toBe('build-info');
+  });
+
   it('matches the new /api/* routes', () => {
     expect(dashboardPath('/api/sessions.json')?.kind).toBe('api-sessions');
     expect(dashboardPath('/api/stats.json')?.kind).toBe('api-stats');
