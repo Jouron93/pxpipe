@@ -66,4 +66,14 @@ describe('BuildProvenance', () => {
     expect(resolved.repository).toBe('test/repo');
     expect(Object.isFrozen(resolved)).toBe(true);
   });
+
+  it('provides runtime Node identity and bundle verification flags', () => {
+    expect(initialProvenance.node_executable).toBeTruthy();
+    expect(initialProvenance.node_version).toBeTruthy();
+    if (initialProvenance.runtime_node_executable !== undefined) {
+      expect(initialProvenance.runtime_node_executable).toBe(process.execPath);
+      expect(initialProvenance.runtime_node_version).toBe(process.version);
+      expect(typeof initialProvenance.runtime_pid).toBe('number');
+    }
+  });
 });

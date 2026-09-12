@@ -67,34 +67,49 @@ console.log('✓ built dist/node.js');
 const nodeJsContent = await readFile('dist/node.js');
 const entrySha256 = createHash('sha256').update(nodeJsContent).digest('hex');
 
-function getGitValue(args, fallback = '') {
-  try {
-    const res = spawnSync('git', args, { encoding: 'utf8' });
-    if (res.status === 0 && res.stdout) {
-      return res.stdout.trim();
-    }
-  } catch {
-    // Git not available
+function runGit(args) {
+  const res = spawnSync('git', args, { encoding: 'utf8' });
+  if (res.status !== 0 || res.error) {
+    throw new Error(`git ${args.join(' ')} failed (exit ${res.status}): ${res.stderr || res.error?.message || ''}`);
   }
-  return fallback;
+  return (res.stdout || '').trim();
 }
 
-const gitCommit =
-  process.env.GIT_COMMIT ||
-  process.env.SOURCE_SHA ||
-  getGitValue(['rev-parse', 'HEAD'], 'unbuilt');
-const gitRef =
-  process.env.SOURCE_REF ||
-  getGitValue(['rev-parse', '--abbrev-ref', 'HEAD'], 'unknown');
-const gitStatus = getGitValue(['status', '--porcelain'], '');
-const isDirty =
-  process.env.GIT_DIRTY != null
-    ? process.env.GIT_DIRTY === 'true' || process.env.GIT_DIRTY === '1'
-    : gitStatus.length > 0;
+let gitCommit;
+let gitRef;
+let isDirty;
+let repository;
+
+try {
+  gitCommit = runGit(['rev-parse', 'HEAD']);
+  if (!/^[0-9a-f]{40}$/i.test(gitCommit)) {
+    throw new Error(`invalid 40-character git commit SHA: '${gitCommit}'`);
+  }
+  gitRef = runGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const statusOut = runGit(['status', '--porcelain']);
+  isDirty = statusOut.length > 0;
+
+  let remoteUrl = '';
+  try {
+    remoteUrl = runGit(['config', '--get', 'remote.origin.url']);
+  } catch {
+    try {
+      remoteUrl = runGit(['config', '--get', 'remote.fork.url']);
+    } catch {
+      // Remote url not configured
+    }
+  }
+  const match = remoteUrl.match(/[:/]([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+?)(?:\.git)?$/);
+  repository = match ? match[1] : (remoteUrl || 'Jouron93/pxpipe');
+} catch (err) {
+  console.error(`✗ Build provenance error: ${err.message}`);
+  console.error(`  Builds MUST be executed in a valid git repository with git available.`);
+  process.exit(1);
+}
 
 const provenance = {
   schema_version: 1,
-  repository: 'Jouron93/pxpipe',
+  repository,
   source_sha: gitCommit,
   source_ref: gitRef,
   dirty: isDirty,

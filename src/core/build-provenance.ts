@@ -1,5 +1,6 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 export interface BuildProvenance {
@@ -13,6 +14,11 @@ export interface BuildProvenance {
   node_version: string;
   built_at_utc: string;
   entry_sha256: string;
+  runtime_node_executable?: string;
+  runtime_node_version?: string;
+  runtime_pid?: number;
+  runtime_entry_sha256?: string;
+  bundle_verified?: boolean;
 }
 
 let cachedProvenance: BuildProvenance | null = null;
@@ -51,7 +57,28 @@ export function getBuildProvenance(): BuildProvenance {
           typeof parsed.source_sha === 'string' &&
           typeof parsed.entry_sha256 === 'string'
         ) {
-          cachedProvenance = Object.freeze({ ...parsed });
+          let runtimeEntrySha256: string | undefined;
+          let bundleVerified = false;
+          try {
+            const candidateDir = path.dirname(candidate);
+            const bundlePath = path.join(candidateDir, 'node.js');
+            if (existsSync(bundlePath)) {
+              const bundleBytes = readFileSync(bundlePath);
+              runtimeEntrySha256 = createHash('sha256').update(bundleBytes).digest('hex');
+              bundleVerified = runtimeEntrySha256 === parsed.entry_sha256;
+            }
+          } catch {
+            // Bundle verification failed
+          }
+
+          cachedProvenance = Object.freeze({
+            ...parsed,
+            runtime_node_executable: process.execPath,
+            runtime_node_version: process.version,
+            runtime_pid: process.pid,
+            runtime_entry_sha256: runtimeEntrySha256,
+            bundle_verified: bundleVerified,
+          });
           return cachedProvenance;
         }
       }
