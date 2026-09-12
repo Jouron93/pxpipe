@@ -429,7 +429,14 @@ export function cacheReadRatio(
   if (norm.startsWith('grok-4.3')) {
     return 0.16;
   }
-  if (norm.includes('grok')) {
+  if (
+    norm.startsWith('grok-4.6') ||
+    norm.startsWith('grok-4-6') ||
+    norm === 'grok' ||
+    norm === 'grok-latest' ||
+    norm.startsWith('grok-4') ||
+    norm.startsWith('grok-4-0')
+  ) {
     return 0.25;
   }
   return 1;
