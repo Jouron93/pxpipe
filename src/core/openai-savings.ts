@@ -91,3 +91,64 @@ export function computeOpenAIBaselineInputEff(
   const deltaWeight = (cachedTokens || 0) > 0 ? openAICacheReadRate(model) : 1.0;
   return actual + delta * deltaWeight;
 }
+
+/**
+ * Profitability Gate V2 — decide whether imaging beats leaving text native,
+ * counting provider prompt-cache discounts. Distinct from pxpipe's local PNG
+ * render cache: this is the provider's prefix-equality cache
+ * (`cached_tokens` / `x-grok-conv-id` / `prompt_cache_key`).
+ *
+ * Warm Grok text is billed at GROK_CACHE_READ_RATE (0.25 = 75% off). Imaging
+ * that prefix pays full vision tokens and busts the cached text. If discounted
+ * native text is cheaper, KEEP TEXT.
+ */
+export interface CacheAwareGateInput {
+  model?: string;
+  textTokens: number;
+  imageTokens: number;
+  preservedTextTokens?: number;
+  /** True when this turn is expected to hit a warm provider prompt cache. */
+  providerCacheLikely?: boolean;
+}
+
+export type CacheAwareGateReason =
+  | 'warm_cached_text_cheaper'
+  | 'image_cheaper'
+  | 'text_cheaper'
+  | 'marginal';
+
+export interface CacheAwareGateResult {
+  profitable: boolean;
+  cacheWeight: number;
+  textCost: number;
+  imageCost: number;
+  reason: CacheAwareGateReason;
+}
+
+export function evalCacheAwareProfitability(input: CacheAwareGateInput): CacheAwareGateResult {
+  const textTokens = Math.max(0, input.textTokens || 0);
+  const imageTokens = Math.max(0, input.imageTokens || 0);
+  const preserved = Math.max(0, input.preservedTextTokens || 0);
+  const imageCost = imageTokens + preserved;
+  const cacheWeight = input.providerCacheLikely ? openAICacheReadRate(input.model) : 1;
+  const textCost = textTokens * cacheWeight;
+  const delta = textCost - imageCost;
+  if (input.providerCacheLikely) {
+    // Noisy/marginal warm savings are not worth busting a cached prefix.
+    const material = Math.max(32, textCost * 0.05);
+    if (imageCost >= textCost || delta < material) {
+      return {
+        profitable: false,
+        cacheWeight,
+        textCost,
+        imageCost,
+        reason: imageCost >= textCost ? 'warm_cached_text_cheaper' : 'marginal',
+      };
+    }
+    return { profitable: true, cacheWeight, textCost, imageCost, reason: 'image_cheaper' };
+  }
+  if (imageCost >= textCost) {
+    return { profitable: false, cacheWeight, textCost, imageCost, reason: 'text_cheaper' };
+  }
+  return { profitable: true, cacheWeight, textCost, imageCost, reason: 'image_cheaper' };
+}

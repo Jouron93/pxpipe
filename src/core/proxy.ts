@@ -55,6 +55,11 @@ export interface ProxyConfig {
    *  Selected per-request when the body model is grok-* so Codex can keep
    *  OPENAI_UPSTREAM=chatgpt.com/backend-api/codex without stealing Grok traffic. */
   xaiUpstream?: string;
+  /** Grok CLI control-plane / signed-in chat-proxy host. Defaults to
+   *  https://cli-chat-proxy.grok.com. Bootstrap paths (`/v1/settings`,
+   *  `/v1/subagents/bundle`, `/v1/feedback/config`) and inference whose
+   *  original Host is this name MUST land here — never on OPENAI_UPSTREAM. */
+  cliChatProxyUpstream?: string;
   /** AGY bridge base for Gemini/AGY models. Defaults to http://127.0.0.1:4017. */
   agyUpstream?: string;
   /** LM Studio base for local models. Defaults to http://127.0.0.1:1234. */
@@ -776,6 +781,7 @@ function teeForUsage(res: Response): {
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
 const DEFAULT_XAI_UPSTREAM = 'https://api.x.ai';
+const DEFAULT_CLI_CHAT_PROXY_UPSTREAM = 'https://cli-chat-proxy.grok.com';
 const DEFAULT_AGY_UPSTREAM = 'http://127.0.0.1:4017';
 const DEFAULT_LMSTUDIO_UPSTREAM = 'http://127.0.0.1:1234';
 const DEFAULT_NIM_UPSTREAM = 'https://integrate.api.nvidia.com';
@@ -846,6 +852,45 @@ function isAnthropicBearer(headers: Headers): boolean {
   const auth = headers.get('authorization');
   if (!auth) return false;
   return /^bearer\s+sk-ant-/i.test(auth.trim());
+}
+
+function inboundHostname(headers: Headers): string {
+  const host = (headers.get('host') ?? '').trim();
+  if (!host) return '';
+  if (host.startsWith('[')) {
+    const end = host.indexOf(']');
+    return (end > 0 ? host.slice(1, end) : host).toLowerCase();
+  }
+  const colon = host.lastIndexOf(':');
+  const bare = colon > 0 && !host.includes(']') ? host.slice(0, colon) : host;
+  return bare.toLowerCase();
+}
+
+function isGrokCliChatProxyHost(host: string): boolean {
+  return host === 'cli-chat-proxy.grok.com';
+}
+
+const GROK_BOOTSTRAP_PATHS = new Set([
+  '/v1/settings',
+  '/v1/subagents/bundle',
+  '/v1/feedback/config',
+  '/v1/bundle/archive',
+]);
+
+export function isGrokBootstrapPath(pathname: string): boolean {
+  if (GROK_BOOTSTRAP_PATHS.has(pathname)) return true;
+  if (pathname === '/v1/subagents' || pathname.startsWith('/v1/subagents/')) return true;
+  if (pathname === '/v1/bundle' || pathname.startsWith('/v1/bundle/')) return true;
+  return false;
+}
+
+/** Grok CLI control-plane paths that are not inference and not /v1/models. */
+export function isGrokNonInferenceV1Path(pathname: string): boolean {
+  if (!pathname.startsWith('/v1/')) return false;
+  if (isOpenAIChatPath(pathname) || isOpenAIResponsesPath(pathname)) return false;
+  if (pathname === '/v1/models' || pathname.startsWith('/v1/models/')) return false;
+  if (isAnthropicMessagesPath(pathname)) return false;
+  return true;
 }
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
@@ -1330,6 +1375,9 @@ export function createProxy(config: ProxyConfig = {}) {
     const xaiUpstream = (config.xaiUpstream
       ?? (typeof process !== 'undefined' ? process.env?.XAI_UPSTREAM : undefined)
       ?? DEFAULT_XAI_UPSTREAM).replace(/\/+$/, '');
+    const cliChatProxyUpstream = (config.cliChatProxyUpstream
+      ?? (typeof process !== 'undefined' ? process.env?.GROK_CLI_CHAT_PROXY_UPSTREAM : undefined)
+      ?? DEFAULT_CLI_CHAT_PROXY_UPSTREAM).replace(/\/+$/, '');
     const agyUpstream = (config.agyUpstream
       ?? (typeof process !== 'undefined' ? process.env?.AGY_UPSTREAM : undefined)
       ?? DEFAULT_AGY_UPSTREAM).replace(/\/+$/, '');
@@ -1341,18 +1389,27 @@ export function createProxy(config: ProxyConfig = {}) {
       ?? DEFAULT_NIM_UPSTREAM).replace(/\/+$/, '');
     const initialUa = (req.headers.get('user-agent') || '').toLowerCase();
     const isXaiPrefixed = routePath.startsWith('/xai/');
-    const isGrokCallerInitial = initialUa.includes('grok') || isXaiPrefixed;
-    let upstreamBase = isXaiPrefixed
-      ? (config.provider === 'cloudflare-ai-gateway' ? passthroughUpstream : xaiUpstream)
-      : providerPrefixed
-        ? passthroughUpstream
-        : isGrokCallerInitial
-          ? xaiUpstream
-          : isOpenAIPath
-            ? openAIUpstream
-            : upstream;
-    let stripOpenAIV1ForRequest = (isGrokCallerInitial || isXaiPrefixed) ? false : routes.stripOpenAIV1;
-    let isGrokLane = isGrokCallerInitial || isXaiPrefixed;
+    const inboundHost = inboundHostname(req.headers);
+    const fromGrokCliChatProxy = isGrokCliChatProxyHost(inboundHost);
+    const grokBootstrap = isGrokBootstrapPath(routePath);
+    const grokControlPlane = grokBootstrap
+      || ((initialUa.includes('grok') || fromGrokCliChatProxy) && isGrokNonInferenceV1Path(routePath));
+    const isGrokCallerInitial = initialUa.includes('grok') || isXaiPrefixed || fromGrokCliChatProxy;
+    let upstreamBase = grokControlPlane
+      ? cliChatProxyUpstream
+      : fromGrokCliChatProxy && !providerPrefixed
+        ? cliChatProxyUpstream
+        : isXaiPrefixed
+          ? (config.provider === 'cloudflare-ai-gateway' ? passthroughUpstream : xaiUpstream)
+          : providerPrefixed
+            ? passthroughUpstream
+            : isGrokCallerInitial
+              ? xaiUpstream
+              : isOpenAIPath
+                ? openAIUpstream
+                : upstream;
+    let stripOpenAIV1ForRequest = (isGrokCallerInitial || isXaiPrefixed || grokControlPlane) ? false : routes.stripOpenAIV1;
+    let isGrokLane = isGrokCallerInitial || isXaiPrefixed || grokControlPlane;
     let isAgyLane = false;
     let isLmStudioLane = false;
     let isNimLane = false;
@@ -1387,8 +1444,12 @@ export function createProxy(config: ProxyConfig = {}) {
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
-        const transformOpts =
+        const inboundConvId = req.headers.get('x-grok-conv-id')?.trim();
+        const transformOptsBase =
           typeof config.transform === 'function' ? config.transform() : config.transform;
+        const transformOpts = inboundConvId
+          ? { ...transformOptsBase, providerCacheLikely: true }
+          : transformOptsBase;
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         requestModel = model ?? undefined;
@@ -1399,7 +1460,9 @@ export function createProxy(config: ProxyConfig = {}) {
         const isGrokCaller = isGrokCallerInitial || callerUa.includes('grok') || isGrokModel(model);
         if ((isOpenAIChat || isOpenAIResponses) && isGrokCaller) {
           isGrokLane = true;
-          upstreamBase = xaiUpstream;
+          // Warp preserves Host: cli-chat-proxy.grok.com; send transformed
+          // inference back there. API-key / Codex grok-* still uses api.x.ai.
+          upstreamBase = fromGrokCliChatProxy ? cliChatProxyUpstream : xaiUpstream;
           stripOpenAIV1ForRequest = false;
           routeKey = 'openai';
         } else if ((isOpenAIChat || isOpenAIResponses) && isClaudeModel(model)) {
@@ -1608,7 +1671,12 @@ export function createProxy(config: ProxyConfig = {}) {
       if (!hasAuth && config.xaiApiKey) {
         outHeaders.set('authorization', `Bearer ${config.xaiApiKey}`);
       }
-      if (grokCacheKey) {
+      // Never replace a caller-supplied conversation id: overwriting it busts
+      // xAI prefix cache. Only mint when the client omitted one.
+      const inboundConvIdHeader = req.headers.get('x-grok-conv-id')?.trim();
+      if (inboundConvIdHeader) {
+        outHeaders.set('x-grok-conv-id', inboundConvIdHeader);
+      } else if (grokCacheKey) {
         outHeaders.set('x-grok-conv-id', grokCacheKey);
       }
     } else if (claudeRerouted) {

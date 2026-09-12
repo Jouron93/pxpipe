@@ -52,6 +52,7 @@ import {
 } from './exact-context.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 import { estimateAdmission } from './admission-estimator.js';
+import { evalCacheAwareProfitability } from './openai-savings.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -255,6 +256,7 @@ interface OpenAIResolvedOptions {
   reflow: boolean;
   collapseHistory: boolean;
   gptHistory?: Partial<GptHistoryOptions>;
+  providerCacheLikely?: boolean;
 }
 
 const DEFAULTS: OpenAIResolvedOptions = {
@@ -281,7 +283,21 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     reflow: opts.reflow ?? DEFAULTS.reflow,
     collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
     gptHistory: opts.gptHistory,
+    providerCacheLikely: opts.providerCacheLikely === true,
   };
+}
+
+function requestHasProviderCacheKey(req: { prompt_cache_key?: unknown }): boolean {
+  return typeof req.prompt_cache_key === 'string' && req.prompt_cache_key.trim() !== '';
+}
+
+function grokProviderCacheLikely(
+  model: string,
+  opts: OpenAIResolvedOptions,
+  req: { prompt_cache_key?: unknown },
+): boolean {
+  if (!isGrokModel(model)) return false;
+  return opts.providerCacheLikely === true || requestHasProviderCacheKey(req);
 }
 
 
@@ -667,6 +683,7 @@ interface OpenAIGateAccounting {
   readonly textTokens?: number;
   readonly preservedText?: string;
   readonly preservedTextTokens?: number;
+  readonly providerCacheLikely?: boolean;
 }
 
 function gateTextTokens(text: string, charsPerToken: number): number {
@@ -729,11 +746,18 @@ function evalOpenAIGate(
     ?? gateTextTokens(accounting.baselineText ?? renderedText, charsPerToken);
   const preservedTextTokens = accounting.preservedTextTokens
     ?? gateTextTokens(accounting.preservedText ?? '', charsPerToken);
+  const cacheAware = evalCacheAwareProfitability({
+    model,
+    textTokens,
+    imageTokens,
+    preservedTextTokens,
+    providerCacheLikely: accounting.providerCacheLikely === true && isGrokModel(model),
+  });
   return {
     imageTokens,
     preservedTextTokens,
     textTokens,
-    profitable: imageTokens + preservedTextTokens < textTokens,
+    profitable: cacheAware.profitable,
   };
 }
 
@@ -952,7 +976,9 @@ export async function transformOpenAIChatCompletions(
     profile.stripCols,
   );
 
-  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken);
+  const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken, {
+    providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+  });
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
@@ -1027,7 +1053,9 @@ export async function transformOpenAIChatCompletions(
   if (o.collapseHistory) {
     const turns = chatMessagesToTurns(req.messages);
     const profitable = (text: string, cols: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+      evalOpenAIGate(req.model, text, cols, o.charsPerToken, {
+        providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+      }).profitable;
     const plan = await planGptCollapse(
       turns,
       firstUserIdx + 1,
@@ -1250,8 +1278,12 @@ export async function transformOpenAIResponses(
       ? {
           baselineText: exactContextPlan.imageableText,
           preservedTextTokens: nativeOverheadGateTokens,
+          providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
         }
-      : { preservedText: exactContextManifest!.text },
+      : {
+          preservedText: exactContextManifest!.text,
+          providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+        },
   );
   info.gateEval = {
     site: 'slab',
@@ -1374,7 +1406,9 @@ export async function transformOpenAIResponses(
   // calls, reasoning/compaction, messages, and malformed/orphan items stay native.
   if (o.collapseHistory && !inputWasString) {
     const profitable = (text: string, cols: number) =>
-      evalOpenAIGate(req.model, text, cols, o.charsPerToken).profitable;
+      evalOpenAIGate(req.model, text, cols, o.charsPerToken, {
+        providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+      }).profitable;
     const plan = await planResponsesPairCollapse(
       inputItems,
       profitable,

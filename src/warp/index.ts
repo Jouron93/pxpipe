@@ -61,6 +61,11 @@ export function defaultRoutes(port: number): Route[] {
     parseRoute(`chatgpt.com/backend-api/codex=http://127.0.0.1:${port}/v1`),
     parseRoute(`api.x.ai/v1/chat/completions*=http://127.0.0.1:${port}`),
     parseRoute(`api.x.ai/v1/responses*=http://127.0.0.1:${port}`),
+    // Signed-in Grok CLI talks to cli-chat-proxy.grok.com, not api.x.ai. Divert
+    // only inference; settings/subagents/feedback stay on the real host so the
+    // CLI's OAuth session and bootstrap plane keep working.
+    parseRoute(`cli-chat-proxy.grok.com/v1/chat/completions*=http://127.0.0.1:${port}`),
+    parseRoute(`cli-chat-proxy.grok.com/v1/responses*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
@@ -340,6 +345,11 @@ export function childEnvironment(
     'codex_base_url',
     'codex_api_base',
     'xai_base_url',
+    // If these survive, Grok CLI sends bootstrap AND inference at pxpipe
+    // (Host 127.0.0.1) and /v1/settings 404s on api.x.ai / Codex. Warp must
+    // see the first-party host so only inference is diverted.
+    'grok_cli_chat_proxy_base_url',
+    'grok_models_base_url',
   ]);
   for (const key of Object.keys(env)) {
     if (stripped.has(key.toLowerCase())) {

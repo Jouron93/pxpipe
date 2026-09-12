@@ -155,6 +155,11 @@ export interface TransformOptions {
    *  glyph-fill). ON by default (98.95% char accuracy at L1 OCR eval, +1pp vs baseline).
    *  Hard newlines become visible ↵ glyphs — tell the model via system prompt. */
   reflow?: boolean;
+  /** True when the provider is expected to serve this turn from a warm prompt
+   *  cache (`x-grok-conv-id`, `prompt_cache_key`, priorWarmTokens). Gate V2 then
+   *  prices native text at the cached-input rate and refuses imaging that would
+   *  cost more than discounted cached text. */
+  providerCacheLikely?: boolean;
   /** Caller fidelity hint: return `true` for a block that must stay as text (IDs,
    *  hashes, file paths — content where mis-OCR would be silent and wrong). Only
    *  consulted on per-block live-region paths (reminders, tool_results). A throwing
