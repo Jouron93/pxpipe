@@ -745,7 +745,7 @@ function evalOpenAIGate(
   // Default: o200k. Non-default charsPerToken keeps the force/override lever.
   // Selective transforms may supply an original-source baseline independently
   // from the rendered source and a numeric native-overhead cost.
-  const textTokens = accounting.textTokens
+  const textTokens = (charsPerToken === DEFAULTS.charsPerToken ? accounting.textTokens : undefined)
     ?? gateTextTokens(accounting.baselineText ?? renderedText, charsPerToken);
   const preservedTextTokens = accounting.preservedTextTokens
     ?? gateTextTokens(accounting.preservedText ?? '', charsPerToken);
@@ -980,6 +980,7 @@ export async function transformOpenAIChatCompletions(
   );
 
   const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken, {
+    textTokens: gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools),
     providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
   });
   info.gateEval = {
@@ -1284,6 +1285,7 @@ export async function transformOpenAIResponses(
           providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
         }
       : {
+          textTokens: gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools),
           preservedText: exactContextManifest!.text,
           providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
         },

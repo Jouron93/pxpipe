@@ -1540,13 +1540,15 @@ export function createProxy(config: ProxyConfig = {}) {
               }
             }
             const existing = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : '';
-            const modelTag = String(model || parsed.model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_');
-            grokCacheKey = existing || `pxpipe-grok-${modelTag}`;
-            if (!existing) parsed.prompt_cache_key = grokCacheKey;
-            r.body = new TextEncoder().encode(JSON.stringify(parsed));
-            bodyOut = r.body as unknown as BodyInit;
+            const inboundConvId = req.headers.get('x-grok-conv-id')?.trim() || '';
+            grokCacheKey = existing || inboundConvId;
+            if (existing) {
+              parsed.prompt_cache_key = existing;
+              r.body = new TextEncoder().encode(JSON.stringify(parsed));
+              bodyOut = r.body as unknown as BodyInit;
+            }
           } catch {
-            grokCacheKey = `pxpipe-grok-${String(model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_')}`;
+            grokCacheKey = req.headers.get('x-grok-conv-id')?.trim() || '';
           }
         }
         reqBodyBytes = r.body;

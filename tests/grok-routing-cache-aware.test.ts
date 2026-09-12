@@ -13,7 +13,10 @@ import {
   evalCacheAwareProfitability,
   GROK_CACHE_READ_RATE,
 } from '../src/core/openai-savings.js';
-import { transformOpenAIChatCompletions } from '../src/core/openai.js';
+import {
+  transformOpenAIChatCompletions,
+  transformOpenAIResponses,
+} from '../src/core/openai.js';
 import { matchRoute, rewriteUrl } from '../src/warp/route.js';
 import { childEnvironment, defaultRoutes } from '../src/warp/index.js';
 
@@ -472,3 +475,78 @@ describe('Codex subscription OpenAI_UPSTREAM cannot steal Grok bootstrap', () =>
     }
   });
 });
+
+describe('Responses transform preserves caller cache identity and gates unprofitable tool requests', () => {
+  it('bypasses Responses requests when baseline text savings do not justify image and overhead cost', async () => {
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'gpt-4o',
+        instructions: 'Brief instruction context that does not justify rendering.',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'query_data',
+              description: 'Fetch data from backend database with filtering options.',
+              parameters: {
+                type: 'object',
+                properties: { query: { type: 'string' } },
+                required: ['query'],
+              },
+            },
+          },
+        ],
+        input: [{ role: 'user', content: 'hello' }],
+      }),
+    );
+    const result = await transformOpenAIResponses(body, {
+      compress: true,
+      minCompressChars: 10,
+    });
+    expect(result.info.compressed).toBe(false);
+    expect(result.info.reason).toMatch(/not_profitable|below_min_chars/);
+  });
+
+  it('does not inject synthetic prompt_cache_key when caller omits it', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/v1/chat/completions', {
+        body: CHAT_BODY('grok-4.5'),
+        headers: {
+          authorization: `Bearer ${XAI_JWT}`,
+          'user-agent': GROK_UA,
+        },
+      });
+      const m = mainRequest(seen);
+      const parsed = JSON.parse(m.bodyText);
+      expect(parsed.prompt_cache_key).toBeUndefined();
+      expect(m.bodyText).not.toContain('pxpipe-grok');
+    } finally {
+      restore();
+    }
+  });
+
+  it('preserves caller-supplied prompt_cache_key on Grok requests', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/v1/chat/completions', {
+        body: {
+          ...CHAT_BODY('grok-4.5'),
+          prompt_cache_key: 'custom-session-key-42',
+        },
+        headers: {
+          authorization: `Bearer ${XAI_JWT}`,
+          'user-agent': GROK_UA,
+        },
+      });
+      const m = mainRequest(seen);
+      const parsed = JSON.parse(m.bodyText);
+      expect(parsed.prompt_cache_key).toBe('custom-session-key-42');
+    } finally {
+      restore();
+    }
+  });
+});
+
