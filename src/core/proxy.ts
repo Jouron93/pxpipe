@@ -6,8 +6,9 @@
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isAgyModel, isClaudeModel, isGrokModel, isLmStudioModel, isNimModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel, minCompressBodyBytes } from './applicability.js';
-import { isAnthropicCredential, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
+import { isAnthropicCredential, isSuperGrokSessionToken, isXaiApiKey, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
 import { resolveModelProfile } from './model-registry.js';
+import { warmCacheTracker } from './warm-cache-tracker.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -55,6 +56,11 @@ export interface ProxyConfig {
    *  Selected per-request when the body model is grok-* so Codex can keep
    *  OPENAI_UPSTREAM=chatgpt.com/backend-api/codex without stealing Grok traffic. */
   xaiUpstream?: string;
+  /** Grok CLI control-plane / signed-in chat-proxy host. Defaults to
+   *  https://cli-chat-proxy.grok.com. Bootstrap paths (`/v1/settings`,
+   *  `/v1/subagents/bundle`, `/v1/feedback/config`) and inference whose
+   *  original Host is this name MUST land here — never on OPENAI_UPSTREAM. */
+  cliChatProxyUpstream?: string;
   /** AGY bridge base for Gemini/AGY models. Defaults to http://127.0.0.1:4017. */
   agyUpstream?: string;
   /** LM Studio base for local models. Defaults to http://127.0.0.1:1234. */
@@ -776,6 +782,7 @@ function teeForUsage(res: Response): {
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
 const DEFAULT_XAI_UPSTREAM = 'https://api.x.ai';
+const DEFAULT_CLI_CHAT_PROXY_UPSTREAM = 'https://cli-chat-proxy.grok.com';
 const DEFAULT_AGY_UPSTREAM = 'http://127.0.0.1:4017';
 const DEFAULT_LMSTUDIO_UPSTREAM = 'http://127.0.0.1:1234';
 const DEFAULT_NIM_UPSTREAM = 'https://integrate.api.nvidia.com';
@@ -846,6 +853,52 @@ function isAnthropicBearer(headers: Headers): boolean {
   const auth = headers.get('authorization');
   if (!auth) return false;
   return /^bearer\s+sk-ant-/i.test(auth.trim());
+}
+
+function inboundHostname(headers: Headers): string {
+  const host = (headers.get('host') ?? '').trim();
+  if (!host) return '';
+  if (host.startsWith('[')) {
+    const end = host.indexOf(']');
+    return (end > 0 ? host.slice(1, end) : host).toLowerCase();
+  }
+  const colon = host.lastIndexOf(':');
+  const bare = colon > 0 && !host.includes(']') ? host.slice(0, colon) : host;
+  return bare.toLowerCase();
+}
+
+function isGrokCliChatProxyHost(host: string): boolean {
+  return host === 'cli-chat-proxy.grok.com';
+}
+
+export function isGrokCliSessionRequest(headers: Headers): boolean {
+  if (isGrokCliChatProxyHost(inboundHostname(headers))) return true;
+  if (headers.has('x-xai-token-auth')) return true;
+  if (headers.has('x-grok-model-override')) return true;
+  return false;
+}
+
+const GROK_BOOTSTRAP_PATHS = new Set([
+  '/v1/settings',
+  '/v1/subagents/bundle',
+  '/v1/feedback/config',
+  '/v1/bundle/archive',
+]);
+
+export function isGrokBootstrapPath(pathname: string): boolean {
+  if (GROK_BOOTSTRAP_PATHS.has(pathname)) return true;
+  if (pathname === '/v1/subagents' || pathname.startsWith('/v1/subagents/')) return true;
+  if (pathname === '/v1/bundle' || pathname.startsWith('/v1/bundle/')) return true;
+  return false;
+}
+
+/** Grok CLI control-plane paths that are not inference and not /v1/models. */
+export function isGrokNonInferenceV1Path(pathname: string): boolean {
+  if (!pathname.startsWith('/v1/')) return false;
+  if (isOpenAIChatPath(pathname) || isOpenAIResponsesPath(pathname)) return false;
+  if (pathname === '/v1/models' || pathname.startsWith('/v1/models/')) return false;
+  if (isAnthropicMessagesPath(pathname)) return false;
+  return true;
 }
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
@@ -1272,6 +1325,23 @@ export function createProxy(config: ProxyConfig = {}) {
             info.baselineProbeStatus = 'ok';
           }
         }
+        if (isGrokLane && status >= 200 && status < 300) {
+          const cachedTokens = usage?.cached_tokens ?? 0;
+          const targetModel = actualModel || requestModel;
+          if (targetModel && isGrokModel(targetModel)) {
+            if (isOpenAIChat && grokChatConvId) {
+              warmCacheTracker.recordUsage(
+                warmCacheTracker.buildKey('xai', 'chat', targetModel, grokChatConvId),
+                cachedTokens,
+              );
+            } else if (isOpenAIResponses && grokResponsesCacheKey) {
+              warmCacheTracker.recordUsage(
+                warmCacheTracker.buildKey('xai', 'responses', targetModel, grokResponsesCacheKey),
+                cachedTokens,
+              );
+            }
+          }
+        }
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
@@ -1330,6 +1400,9 @@ export function createProxy(config: ProxyConfig = {}) {
     const xaiUpstream = (config.xaiUpstream
       ?? (typeof process !== 'undefined' ? process.env?.XAI_UPSTREAM : undefined)
       ?? DEFAULT_XAI_UPSTREAM).replace(/\/+$/, '');
+    const cliChatProxyUpstream = (config.cliChatProxyUpstream
+      ?? (typeof process !== 'undefined' ? process.env?.GROK_CLI_CHAT_PROXY_UPSTREAM : undefined)
+      ?? DEFAULT_CLI_CHAT_PROXY_UPSTREAM).replace(/\/+$/, '');
     const agyUpstream = (config.agyUpstream
       ?? (typeof process !== 'undefined' ? process.env?.AGY_UPSTREAM : undefined)
       ?? DEFAULT_AGY_UPSTREAM).replace(/\/+$/, '');
@@ -1341,22 +1414,32 @@ export function createProxy(config: ProxyConfig = {}) {
       ?? DEFAULT_NIM_UPSTREAM).replace(/\/+$/, '');
     const initialUa = (req.headers.get('user-agent') || '').toLowerCase();
     const isXaiPrefixed = routePath.startsWith('/xai/');
-    const isGrokCallerInitial = initialUa.includes('grok') || isXaiPrefixed;
-    let upstreamBase = isXaiPrefixed
-      ? (config.provider === 'cloudflare-ai-gateway' ? passthroughUpstream : xaiUpstream)
-      : providerPrefixed
-        ? passthroughUpstream
-        : isGrokCallerInitial
-          ? xaiUpstream
-          : isOpenAIPath
-            ? openAIUpstream
-            : upstream;
-    let stripOpenAIV1ForRequest = (isGrokCallerInitial || isXaiPrefixed) ? false : routes.stripOpenAIV1;
-    let isGrokLane = isGrokCallerInitial || isXaiPrefixed;
+    const inboundHost = inboundHostname(req.headers);
+    const fromGrokCliChatProxy = isGrokCliSessionRequest(req.headers);
+    const grokBootstrap = isGrokBootstrapPath(routePath);
+    const grokControlPlane = grokBootstrap
+      || ((initialUa.includes('grok') || fromGrokCliChatProxy) && isGrokNonInferenceV1Path(routePath));
+    const isGrokCallerInitial = initialUa.includes('grok') || isXaiPrefixed || fromGrokCliChatProxy;
+    let upstreamBase = grokControlPlane
+      ? cliChatProxyUpstream
+      : fromGrokCliChatProxy && !providerPrefixed
+        ? cliChatProxyUpstream
+        : isXaiPrefixed
+          ? (config.provider === 'cloudflare-ai-gateway' ? passthroughUpstream : xaiUpstream)
+          : providerPrefixed
+            ? passthroughUpstream
+            : isGrokCallerInitial
+              ? xaiUpstream
+              : isOpenAIPath
+                ? openAIUpstream
+                : upstream;
+    let stripOpenAIV1ForRequest = (isGrokCallerInitial || isXaiPrefixed || grokControlPlane) ? false : routes.stripOpenAIV1;
+    let isGrokLane = isGrokCallerInitial || isXaiPrefixed || grokControlPlane;
     let isAgyLane = false;
     let isLmStudioLane = false;
     let isNimLane = false;
-    let grokCacheKey: string | undefined;
+    let grokResponsesCacheKey: string | undefined;
+    let grokChatConvId: string | undefined;
     // Set when an OpenAI-shaped request is rerouted to Anthropic because the body model is
     // claude-*: the auth branch below must then follow Anthropic rules, not OpenAI's.
     let claudeRerouted = false;
@@ -1387,11 +1470,43 @@ export function createProxy(config: ProxyConfig = {}) {
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
-        const transformOpts =
-          typeof config.transform === 'function' ? config.transform() : config.transform;
+        const transformOptsBase =
+          (typeof config.transform === 'function' ? config.transform() : config.transform) ?? {};
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         requestModel = model ?? undefined;
+
+        let providerCacheLikely = transformOptsBase.providerCacheLikely;
+        if (providerCacheLikely === undefined && model && isGrokModel(model)) {
+          if (isOpenAIChat) {
+            const inboundConvId = req.headers.get('x-grok-conv-id')?.trim();
+            if (inboundConvId) {
+              grokChatConvId = inboundConvId;
+              providerCacheLikely = warmCacheTracker.isWarm(
+                warmCacheTracker.buildKey('xai', 'chat', model, inboundConvId),
+              );
+            } else {
+              providerCacheLikely = false;
+            }
+          } else if (isOpenAIResponses) {
+            try {
+              const peek = JSON.parse(new TextDecoder().decode(bodyIn)) as Record<string, unknown>;
+              if (typeof peek.prompt_cache_key === 'string' && peek.prompt_cache_key.trim()) {
+                grokResponsesCacheKey = peek.prompt_cache_key.trim();
+                providerCacheLikely = warmCacheTracker.isWarm(
+                  warmCacheTracker.buildKey('xai', 'responses', model, grokResponsesCacheKey),
+                );
+              } else {
+                providerCacheLikely = false;
+              }
+            } catch {
+              providerCacheLikely = false;
+            }
+          }
+        }
+        const transformOpts = providerCacheLikely !== undefined
+          ? { ...transformOptsBase, providerCacheLikely }
+          : transformOptsBase;
 
         // Grok on /v1/responses|/v1/chat/completions → compress here, forward to
         // api.x.ai with the client's xAI bearer. Never use Codex/OpenAI upstream.
@@ -1399,7 +1514,9 @@ export function createProxy(config: ProxyConfig = {}) {
         const isGrokCaller = isGrokCallerInitial || callerUa.includes('grok') || isGrokModel(model);
         if ((isOpenAIChat || isOpenAIResponses) && isGrokCaller) {
           isGrokLane = true;
-          upstreamBase = xaiUpstream;
+          // Warp preserves Host: cli-chat-proxy.grok.com; send transformed
+          // inference back there. API-key / Codex grok-* still uses api.x.ai.
+          upstreamBase = fromGrokCliChatProxy ? cliChatProxyUpstream : xaiUpstream;
           stripOpenAIV1ForRequest = false;
           routeKey = 'openai';
         } else if ((isOpenAIChat || isOpenAIResponses) && isClaudeModel(model)) {
@@ -1426,6 +1543,12 @@ export function createProxy(config: ProxyConfig = {}) {
           stripOpenAIV1ForRequest = false;
           routeKey = 'openai';
           isNimLane = true;
+        } else if (isOpenAIChat || isOpenAIResponses) {
+          // Standard OpenAI / Codex models route to passthroughUpstream if prefixed, else openAIUpstream
+          upstreamBase = providerPrefixed ? passthroughUpstream : openAIUpstream;
+          stripOpenAIV1ForRequest = routes.stripOpenAIV1;
+          routeKey = 'openai';
+          isGrokLane = false;
         }
 
         // /v1/messages is only a wire schema: Claude Code can target a non-
@@ -1470,21 +1593,32 @@ export function createProxy(config: ProxyConfig = {}) {
         if (isGrokLane) {
           try {
             const parsed = JSON.parse(new TextDecoder().decode(r.body)) as Record<string, unknown>;
+            let mutated = false;
             if (typeof parsed.model === 'string') {
               const prof = resolveModelProfile(parsed.model);
               if (prof.family === 'grok' && prof.canonicalId) {
                 parsed.model = prof.canonicalId;
+                mutated = true;
               }
             }
-            const existing = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : '';
-            const modelTag = String(model || parsed.model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_');
-            grokCacheKey = existing || `pxpipe-grok-${modelTag}`;
-            if (!existing) parsed.prompt_cache_key = grokCacheKey;
-            r.body = new TextEncoder().encode(JSON.stringify(parsed));
-            bodyOut = r.body as unknown as BodyInit;
-          } catch {
-            grokCacheKey = `pxpipe-grok-${String(model || 'grok').replace(/[^a-zA-Z0-9._-]+/g, '_')}`;
-          }
+            if (isOpenAIResponses) {
+              const existing = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : '';
+              if (existing) {
+                parsed.prompt_cache_key = existing;
+                grokResponsesCacheKey = existing;
+                mutated = true;
+              }
+            } else if (isOpenAIChat) {
+              const inboundConvId = req.headers.get('x-grok-conv-id')?.trim();
+              if (inboundConvId) {
+                grokChatConvId = inboundConvId;
+              }
+            }
+            if (mutated) {
+              r.body = new TextEncoder().encode(JSON.stringify(parsed));
+              bodyOut = r.body as unknown as BodyInit;
+            }
+          } catch {}
         }
         reqBodyBytes = r.body;
         if (r.body.byteLength > 0) {
@@ -1608,8 +1742,14 @@ export function createProxy(config: ProxyConfig = {}) {
       if (!hasAuth && config.xaiApiKey) {
         outHeaders.set('authorization', `Bearer ${config.xaiApiKey}`);
       }
-      if (grokCacheKey) {
-        outHeaders.set('x-grok-conv-id', grokCacheKey);
+      // Never replace a caller-supplied conversation id on Chat completions:
+      // overwriting it busts xAI prefix cache. Responses uses prompt_cache_key in body;
+      // never emit x-grok-conv-id for Responses (zero cross-population).
+      if (isOpenAIChat) {
+        const inboundConvIdHeader = req.headers.get('x-grok-conv-id')?.trim();
+        if (inboundConvIdHeader) {
+          outHeaders.set('x-grok-conv-id', inboundConvIdHeader);
+        }
       }
     } else if (claudeRerouted) {
       // OpenAI-shaped request rerouted to Anthropic because the body model is claude-*.

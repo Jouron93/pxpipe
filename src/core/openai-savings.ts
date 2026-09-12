@@ -28,8 +28,13 @@ export const OPENAI_GPT5_OUTPUT_RATE = 8;
 /** Older OpenAI families use a less aggressive cached-input discount. pxpipe's
  * GPT compression gate is currently gpt-5.x-only, but keep the helper explicit
  * so passthrough telemetry does not accidentally get priced at Anthropic rates. */
-/** Grok cached prompt list ratio from xAI model pricing metadata
- *  (cachedPromptTokenPrice / promptTextTokenPrice = 5000/20000). */
+/** Grok 4.5 cached prompt ratio: 0.15x normal input ($0.30 vs $2.00 / Mtok). */
+export const GROK_45_CACHE_READ_RATE = 0.15;
+
+/** Grok 4.6 cached prompt ratio: 0.25x normal input ($0.50 vs $2.00 / Mtok). */
+export const GROK_46_CACHE_READ_RATE = 0.25;
+
+/** Default Grok cached prompt list ratio (0.25 for Grok 4.6 / general Grok). */
 export const GROK_CACHE_READ_RATE = 0.25;
 
 /** Grok completion/input list ratio (completionTextTokenPrice / promptTextTokenPrice
@@ -90,4 +95,65 @@ export function computeOpenAIBaselineInputEff(
   const delta = baselineImagedTokens - imageTokens;
   const deltaWeight = (cachedTokens || 0) > 0 ? openAICacheReadRate(model) : 1.0;
   return actual + delta * deltaWeight;
+}
+
+/**
+ * Profitability Gate V2 — decide whether imaging beats leaving text native,
+ * counting provider prompt-cache discounts. Distinct from pxpipe's local PNG
+ * render cache: this is the provider's prefix-equality cache
+ * (`cached_tokens` / `x-grok-conv-id` / `prompt_cache_key`).
+ *
+ * Warm Grok text is billed at GROK_CACHE_READ_RATE (0.25 = 75% off). Imaging
+ * that prefix pays full vision tokens and busts the cached text. If discounted
+ * native text is cheaper, KEEP TEXT.
+ */
+export interface CacheAwareGateInput {
+  model?: string;
+  textTokens: number;
+  imageTokens: number;
+  preservedTextTokens?: number;
+  /** True when this turn is expected to hit a warm provider prompt cache. */
+  providerCacheLikely?: boolean;
+}
+
+export type CacheAwareGateReason =
+  | 'warm_cached_text_cheaper'
+  | 'image_cheaper'
+  | 'text_cheaper'
+  | 'marginal';
+
+export interface CacheAwareGateResult {
+  profitable: boolean;
+  cacheWeight: number;
+  textCost: number;
+  imageCost: number;
+  reason: CacheAwareGateReason;
+}
+
+export function evalCacheAwareProfitability(input: CacheAwareGateInput): CacheAwareGateResult {
+  const textTokens = Math.max(0, input.textTokens || 0);
+  const imageTokens = Math.max(0, input.imageTokens || 0);
+  const preserved = Math.max(0, input.preservedTextTokens || 0);
+  const imageCost = imageTokens + preserved;
+  const cacheWeight = input.providerCacheLikely ? openAICacheReadRate(input.model) : 1;
+  const textCost = textTokens * cacheWeight;
+  const delta = textCost - imageCost;
+  if (input.providerCacheLikely) {
+    // Noisy/marginal warm savings are not worth busting a cached prefix.
+    const material = Math.max(32, textCost * 0.05);
+    if (imageCost >= textCost || delta < material) {
+      return {
+        profitable: false,
+        cacheWeight,
+        textCost,
+        imageCost,
+        reason: imageCost >= textCost ? 'warm_cached_text_cheaper' : 'marginal',
+      };
+    }
+    return { profitable: true, cacheWeight, textCost, imageCost, reason: 'image_cheaper' };
+  }
+  if (imageCost >= textCost) {
+    return { profitable: false, cacheWeight, textCost, imageCost, reason: 'text_cheaper' };
+  }
+  return { profitable: true, cacheWeight, textCost, imageCost, reason: 'image_cheaper' };
 }

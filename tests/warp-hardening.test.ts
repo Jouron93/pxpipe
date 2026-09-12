@@ -95,6 +95,20 @@ describe('P1-4: codex on chatgpt.com is diverted, provider base URLs are strippe
     expect(() => parseRoute('a.test/x=http://127.0.0.1:1/*')).toThrow(/needs a "\*" in the pattern path/);
   });
 
+  it('diverts Grok CLI inference on cli-chat-proxy.grok.com and leaves bootstrap on the real host', () => {
+    const routes = defaultRoutes(47821);
+    const chat = matchRoute(routes, 'cli-chat-proxy.grok.com:443', '/v1/chat/completions');
+    expect(chat).not.toBeNull();
+    expect(rewriteUrl(chat!, '/v1/chat/completions?stream=true')).toBe(
+      'http://127.0.0.1:47821/v1/chat/completions?stream=true',
+    );
+    const responses = matchRoute(routes, 'cli-chat-proxy.grok.com:443', '/v1/responses');
+    expect(responses).not.toBeNull();
+    expect(matchRoute(routes, 'cli-chat-proxy.grok.com:443', '/v1/settings')).toBeNull();
+    expect(matchRoute(routes, 'cli-chat-proxy.grok.com:443', '/v1/subagents/bundle')).toBeNull();
+    expect(matchRoute(routes, 'cli-chat-proxy.grok.com:443', '/v1/feedback/config')).toBeNull();
+  });
+
   it('removes every provider base URL, not just Anthropic', () => {
     const env = childEnvironment(
       {
@@ -103,12 +117,22 @@ describe('P1-4: codex on chatgpt.com is diverted, provider base URLs are strippe
         OPENAI_BASE_URL: 'http://127.0.0.1:47822/v1',
         OPENAI_API_BASE: 'http://127.0.0.1:47822/v1',
         XAI_BASE_URL: 'http://127.0.0.1:47822/v1',
+        GROK_CLI_CHAT_PROXY_BASE_URL: 'http://127.0.0.1:47821/v1',
+        GROK_MODELS_BASE_URL: 'http://127.0.0.1:47821/v1',
         KEEP_ME: 'yes',
       },
       'http://127.0.0.1:5',
       { certPath: '/ca.pem', bundlePath: '/bundle.pem' },
     );
-    for (const k of ['ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'CODEX_BASE_URL', 'XAI_BASE_URL']) {
+    for (const k of [
+      'ANTHROPIC_BASE_URL',
+      'OPENAI_BASE_URL',
+      'OPENAI_API_BASE',
+      'CODEX_BASE_URL',
+      'XAI_BASE_URL',
+      'GROK_CLI_CHAT_PROXY_BASE_URL',
+      'GROK_MODELS_BASE_URL',
+    ]) {
       expect(env[k], k).toBeUndefined();
     }
     expect(env.KEEP_ME).toBe('yes');
