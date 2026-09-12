@@ -107,3 +107,50 @@ export function getBuildProvenance(): BuildProvenance {
 export function _setMockBuildProvenance(p: BuildProvenance | null): void {
   cachedProvenance = p ? Object.freeze({ ...p }) : null;
 }
+
+/** Detect repository from git tracking upstream remote first, falling back to origin/fork. */
+export function detectGitRepository(
+  runGitCmd: (args: string[]) => string,
+): string {
+  let remoteName = '';
+  try {
+    const upstreamRef = runGitCmd(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+    if (upstreamRef && upstreamRef.includes('/')) {
+      remoteName = upstreamRef.split('/')[0] ?? '';
+    }
+  } catch {
+    // Branch may not have tracking upstream or in detached HEAD
+  }
+
+  if (!remoteName) {
+    try {
+      const branchName = runGitCmd(['rev-parse', '--abbrev-ref', 'HEAD']);
+      if (branchName && branchName !== 'HEAD') {
+        remoteName = runGitCmd(['config', '--get', `branch.${branchName}.remote`]);
+      }
+    } catch {}
+  }
+
+  let remoteUrl = '';
+  if (remoteName) {
+    try {
+      remoteUrl = runGitCmd(['config', '--get', `remote.${remoteName}.url`]);
+    } catch {}
+  }
+
+  if (!remoteUrl) {
+    try {
+      remoteUrl = runGitCmd(['config', '--get', 'remote.origin.url']);
+    } catch {
+      try {
+        remoteUrl = runGitCmd(['config', '--get', 'remote.fork.url']);
+      } catch {
+        // Remote url not configured
+      }
+    }
+  }
+
+  const match = remoteUrl.match(/[:/]([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+?)(?:\.git)?$/);
+  return (match && match[1]) ? match[1] : (remoteUrl || 'Jouron93/pxpipe');
+}
+

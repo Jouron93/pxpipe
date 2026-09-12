@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   getBuildProvenance,
   _setMockBuildProvenance,
+  detectGitRepository,
   type BuildProvenance,
 } from '../src/core/build-provenance.js';
 
@@ -75,5 +76,45 @@ describe('BuildProvenance', () => {
       expect(initialProvenance.runtime_node_version).toBe(process.version);
       expect(typeof initialProvenance.runtime_pid).toBe('number');
     }
+  });
+
+  describe('detectGitRepository', () => {
+    it('prioritizes branch tracking upstream remote (fork) over origin', () => {
+      const mockGit = (args: string[]) => {
+        const cmd = args.join(' ');
+        if (cmd === 'rev-parse --abbrev-ref --symbolic-full-name @{u}') return 'fork/fix/runtime-provenance';
+        if (cmd === 'config --get remote.fork.url') return 'https://github.com/Jouron93/pxpipe.git';
+        if (cmd === 'config --get remote.origin.url') return 'https://github.com/teamchong/pxpipe.git';
+        throw new Error(`unexpected git command: ${cmd}`);
+      };
+      const repo = detectGitRepository(mockGit);
+      expect(repo).toBe('Jouron93/pxpipe');
+    });
+
+    it('resolves tracking remote via branch.<name>.remote when @{u} is unavailable', () => {
+      const mockGit = (args: string[]) => {
+        const cmd = args.join(' ');
+        if (cmd === 'rev-parse --abbrev-ref --symbolic-full-name @{u}') throw new Error('no upstream');
+        if (cmd === 'rev-parse --abbrev-ref HEAD') return 'fix/runtime-provenance';
+        if (cmd === 'config --get branch.fix/runtime-provenance.remote') return 'fork';
+        if (cmd === 'config --get remote.fork.url') return 'git@github.com:Jouron93/pxpipe.git';
+        if (cmd === 'config --get remote.origin.url') return 'https://github.com/teamchong/pxpipe.git';
+        throw new Error(`unexpected git command: ${cmd}`);
+      };
+      const repo = detectGitRepository(mockGit);
+      expect(repo).toBe('Jouron93/pxpipe');
+    });
+
+    it('falls back to remote.origin.url when no tracking branch is configured', () => {
+      const mockGit = (args: string[]) => {
+        const cmd = args.join(' ');
+        if (cmd === 'rev-parse --abbrev-ref --symbolic-full-name @{u}') throw new Error('no upstream');
+        if (cmd === 'rev-parse --abbrev-ref HEAD') return 'HEAD';
+        if (cmd === 'config --get remote.origin.url') return 'https://github.com/teamchong/pxpipe.git';
+        throw new Error(`unexpected git command: ${cmd}`);
+      };
+      const repo = detectGitRepository(mockGit);
+      expect(repo).toBe('teamchong/pxpipe');
+    });
   });
 });

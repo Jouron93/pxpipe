@@ -89,14 +89,37 @@ try {
   const statusOut = runGit(['status', '--porcelain']);
   isDirty = statusOut.length > 0;
 
-  let remoteUrl = '';
+  // Prioritize branch tracking upstream remote, falling back to origin/fork
+  let remoteName = '';
   try {
-    remoteUrl = runGit(['config', '--get', 'remote.origin.url']);
-  } catch {
+    const upstreamRef = runGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+    if (upstreamRef && upstreamRef.includes('/')) {
+      remoteName = upstreamRef.split('/')[0];
+    }
+  } catch {}
+
+  if (!remoteName && gitRef && gitRef !== 'HEAD') {
     try {
-      remoteUrl = runGit(['config', '--get', 'remote.fork.url']);
+      remoteName = runGit(['config', '--get', `branch.${gitRef}.remote`]);
+    } catch {}
+  }
+
+  let remoteUrl = '';
+  if (remoteName) {
+    try {
+      remoteUrl = runGit(['config', '--get', `remote.${remoteName}.url`]);
+    } catch {}
+  }
+
+  if (!remoteUrl) {
+    try {
+      remoteUrl = runGit(['config', '--get', 'remote.origin.url']);
     } catch {
-      // Remote url not configured
+      try {
+        remoteUrl = runGit(['config', '--get', 'remote.fork.url']);
+      } catch {
+        // Remote url not configured
+      }
     }
   }
   const match = remoteUrl.match(/[:/]([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+?)(?:\.git)?$/);
