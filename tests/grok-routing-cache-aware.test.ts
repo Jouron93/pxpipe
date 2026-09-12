@@ -23,11 +23,12 @@ import { matchRoute, rewriteUrl } from '../src/warp/route.js';
 import { childEnvironment, defaultRoutes } from '../src/warp/index.js';
 import { resolveModelProfile } from '../src/core/model-registry.js';
 import { cacheReadRatio } from '../src/core/model-pricing.js';
+import { warmCacheTracker } from '../src/core/warm-cache-tracker.js';
 
 let ambientPxpipeModels: string | undefined;
 beforeAll(() => {
   ambientPxpipeModels = process.env.PXPIPE_MODELS;
-  process.env.PXPIPE_MODELS = 'grok-4.5';
+  process.env.PXPIPE_MODELS = 'grok-4.5,grok-4.6';
 });
 afterAll(() => {
   if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
@@ -456,7 +457,6 @@ describe('Exact/verbatim blocks remain text; pass-through and kill switch', () =
       new TextEncoder().encode(
         JSON.stringify({
           model: 'grok-4.5',
-          prompt_cache_key: 'warm-1',
           messages: [
             { role: 'system', content: bulky },
             { role: 'user', content: 'sha256=deadbeefcafebabe0123456789abcdef continue' },
@@ -585,14 +585,36 @@ describe('Responses transform preserves caller cache identity and gates unprofit
     }
   });
 
-  it('preserves caller-supplied prompt_cache_key on Grok requests', async () => {
+  it('preserves caller-supplied x-grok-conv-id and never injects prompt_cache_key on Chat requests', async () => {
     const { seen, restore } = captureUpstream();
     try {
       const proxy = createProxy(BASE);
       await send(proxy, '/v1/chat/completions', {
+        body: CHAT_BODY('grok-4.5'),
+        headers: {
+          authorization: `Bearer ${XAI_JWT}`,
+          'user-agent': GROK_UA,
+          'x-grok-conv-id': 'chat-conv-42',
+        },
+      });
+      const m = mainRequest(seen);
+      expect(m.headers.get('x-grok-conv-id')).toBe('chat-conv-42');
+      const parsed = JSON.parse(m.bodyText);
+      expect(parsed.prompt_cache_key).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  it('preserves caller-supplied prompt_cache_key and never emits x-grok-conv-id on Responses requests', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/v1/responses', {
         body: {
-          ...CHAT_BODY('grok-4.5'),
+          model: 'grok-4.5',
           prompt_cache_key: 'custom-session-key-42',
+          input: [{ role: 'user', content: 'hi responses' }],
         },
         headers: {
           authorization: `Bearer ${XAI_JWT}`,
@@ -602,6 +624,7 @@ describe('Responses transform preserves caller cache identity and gates unprofit
       const m = mainRequest(seen);
       const parsed = JSON.parse(m.bodyText);
       expect(parsed.prompt_cache_key).toBe('custom-session-key-42');
+      expect(m.headers.get('x-grok-conv-id')).toBeNull();
     } finally {
       restore();
     }
@@ -634,6 +657,90 @@ describe('Grok model pricing, 0.15x cache economics, and alias resolution', () =
   it('verifies grok-4.6 has 0.25x and grok-4.3 has 0.16x cache ratios', () => {
     expect(cacheReadRatio('grok-4.6')).toBe(0.25);
     expect(cacheReadRatio('grok-4.3')).toBe(0.16);
+  });
+
+  it('ensures unvalidated future Grok models do not default to 0.25 cache ratio', () => {
+    expect(cacheReadRatio('grok-5')).toBe(1);
+    expect(cacheReadRatio('grok-future-preview')).toBe(1);
+    expect(cacheReadRatio('grok-next')).toBe(1);
+  });
+
+  it('ensures Grok models have no Anthropic-style cacheWritePerMtok pricing', () => {
+    for (const id of ['grok-4.6', 'grok-4.5', 'grok-4.3', 'grok-4']) {
+      const p = resolveModelProfile(id);
+      expect(p.pricing.cacheWritePerMtok).toBeUndefined();
+    }
+  });
+});
+
+describe('Grok 4.6 Responses negative savings regression: cold-first vs warm-follow-up', () => {
+  it('cold first request evaluates cold economics, warm follow-up keeps native text when cached text beats imaging', async () => {
+    warmCacheTracker.clear();
+    const sessionKey = 'grok46-tool-regress-01';
+
+    const tools = Array.from({ length: 12 }, (_, i) => ({
+      type: 'function',
+      function: {
+        name: `service_tool_operation_${i}`,
+        description: `Perform operation ${i} across multi-agent workspace with extensive parameter validation and logging. `.repeat(6),
+        parameters: {
+          type: 'object',
+          properties: {
+            targetId: { type: 'string', description: 'Identifier of target entity to operate upon' },
+            operationMode: { type: 'string', enum: ['read', 'write', 'execute', 'dry_run'] },
+            options: {
+              type: 'object',
+              properties: {
+                maxRetries: { type: 'number', description: 'Retry limit on transient failures' },
+                timeoutMs: { type: 'number', description: 'Timeout in milliseconds' },
+                filterPatterns: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
+          required: ['targetId', 'operationMode'],
+        },
+      },
+    }));
+
+    const reqPayload = {
+      model: 'grok-4.6',
+      prompt_cache_key: sessionKey,
+      instructions: 'You are an automated trading system controller. Verify all state assertions before execution. '.repeat(10),
+      tools,
+      input: [{ role: 'user', content: 'Scan ledger status and verify current risk allocations.' }],
+    };
+    const bodyBytes = new TextEncoder().encode(JSON.stringify(reqPayload));
+
+    // Turn 1: Cold request
+    expect(warmCacheTracker.isWarm(warmCacheTracker.buildKey('xai', 'responses', 'grok-4.6', sessionKey))).toBe(false);
+
+    await transformOpenAIResponses(bodyBytes, {
+      compress: true,
+      minCompressChars: 100,
+    });
+
+    // Record turn 1 response usage indicating cache hit
+    warmCacheTracker.recordUsage(
+      warmCacheTracker.buildKey('xai', 'responses', 'grok-4.6', sessionKey),
+      6500,
+    );
+
+    // Turn 2: Warm follow-up request with identical prompt_cache_key
+    expect(warmCacheTracker.isWarm(warmCacheTracker.buildKey('xai', 'responses', 'grok-4.6', sessionKey))).toBe(true);
+
+    const turn2Result = await transformOpenAIResponses(bodyBytes, {
+      compress: true,
+      minCompressChars: 100,
+    });
+
+    // On warm follow-up, Grok 4.6 cached text is discounted at 0.25x ($0.50/Mtok).
+    // Imaging costs full vision tokens (1.0x) which would create negative savings (-1,911 tokens).
+    // Profitability Gate V2 must reject imaging and preserve native text.
+    expect(turn2Result.info.compressed).toBe(false);
+    expect(turn2Result.info.reason ?? '').toMatch(/not_profitable/);
+    const parsedTurn2 = JSON.parse(new TextDecoder().decode(turn2Result.body));
+    expect(parsedTurn2.prompt_cache_key).toBe(sessionKey);
+    expect(parsedTurn2.tools).toHaveLength(12);
   });
 });
 
