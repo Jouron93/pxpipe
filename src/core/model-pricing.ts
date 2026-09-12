@@ -419,9 +419,20 @@ export function cacheReadRatio(
   route?: PricingRoute,
 ): number {
   const r = resolveModelRate(model, inputTokens, route);
-  return r.inputPerMtok && r.cachedInputPerMtok !== undefined
-    ? r.cachedInputPerMtok / r.inputPerMtok
-    : 1;
+  if (r.inputPerMtok && r.cachedInputPerMtok !== undefined) {
+    return r.cachedInputPerMtok / r.inputPerMtok;
+  }
+  const norm = normalizeModelName(model);
+  if (norm.startsWith('grok-4.5') || norm === 'grok-build-latest') {
+    return 0.15;
+  }
+  if (norm.startsWith('grok-4.3')) {
+    return 0.16;
+  }
+  if (norm.includes('grok')) {
+    return 0.25;
+  }
+  return 1;
 }
 
 export function outputInputRatio(

@@ -11,6 +11,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
 import {
   evalCacheAwareProfitability,
+  GROK_45_CACHE_READ_RATE,
+  GROK_46_CACHE_READ_RATE,
   GROK_CACHE_READ_RATE,
 } from '../src/core/openai-savings.js';
 import {
@@ -19,6 +21,8 @@ import {
 } from '../src/core/openai.js';
 import { matchRoute, rewriteUrl } from '../src/warp/route.js';
 import { childEnvironment, defaultRoutes } from '../src/warp/index.js';
+import { resolveModelProfile } from '../src/core/model-registry.js';
+import { cacheReadRatio } from '../src/core/model-pricing.js';
 
 let ambientPxpipeModels: string | undefined;
 beforeAll(() => {
@@ -132,6 +136,47 @@ describe('Grok signed-in chat route preserves original cli-chat-proxy host', () 
         headers: { authorization: 'Bearer xai-console-key' },
       });
       expect(mainRequest(seen).url.host).toBe('xai.test');
+    } finally {
+      restore();
+    }
+  });
+
+  it('forwards direct-redirect Grok CLI chat with X-XAI-Token-Auth to cli-chat-proxy even when Host is local', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/v1/chat/completions', {
+        body: CHAT_BODY('grok-4.5'),
+        headers: {
+          authorization: `Bearer ${XAI_JWT}`,
+          'x-xai-token-auth': 'xai-grok-cli',
+          'user-agent': GROK_UA,
+        },
+      });
+      const m = mainRequest(seen);
+      expect(m.url.host).toBe('cli-chat-proxy.grok.com');
+      expect(m.url.pathname).toBe('/v1/chat/completions');
+      expect(m.headers.get('x-xai-token-auth')).toBe('xai-grok-cli');
+    } finally {
+      restore();
+    }
+  });
+
+  it('forwards direct-redirect Grok CLI chat with x-grok-model-override to cli-chat-proxy even when Host is local', async () => {
+    const { seen, restore } = captureUpstream();
+    try {
+      const proxy = createProxy(BASE);
+      await send(proxy, '/v1/chat/completions', {
+        body: CHAT_BODY('grok-4.5'),
+        headers: {
+          authorization: `Bearer ${XAI_JWT}`,
+          'x-grok-model-override': 'grok-4.5',
+          'user-agent': GROK_UA,
+        },
+      });
+      const m = mainRequest(seen);
+      expect(m.url.host).toBe('cli-chat-proxy.grok.com');
+      expect(m.url.pathname).toBe('/v1/chat/completions');
     } finally {
       restore();
     }
@@ -355,17 +400,30 @@ describe('Streaming Grok request succeeds', () => {
 });
 
 describe('Profitability Gate V2 — warm cached Grok text is never imaged', () => {
-  it('keeps text when a 0.25x cached prefix is cheaper than vision tokens', () => {
+  it('keeps text when a 0.15x cached prefix on grok-4.5 is cheaper than vision tokens', () => {
     const r = evalCacheAwareProfitability({
       model: 'grok-4.5',
       textTokens: 10_000,
       imageTokens: 4_000,
       providerCacheLikely: true,
     });
-    expect(r.cacheWeight).toBe(GROK_CACHE_READ_RATE);
+    expect(r.cacheWeight).toBe(GROK_45_CACHE_READ_RATE);
     expect(r.profitable).toBe(false);
     expect(r.reason).toBe('warm_cached_text_cheaper');
-    expect(r.textCost).toBe(10_000 * GROK_CACHE_READ_RATE);
+    expect(r.textCost).toBe(10_000 * GROK_45_CACHE_READ_RATE);
+  });
+
+  it('keeps text when a 0.25x cached prefix on grok-4.6 is cheaper than vision tokens', () => {
+    const r = evalCacheAwareProfitability({
+      model: 'grok-4.6',
+      textTokens: 10_000,
+      imageTokens: 4_000,
+      providerCacheLikely: true,
+    });
+    expect(r.cacheWeight).toBe(GROK_46_CACHE_READ_RATE);
+    expect(r.profitable).toBe(false);
+    expect(r.reason).toBe('warm_cached_text_cheaper');
+    expect(r.textCost).toBe(10_000 * GROK_46_CACHE_READ_RATE);
   });
 
   it('images a cold bulky eligible prefix when vision is cheaper than full-price text', () => {
@@ -549,4 +607,34 @@ describe('Responses transform preserves caller cache identity and gates unprofit
     }
   });
 });
+
+describe('Grok model pricing, 0.15x cache economics, and alias resolution', () => {
+  it('resolves grok-4.5 canonical profile with 0.15x cache read ratio', () => {
+    const profile = resolveModelProfile('grok-4.5');
+    expect(profile.canonicalId).toBe('grok-4.5');
+    expect(profile.family).toBe('grok');
+    expect(profile.pricing.inputPerMtok).toBe(2);
+    expect(profile.pricing.cacheReadPerMtok).toBe(0.3);
+    expect(cacheReadRatio('grok-4.5')).toBe(0.15);
+  });
+
+  it('resolves grok-4.5-latest to canonical grok-4.5 profile with 0.15x ratio', () => {
+    const profile = resolveModelProfile('grok-4.5-latest');
+    expect(profile.canonicalId).toBe('grok-4.5');
+    expect(profile.pricing.cacheReadPerMtok).toBe(0.3);
+    expect(cacheReadRatio('grok-4.5-latest')).toBe(0.15);
+  });
+
+  it('resolves grok-build-latest to canonical grok-4.5 profile', () => {
+    const p1 = resolveModelProfile('grok-build-latest');
+    expect(p1.canonicalId).toBe('grok-4.5');
+    expect(cacheReadRatio('grok-build-latest')).toBe(0.15);
+  });
+
+  it('verifies grok-4.6 has 0.25x and grok-4.3 has 0.16x cache ratios', () => {
+    expect(cacheReadRatio('grok-4.6')).toBe(0.25);
+    expect(cacheReadRatio('grok-4.3')).toBe(0.16);
+  });
+});
+
 

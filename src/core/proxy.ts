@@ -6,7 +6,7 @@
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isAgyModel, isClaudeModel, isGrokModel, isLmStudioModel, isNimModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel, minCompressBodyBytes } from './applicability.js';
-import { isAnthropicCredential, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
+import { isAnthropicCredential, isSuperGrokSessionToken, isXaiApiKey, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
 import { resolveModelProfile } from './model-registry.js';
 import {
   buildBaselineCountTokensBody,
@@ -870,6 +870,13 @@ function isGrokCliChatProxyHost(host: string): boolean {
   return host === 'cli-chat-proxy.grok.com';
 }
 
+export function isGrokCliSessionRequest(headers: Headers): boolean {
+  if (isGrokCliChatProxyHost(inboundHostname(headers))) return true;
+  if (headers.has('x-xai-token-auth')) return true;
+  if (headers.has('x-grok-model-override')) return true;
+  return false;
+}
+
 const GROK_BOOTSTRAP_PATHS = new Set([
   '/v1/settings',
   '/v1/subagents/bundle',
@@ -1390,7 +1397,7 @@ export function createProxy(config: ProxyConfig = {}) {
     const initialUa = (req.headers.get('user-agent') || '').toLowerCase();
     const isXaiPrefixed = routePath.startsWith('/xai/');
     const inboundHost = inboundHostname(req.headers);
-    const fromGrokCliChatProxy = isGrokCliChatProxyHost(inboundHost);
+    const fromGrokCliChatProxy = isGrokCliSessionRequest(req.headers);
     const grokBootstrap = isGrokBootstrapPath(routePath);
     const grokControlPlane = grokBootstrap
       || ((initialUa.includes('grok') || fromGrokCliChatProxy) && isGrokNonInferenceV1Path(routePath));
@@ -1489,6 +1496,12 @@ export function createProxy(config: ProxyConfig = {}) {
           stripOpenAIV1ForRequest = false;
           routeKey = 'openai';
           isNimLane = true;
+        } else if (isOpenAIChat || isOpenAIResponses) {
+          // Standard OpenAI / Codex models route to passthroughUpstream if prefixed, else openAIUpstream
+          upstreamBase = providerPrefixed ? passthroughUpstream : openAIUpstream;
+          stripOpenAIV1ForRequest = routes.stripOpenAIV1;
+          routeKey = 'openai';
+          isGrokLane = false;
         }
 
         // /v1/messages is only a wire schema: Claude Code can target a non-
