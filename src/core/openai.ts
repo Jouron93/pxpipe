@@ -204,6 +204,7 @@ interface OpenAIChatRequest {
   model: string;
   messages: OpenAIChatMessage[];
   tools?: unknown[];
+  prompt_cache_key?: unknown;
   [k: string]: unknown;
 }
 
@@ -234,6 +235,7 @@ interface ResponsesRequest {
   instructions?: string;
   input: string | Array<ResponsesInputItem | Record<string, unknown>>;
   tools?: unknown[];
+  prompt_cache_key?: unknown;
   [k: string]: unknown;
 }
 
@@ -269,6 +271,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
   charsPerToken: 4, // conservative OpenAI default; override after telemetry
   reflow: true,
   collapseHistory: true,
+  providerCacheLikely: false,
 };
 
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
@@ -287,14 +290,14 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   };
 }
 
-function requestHasProviderCacheKey(req: { prompt_cache_key?: unknown }): boolean {
+function requestHasProviderCacheKey(req: { prompt_cache_key?: unknown; [k: string]: unknown }): boolean {
   return typeof req.prompt_cache_key === 'string' && req.prompt_cache_key.trim() !== '';
 }
 
 function grokProviderCacheLikely(
   model: string,
   opts: OpenAIResolvedOptions,
-  req: { prompt_cache_key?: unknown },
+  req: { prompt_cache_key?: unknown; [k: string]: unknown },
 ): boolean {
   if (!isGrokModel(model)) return false;
   return opts.providerCacheLikely === true || requestHasProviderCacheKey(req);

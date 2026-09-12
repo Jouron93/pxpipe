@@ -198,6 +198,7 @@ const DEFAULTS: Required<TransformOptions> = {
   // GPT-only knobs; the Anthropic transform ignores them but Required<> needs them.
   collapseHistory: true,
   gptHistory: {},
+  providerCacheLikely: false,
 };
 
 // --- per-block break-even check ---
