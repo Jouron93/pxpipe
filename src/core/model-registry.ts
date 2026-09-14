@@ -294,7 +294,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     contextWindowTokens: 500_000,
     maxOutputTokens: 128_000,
     factsheetEnabled: true,
-    aliases: ['grok-4.6-latest', 'grok-latest'],
+    aliases: ['grok-4-6', 'grok-4.6-latest', 'grok-latest'],
   },
   {
     canonicalId: 'grok-4.5',
@@ -307,7 +307,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     contextWindowTokens: 524_288,
     maxOutputTokens: 128_000,
     factsheetEnabled: true,
-    aliases: ['grok-4.5-thinking', 'grok-4.5-latest', 'grok-build-latest'],
+    aliases: ['grok-4-5', 'grok-4.5-thinking', 'grok-4.5-latest', 'grok-build-latest'],
   },
   {
     canonicalId: 'grok-4.3',
