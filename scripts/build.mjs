@@ -3,10 +3,11 @@
 // wrangler directly from src/worker.ts, but dist/worker.js is also emitted for
 // package consumers via tsc.
 import { build } from 'esbuild';
-import { mkdir, rm, readFile } from 'node:fs/promises';
+import { mkdir, rm, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 
 import path from 'node:path';
 
@@ -62,6 +63,89 @@ await build({
 
 console.log('✓ built dist/node.js');
 
+// Compute immutable entry SHA-256 and gather git build provenance
+const nodeJsContent = await readFile('dist/node.js');
+const entrySha256 = createHash('sha256').update(nodeJsContent).digest('hex');
+
+function runGit(args) {
+  const res = spawnSync('git', args, { encoding: 'utf8' });
+  if (res.status !== 0 || res.error) {
+    throw new Error(`git ${args.join(' ')} failed (exit ${res.status}): ${res.stderr || res.error?.message || ''}`);
+  }
+  return (res.stdout || '').trim();
+}
+
+let gitCommit;
+let gitRef;
+let isDirty;
+let repository;
+
+try {
+  gitCommit = runGit(['rev-parse', 'HEAD']);
+  if (!/^[0-9a-f]{40}$/i.test(gitCommit)) {
+    throw new Error(`invalid 40-character git commit SHA: '${gitCommit}'`);
+  }
+  gitRef = runGit(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const statusOut = runGit(['status', '--porcelain']);
+  isDirty = statusOut.length > 0;
+
+  // Prioritize branch tracking upstream remote, falling back to origin/fork
+  let remoteName = '';
+  try {
+    const upstreamRef = runGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+    if (upstreamRef && upstreamRef.includes('/')) {
+      remoteName = upstreamRef.split('/')[0];
+    }
+  } catch {}
+
+  if (!remoteName && gitRef && gitRef !== 'HEAD') {
+    try {
+      remoteName = runGit(['config', '--get', `branch.${gitRef}.remote`]);
+    } catch {}
+  }
+
+  let remoteUrl = '';
+  if (remoteName) {
+    try {
+      remoteUrl = runGit(['config', '--get', `remote.${remoteName}.url`]);
+    } catch {}
+  }
+
+  if (!remoteUrl) {
+    try {
+      remoteUrl = runGit(['config', '--get', 'remote.origin.url']);
+    } catch {
+      try {
+        remoteUrl = runGit(['config', '--get', 'remote.fork.url']);
+      } catch {
+        // Remote url not configured
+      }
+    }
+  }
+  const match = remoteUrl.match(/[:/]([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+?)(?:\.git)?$/);
+  repository = match ? match[1] : (remoteUrl || 'Jouron93/pxpipe');
+} catch (err) {
+  console.error(`✗ Build provenance error: ${err.message}`);
+  console.error(`  Builds MUST be executed in a valid git repository with git available.`);
+  process.exit(1);
+}
+
+const provenance = {
+  schema_version: 1,
+  repository,
+  source_sha: gitCommit,
+  source_ref: gitRef,
+  dirty: isDirty,
+  package_version: pkg.version,
+  node_executable: process.execPath,
+  node_version: process.version,
+  built_at_utc: new Date().toISOString(),
+  entry_sha256: entrySha256,
+};
+
+await writeFile('dist/build-provenance.json', JSON.stringify(provenance, null, 2) + '\n', 'utf8');
+console.log(`✓ wrote dist/build-provenance.json (source: ${provenance.source_sha}, entry: ${entrySha256})`);
+
 // Smoke check: the bundled CLI must report the real package version, not a
 // stale fallback. Runs the shipped artifact end-to-end and fails the build on
 // mismatch, so a broken version injection can never reach a release.
@@ -75,3 +159,30 @@ if (smoke.status !== 0 || printedVersion !== pkg.version) {
   process.exit(1);
 }
 console.log(`✓ version smoke check: --version prints ${pkg.version}`);
+
+// Smoke check 2: the bundled CLI must report valid build provenance matching entry SHA-256
+const provSmoke = spawnSync(process.execPath, ['dist/node.js', '--build-info'], { encoding: 'utf8' });
+const printedProv = (provSmoke.stdout ?? '').trim();
+if (provSmoke.status !== 0) {
+  console.error(`✗ build-info smoke check failed: exit ${provSmoke.status}\n${provSmoke.stderr}`);
+  process.exit(1);
+}
+let parsedProv;
+try {
+  parsedProv = JSON.parse(printedProv);
+} catch (err) {
+  console.error(`✗ build-info smoke check failed to parse JSON: ${printedProv}`);
+  process.exit(1);
+}
+if (
+  parsedProv.schema_version !== 1 ||
+  parsedProv.entry_sha256 !== entrySha256 ||
+  parsedProv.source_sha !== gitCommit ||
+  parsedProv.package_version !== pkg.version
+) {
+  console.error(
+    `✗ build-info verification failed. Expected entry_sha256=${entrySha256}, got=${parsedProv.entry_sha256}`,
+  );
+  process.exit(1);
+}
+console.log(`✓ build-info smoke check: valid provenance schema v1 with matching entry SHA-256`);

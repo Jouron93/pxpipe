@@ -74,6 +74,20 @@ export function isXaiCredential(authorization: string | null | undefined): boole
   return host !== undefined && XAI_ISSUER_HOSTS.has(host);
 }
 
+/** True if this is a SuperGrok / Grok CLI OAuth session JWT issued by auth.x.ai (NOT an xai- console key). */
+export function isSuperGrokSessionToken(authorization: string | null | undefined): boolean {
+  const token = bearerToken(authorization);
+  if (!token) return false;
+  const host = jwtIssuerHost(token);
+  return host !== undefined && XAI_ISSUER_HOSTS.has(host);
+}
+
+/** True if this is an xAI console API key (starts with xai-). */
+export function isXaiApiKey(authorization: string | null | undefined): boolean {
+  const token = bearerToken(authorization);
+  return token !== undefined && token.startsWith('xai-');
+}
+
 /** Credential headers no built-in provider lane needs, so they are dropped for every
  *  destination except `passthrough`. `api-key` is Azure OpenAI's header and
  *  `x-goog-api-key` is Google's: a client configured for either could send one to this

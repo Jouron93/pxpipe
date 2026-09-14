@@ -28,8 +28,13 @@ export const OPENAI_GPT5_OUTPUT_RATE = 8;
 /** Older OpenAI families use a less aggressive cached-input discount. pxpipe's
  * GPT compression gate is currently gpt-5.x-only, but keep the helper explicit
  * so passthrough telemetry does not accidentally get priced at Anthropic rates. */
-/** Grok cached prompt list ratio from xAI model pricing metadata
- *  (cachedPromptTokenPrice / promptTextTokenPrice = 5000/20000). */
+/** Grok 4.5 cached prompt ratio: 0.15x normal input ($0.30 vs $2.00 / Mtok). */
+export const GROK_45_CACHE_READ_RATE = 0.15;
+
+/** Grok 4.6 cached prompt ratio: 0.25x normal input ($0.50 vs $2.00 / Mtok). */
+export const GROK_46_CACHE_READ_RATE = 0.25;
+
+/** Default Grok cached prompt list ratio (0.25 for Grok 4.6 / general Grok). */
 export const GROK_CACHE_READ_RATE = 0.25;
 
 /** Grok completion/input list ratio (completionTextTokenPrice / promptTextTokenPrice

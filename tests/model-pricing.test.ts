@@ -55,7 +55,16 @@ describe('provider-aware model pricing', () => {
 
   it('prices direct xAI API models without treating the Grok client as a model', () => {
     expect(resolveModelRate('grok-4.5')).toMatchObject({
-      provider: 'xai', status: 'api_equivalent', inputPerMtok: 2, cachedInputPerMtok: 0.5, outputPerMtok: 6,
+      provider: 'xai', status: 'api_equivalent', inputPerMtok: 2, cachedInputPerMtok: 0.3, outputPerMtok: 6,
+    });
+    expect(cacheReadRatio('grok-4.5')).toBe(0.15);
+    expect(cacheReadRatio('grok-4.5-latest')).toBe(0.15);
+    expect(cacheReadRatio('grok-build-latest')).toBe(0.15);
+    expect(resolveModelRate('grok-4.5-latest')).toMatchObject({
+      provider: 'xai', status: 'api_equivalent', canonicalModel: 'grok-4.5', cachedInputPerMtok: 0.3,
+    });
+    expect(resolveModelRate('grok-build-latest')).toMatchObject({
+      provider: 'xai', status: 'api_equivalent', canonicalModel: 'grok-4.5', cachedInputPerMtok: 0.3,
     });
     expect(resolveModelRate('grok-build')).toMatchObject({ status: 'unavailable' });
   });

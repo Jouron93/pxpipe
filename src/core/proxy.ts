@@ -6,8 +6,9 @@
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isAgyModel, isClaudeModel, isGrokModel, isLmStudioModel, isNimModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel, minCompressBodyBytes } from './applicability.js';
-import { isAnthropicCredential, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
+import { isAnthropicCredential, isSuperGrokSessionToken, isXaiApiKey, isXaiCredential, sanitizeCredentialHeaders, type UpstreamProvider } from './credential-shape.js';
 import { resolveModelProfile } from './model-registry.js';
+import { warmCacheTracker } from './warm-cache-tracker.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -870,6 +871,13 @@ function isGrokCliChatProxyHost(host: string): boolean {
   return host === 'cli-chat-proxy.grok.com';
 }
 
+export function isGrokCliSessionRequest(headers: Headers): boolean {
+  if (isGrokCliChatProxyHost(inboundHostname(headers))) return true;
+  if (headers.has('x-xai-token-auth')) return true;
+  if (headers.has('x-grok-model-override')) return true;
+  return false;
+}
+
 const GROK_BOOTSTRAP_PATHS = new Set([
   '/v1/settings',
   '/v1/subagents/bundle',
@@ -1317,6 +1325,23 @@ export function createProxy(config: ProxyConfig = {}) {
             info.baselineProbeStatus = 'ok';
           }
         }
+        if (isGrokLane && status >= 200 && status < 300) {
+          const cachedTokens = usage?.cached_tokens ?? 0;
+          const targetModel = actualModel || requestModel;
+          if (targetModel && isGrokModel(targetModel)) {
+            if (isOpenAIChat && grokChatConvId) {
+              warmCacheTracker.recordUsage(
+                warmCacheTracker.buildKey('xai', 'chat', targetModel, grokChatConvId),
+                cachedTokens,
+              );
+            } else if (isOpenAIResponses && grokResponsesCacheKey) {
+              warmCacheTracker.recordUsage(
+                warmCacheTracker.buildKey('xai', 'responses', targetModel, grokResponsesCacheKey),
+                cachedTokens,
+              );
+            }
+          }
+        }
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
@@ -1390,7 +1415,7 @@ export function createProxy(config: ProxyConfig = {}) {
     const initialUa = (req.headers.get('user-agent') || '').toLowerCase();
     const isXaiPrefixed = routePath.startsWith('/xai/');
     const inboundHost = inboundHostname(req.headers);
-    const fromGrokCliChatProxy = isGrokCliChatProxyHost(inboundHost);
+    const fromGrokCliChatProxy = isGrokCliSessionRequest(req.headers);
     const grokBootstrap = isGrokBootstrapPath(routePath);
     const grokControlPlane = grokBootstrap
       || ((initialUa.includes('grok') || fromGrokCliChatProxy) && isGrokNonInferenceV1Path(routePath));
@@ -1413,7 +1438,8 @@ export function createProxy(config: ProxyConfig = {}) {
     let isAgyLane = false;
     let isLmStudioLane = false;
     let isNimLane = false;
-    let grokCacheKey: string | undefined;
+    let grokResponsesCacheKey: string | undefined;
+    let grokChatConvId: string | undefined;
     // Set when an OpenAI-shaped request is rerouted to Anthropic because the body model is
     // claude-*: the auth branch below must then follow Anthropic rules, not OpenAI's.
     let claudeRerouted = false;
@@ -1444,15 +1470,43 @@ export function createProxy(config: ProxyConfig = {}) {
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
       try {
-        const inboundConvId = req.headers.get('x-grok-conv-id')?.trim();
         const transformOptsBase =
-          typeof config.transform === 'function' ? config.transform() : config.transform;
-        const transformOpts = inboundConvId
-          ? { ...transformOptsBase, providerCacheLikely: true }
-          : transformOptsBase;
+          (typeof config.transform === 'function' ? config.transform() : config.transform) ?? {};
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         requestModel = model ?? undefined;
+
+        let providerCacheLikely = transformOptsBase.providerCacheLikely;
+        if (providerCacheLikely === undefined && model && isGrokModel(model)) {
+          if (isOpenAIChat) {
+            const inboundConvId = req.headers.get('x-grok-conv-id')?.trim();
+            if (inboundConvId) {
+              grokChatConvId = inboundConvId;
+              providerCacheLikely = warmCacheTracker.isWarm(
+                warmCacheTracker.buildKey('xai', 'chat', model, inboundConvId),
+              );
+            } else {
+              providerCacheLikely = false;
+            }
+          } else if (isOpenAIResponses) {
+            try {
+              const peek = JSON.parse(new TextDecoder().decode(bodyIn)) as Record<string, unknown>;
+              if (typeof peek.prompt_cache_key === 'string' && peek.prompt_cache_key.trim()) {
+                grokResponsesCacheKey = peek.prompt_cache_key.trim();
+                providerCacheLikely = warmCacheTracker.isWarm(
+                  warmCacheTracker.buildKey('xai', 'responses', model, grokResponsesCacheKey),
+                );
+              } else {
+                providerCacheLikely = false;
+              }
+            } catch {
+              providerCacheLikely = false;
+            }
+          }
+        }
+        const transformOpts = providerCacheLikely !== undefined
+          ? { ...transformOptsBase, providerCacheLikely }
+          : transformOptsBase;
 
         // Grok on /v1/responses|/v1/chat/completions → compress here, forward to
         // api.x.ai with the client's xAI bearer. Never use Codex/OpenAI upstream.
@@ -1489,6 +1543,12 @@ export function createProxy(config: ProxyConfig = {}) {
           stripOpenAIV1ForRequest = false;
           routeKey = 'openai';
           isNimLane = true;
+        } else if (isOpenAIChat || isOpenAIResponses) {
+          // Standard OpenAI / Codex models route to passthroughUpstream if prefixed, else openAIUpstream
+          upstreamBase = providerPrefixed ? passthroughUpstream : openAIUpstream;
+          stripOpenAIV1ForRequest = routes.stripOpenAIV1;
+          routeKey = 'openai';
+          isGrokLane = false;
         }
 
         // /v1/messages is only a wire schema: Claude Code can target a non-
@@ -1533,23 +1593,32 @@ export function createProxy(config: ProxyConfig = {}) {
         if (isGrokLane) {
           try {
             const parsed = JSON.parse(new TextDecoder().decode(r.body)) as Record<string, unknown>;
+            let mutated = false;
             if (typeof parsed.model === 'string') {
               const prof = resolveModelProfile(parsed.model);
               if (prof.family === 'grok' && prof.canonicalId) {
                 parsed.model = prof.canonicalId;
+                mutated = true;
               }
             }
-            const existing = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : '';
-            const inboundConvId = req.headers.get('x-grok-conv-id')?.trim() || '';
-            grokCacheKey = existing || inboundConvId;
-            if (existing) {
-              parsed.prompt_cache_key = existing;
+            if (isOpenAIResponses) {
+              const existing = typeof parsed.prompt_cache_key === 'string' ? parsed.prompt_cache_key.trim() : '';
+              if (existing) {
+                parsed.prompt_cache_key = existing;
+                grokResponsesCacheKey = existing;
+                mutated = true;
+              }
+            } else if (isOpenAIChat) {
+              const inboundConvId = req.headers.get('x-grok-conv-id')?.trim();
+              if (inboundConvId) {
+                grokChatConvId = inboundConvId;
+              }
+            }
+            if (mutated) {
               r.body = new TextEncoder().encode(JSON.stringify(parsed));
               bodyOut = r.body as unknown as BodyInit;
             }
-          } catch {
-            grokCacheKey = req.headers.get('x-grok-conv-id')?.trim() || '';
-          }
+          } catch {}
         }
         reqBodyBytes = r.body;
         if (r.body.byteLength > 0) {
@@ -1673,13 +1742,14 @@ export function createProxy(config: ProxyConfig = {}) {
       if (!hasAuth && config.xaiApiKey) {
         outHeaders.set('authorization', `Bearer ${config.xaiApiKey}`);
       }
-      // Never replace a caller-supplied conversation id: overwriting it busts
-      // xAI prefix cache. Only mint when the client omitted one.
-      const inboundConvIdHeader = req.headers.get('x-grok-conv-id')?.trim();
-      if (inboundConvIdHeader) {
-        outHeaders.set('x-grok-conv-id', inboundConvIdHeader);
-      } else if (grokCacheKey) {
-        outHeaders.set('x-grok-conv-id', grokCacheKey);
+      // Never replace a caller-supplied conversation id on Chat completions:
+      // overwriting it busts xAI prefix cache. Responses uses prompt_cache_key in body;
+      // never emit x-grok-conv-id for Responses (zero cross-population).
+      if (isOpenAIChat) {
+        const inboundConvIdHeader = req.headers.get('x-grok-conv-id')?.trim();
+        if (inboundConvIdHeader) {
+          outHeaders.set('x-grok-conv-id', inboundConvIdHeader);
+        }
       }
     } else if (claudeRerouted) {
       // OpenAI-shaped request rerouted to Anthropic because the body model is claude-*.

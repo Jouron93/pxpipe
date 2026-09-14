@@ -289,12 +289,12 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'grok',
     status: 'validated',
     enabledByDefault: true,
-    pricing: { inputPerMtok: 2, cacheWritePerMtok: 2.5, cacheReadPerMtok: 0.5, outputPerMtok: 6 },
+    pricing: { inputPerMtok: 2, cacheReadPerMtok: 0.5, outputPerMtok: 6 },
     renderProfile: DEFAULT_GROK_RENDER,
     contextWindowTokens: 500_000,
     maxOutputTokens: 128_000,
     factsheetEnabled: true,
-    aliases: ['grok-4.6-latest', 'grok-latest'],
+    aliases: ['grok-4-6', 'grok-4.6-latest', 'grok-latest'],
   },
   {
     canonicalId: 'grok-4.5',
@@ -302,12 +302,12 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'grok',
     status: 'degraded',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 2, cacheWritePerMtok: 2.5, cacheReadPerMtok: 0.5, outputPerMtok: 6 },
+    pricing: { inputPerMtok: 2, cacheReadPerMtok: 0.3, outputPerMtok: 6 },
     renderProfile: DEFAULT_GROK_RENDER,
     contextWindowTokens: 524_288,
     maxOutputTokens: 128_000,
     factsheetEnabled: true,
-    aliases: ['grok-4.5-thinking'],
+    aliases: ['grok-4-5', 'grok-4.5-thinking', 'grok-4.5-latest', 'grok-build-latest'],
   },
   {
     canonicalId: 'grok-4.3',
@@ -315,7 +315,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'grok',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 1.25, cacheWritePerMtok: 1.5, cacheReadPerMtok: 0.2, outputPerMtok: 2.5 },
+    pricing: { inputPerMtok: 1.25, cacheReadPerMtok: 0.2, outputPerMtok: 2.5 },
     renderProfile: DEFAULT_GROK_RENDER,
     contextWindowTokens: 1_000_000,
     maxOutputTokens: 128_000,
@@ -328,7 +328,7 @@ export const BUILTIN_CATALOG: PxpipeModelProfile[] = [
     family: 'grok',
     status: 'validated',
     enabledByDefault: false,
-    pricing: { inputPerMtok: 2, cacheWritePerMtok: 2.5, cacheReadPerMtok: 0.5, outputPerMtok: 6 },
+    pricing: { inputPerMtok: 2, cacheReadPerMtok: 0.5, outputPerMtok: 6 },
     renderProfile: DEFAULT_GROK_RENDER,
     contextWindowTokens: 500_000,
     maxOutputTokens: 64_000,
@@ -1000,7 +1000,7 @@ function createDynamicFallbackProfile(modelId: string, norm: string): PxpipeMode
     canonicalId: modelId,
     displayName: modelId,
     family,
-    status: 'validated',
+    status: 'unvalidated',
     enabledByDefault: false,
     pricing: { inputPerMtok: 0, cacheWritePerMtok: 0, cacheReadPerMtok: 0, outputPerMtok: 0 },
     renderProfile: family === 'claude' ? DEFAULT_CLAUDE_RENDER : (family === 'grok' ? DEFAULT_GROK_RENDER : DEFAULT_GPT_RENDER),
@@ -1045,6 +1045,22 @@ export function resolveModelProfile(modelId: string, _route?: PricingRouteOverri
   }
 
   // 2. Base model alias match (e.g. claude-opus-4-8 -> claude-opus-5)
+  if (norm.startsWith('grok-4.5') || norm.startsWith('grok-4-5') || norm === 'grok-build-latest') {
+    const profile = profileRegistry.get('grok-4.5');
+    if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };
+  }
+  if (norm.startsWith('grok-4.6') || norm.startsWith('grok-4-6') || norm === 'grok' || norm === 'grok-latest') {
+    const profile = profileRegistry.get('grok-4.6');
+    if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };
+  }
+  if (norm.startsWith('grok-4.3') || norm.startsWith('grok-4-3')) {
+    const profile = profileRegistry.get('grok-4.3');
+    if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };
+  }
+  if (norm.startsWith('grok-4') || norm.startsWith('grok-4-0')) {
+    const profile = profileRegistry.get('grok-4');
+    if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };
+  }
   if (norm.startsWith('gpt-5.6-sol') || norm.startsWith('gpt-5-6-sol')) {
     const profile = profileRegistry.get('gpt-5.6-sol');
     if (profile) return { ...profile, pricing: { ...profile.pricing }, renderProfile: { ...profile.renderProfile, style: { ...profile.renderProfile.style } }, aliases: [...profile.aliases] };

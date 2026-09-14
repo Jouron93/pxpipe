@@ -53,6 +53,7 @@ import {
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
 import { estimateAdmission } from './admission-estimator.js';
 import { evalCacheAwareProfitability } from './openai-savings.js';
+import { warmCacheTracker } from './warm-cache-tracker.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -290,17 +291,21 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   };
 }
 
-function requestHasProviderCacheKey(req: { prompt_cache_key?: unknown; [k: string]: unknown }): boolean {
-  return typeof req.prompt_cache_key === 'string' && req.prompt_cache_key.trim() !== '';
-}
-
 function grokProviderCacheLikely(
   model: string,
   opts: OpenAIResolvedOptions,
   req: { prompt_cache_key?: unknown; [k: string]: unknown },
+  endpoint: 'chat' | 'responses' = 'responses',
 ): boolean {
   if (!isGrokModel(model)) return false;
-  return opts.providerCacheLikely === true || requestHasProviderCacheKey(req);
+  if (opts.providerCacheLikely === true) return true;
+  if (endpoint === 'responses') {
+    const key = typeof req.prompt_cache_key === 'string' ? req.prompt_cache_key.trim() : '';
+    if (key) {
+      return warmCacheTracker.isWarm(warmCacheTracker.buildKey('xai', 'responses', model, key));
+    }
+  }
+  return false;
 }
 
 
@@ -981,7 +986,7 @@ export async function transformOpenAIChatCompletions(
 
   const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken, {
     textTokens: gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools),
-    providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+    providerCacheLikely: grokProviderCacheLikely(req.model, o, req, 'chat'),
   });
   info.gateEval = {
     site: 'slab',
@@ -1058,7 +1063,7 @@ export async function transformOpenAIChatCompletions(
     const turns = chatMessagesToTurns(req.messages);
     const profitable = (text: string, cols: number) =>
       evalOpenAIGate(req.model, text, cols, o.charsPerToken, {
-        providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+        providerCacheLikely: grokProviderCacheLikely(req.model, o, req, 'chat'),
       }).profitable;
     const plan = await planGptCollapse(
       turns,
@@ -1282,12 +1287,12 @@ export async function transformOpenAIResponses(
       ? {
           baselineText: exactContextPlan.imageableText,
           preservedTextTokens: nativeOverheadGateTokens,
-          providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+          providerCacheLikely: grokProviderCacheLikely(req.model, o, req, 'responses'),
         }
       : {
           textTokens: gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools),
           preservedText: exactContextManifest!.text,
-          providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+          providerCacheLikely: grokProviderCacheLikely(req.model, o, req, 'responses'),
         },
   );
   info.gateEval = {
@@ -1412,7 +1417,7 @@ export async function transformOpenAIResponses(
   if (o.collapseHistory && !inputWasString) {
     const profitable = (text: string, cols: number) =>
       evalOpenAIGate(req.model, text, cols, o.charsPerToken, {
-        providerCacheLikely: grokProviderCacheLikely(req.model, o, req),
+        providerCacheLikely: grokProviderCacheLikely(req.model, o, req, 'responses'),
       }).profitable;
     const plan = await planResponsesPairCollapse(
       inputItems,

@@ -41,6 +41,7 @@ import {
 import { applyRuntimeConfigOverrides } from './core/model-registry.js';
 import { applyModelScopeFromConfig } from './core/model-scope-config.js';
 import { fetchUpstreamCodexModels } from './core/codex-models.js';
+import { getBuildProvenance } from './core/build-provenance.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -187,6 +188,10 @@ function parseCli(argv: string[]): RuntimeConfig {
       printVersion();
       process.exit(0);
     }
+    if (a === '--build-info' || a === '--provenance') {
+      printBuildInfo();
+      process.exit(0);
+    }
     if (a.startsWith('-')) {
       console.error(`[pxpipe] unknown option: ${a}`);
       console.error(`[pxpipe] this build accepts no flags; run \`pxpipe --help\` for env vars`);
@@ -281,6 +286,7 @@ Stats, sessions, and cleanup tools live in the dashboard at
 Flags:
   -h, --help              show this help
       --version           show version
+      --build-info        show immutable build provenance JSON
 
 Environment:
   PORT                    listen port (default 47821)
@@ -349,6 +355,11 @@ declare const __PXPIPE_VERSION__: string | undefined;
 function printVersion(): void {
   const injected = typeof __PXPIPE_VERSION__ === 'string' ? __PXPIPE_VERSION__ : undefined;
   console.log(injected ?? process.env.npm_package_version ?? 'unknown');
+}
+
+function printBuildInfo(): void {
+  const prov = getBuildProvenance();
+  console.log(JSON.stringify(prov, null, 2));
 }
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
@@ -518,6 +529,7 @@ async function dispatchDashboard(
       const body = JSON.stringify({
         ok: true,
         service: 'pxpipe',
+        build: getBuildProvenance(),
         upstream_openai: healthMeta?.openAIUpstream ?? '',
         upstream_anthropic: healthMeta?.anthropicUpstream ?? '',
         upstream_xai: healthMeta?.xaiUpstream ?? '',
@@ -525,6 +537,16 @@ async function dispatchDashboard(
         uptime_s: Math.round(process.uptime() * 10) / 10,
       });
       return new Response(method === 'HEAD' ? null : body, {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
+    case 'build-info': {
+      if (method !== 'GET' && method !== 'HEAD') return undefined;
+      return new Response(method === 'HEAD' ? null : JSON.stringify(getBuildProvenance(), null, 2), {
         status: 200,
         headers: {
           'content-type': 'application/json; charset=utf-8',
@@ -1343,6 +1365,9 @@ async function main(): Promise<void> {
           `Unset HOST to restrict to loopback.`,
       );
     }
+    const prov = getBuildProvenance();
+    console.log(`[pxpipe] build source → ${prov.source_sha}${prov.dirty ? ' (dirty)' : ''} [${prov.source_ref}]`);
+    console.log(`[pxpipe] build entry sha256 → ${prov.entry_sha256}`);
     console.log(`[pxpipe] anthropic upstream → ${upstreamRoutes.anthropic}`);
     console.log(`[pxpipe] openai upstream → ${upstreamRoutes.openai}`);
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
