@@ -20,7 +20,7 @@ import {
   X509Certificate,
   type KeyObject,
 } from 'node:crypto';
-import { createSecureContext, type SecureContext } from 'node:tls';
+import { createSecureContext, rootCertificates, type SecureContext } from 'node:tls';
 import { isIP } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -196,7 +196,7 @@ export class CertificateAuthority {
     readonly certPath: string,
     /** Our CA followed by the system roots; see {@link writeBundle}. */
     readonly bundlePath: string,
-    /** Null when no system root bundle was found and `bundlePath` is CA-only. */
+    /** Null when the bundle uses Node's built-in public roots instead of an OS file. */
     readonly systemRootsPath: string | null,
   ) {}
 
@@ -213,12 +213,14 @@ export class CertificateAuthority {
       try {
         roots = readFileSync(systemRootsPath, 'utf8');
       } catch {
-        /* unreadable: fall back to CA-only, reported via systemRootsPath */
+        /* unreadable: fall back to Node's built-in public roots below */
       }
     }
+    const loadedPath = roots ? systemRootsPath : null;
+    if (!roots) roots = rootCertificates.join('\n') + '\n';
     const sep = roots && !roots.endsWith('\n') ? '\n' : '';
     writeFileSync(bundlePath, certPem + roots + sep, { mode: 0o644 });
-    return { bundlePath, systemRootsPath: roots ? systemRootsPath : null };
+    return { bundlePath, systemRootsPath: loadedPath };
   }
 
   /**

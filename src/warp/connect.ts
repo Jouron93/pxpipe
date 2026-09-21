@@ -21,7 +21,7 @@ import {
   request as httpsRequest,
 } from 'node:https';
 import { connect as netConnect, type Socket } from 'node:net';
-import { connect as tlsConnect, type TLSSocket } from 'node:tls';
+import { connect as tlsConnect, rootCertificates, type TLSSocket } from 'node:tls';
 
 import type { CertificateAuthority } from './ca.js';
 import { hostCouldMatch, matchRoute, rewriteUrl, type Route } from './route.js';
@@ -112,7 +112,10 @@ function pipeSockets(a: Socket, b: Socket): void {
  * plus a full TLS handshake to the real host on the passthrough path.
  */
 const httpAgent = new HttpAgent({ keepAlive: true });
-const httpsAgent = new HttpsAgent({ keepAlive: true });
+const httpsAgent = new HttpsAgent({
+  keepAlive: true,
+  ...(process.platform === 'win32' ? { ca: [...rootCertificates] } : {}),
+});
 
 export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const { routes, ca, onDivert } = options;
@@ -157,6 +160,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     outbound.on('response', (upstream) => {
       upstreamRes = upstream;
       res.writeHead(upstream.statusCode ?? 502, forwardHeaders(upstream.headers));
+      res.flushHeaders();
       // Streamed, never buffered: /v1/messages is SSE and must arrive token by
       // token or the agent appears to hang until the response completes.
       upstream.pipe(res);

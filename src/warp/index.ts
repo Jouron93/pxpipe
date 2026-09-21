@@ -288,8 +288,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       console.error(`[pxpipe] warp CA bundle → ${ca.bundlePath} (+ system roots from ${ca.systemRootsPath})`);
     } else {
       console.error(
-        `[pxpipe] warp CA bundle → ${ca.bundlePath} (no system root bundle found; ` +
-          `non-pxpipe HTTPS in the child may fail verification — set SSL_CERT_FILE to your OS bundle before warp)`,
+        `[pxpipe] warp CA bundle → ${ca.bundlePath} (+ Node built-in tls.rootCertificates)`,
       );
     }
     console.error(`[pxpipe] warp exec → ${command.join(' ')}`);

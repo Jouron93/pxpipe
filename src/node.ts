@@ -14,6 +14,8 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
+import { rootCertificates } from 'node:tls';
+import { Agent, setGlobalDispatcher } from 'undici';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import {
   chatCompletionsUrl,
@@ -417,6 +419,8 @@ function waitForDrain(out: ServerResponse): Promise<void> {
 async function writeWebResponse(res: Response, out: ServerResponse): Promise<void> {
   out.statusCode = res.status;
   res.headers.forEach((v, k) => out.setHeader(k, v));
+  // Send SSE headers even when the provider has not produced its first token.
+  if (res.headers.get('content-type')?.includes('text/event-stream')) out.flushHeaders();
   if (!res.body) {
     out.end();
     return;
@@ -1082,6 +1086,11 @@ async function runExport(argv: string[]): Promise<void> {
 // ---- main ----------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // Explicit public roots for outbound fetch on Windows; the local Warp CA is
+  // only for children trusting interception, never an upstream trust anchor.
+  if (process.platform === 'win32') {
+    setGlobalDispatcher(new Agent({ connect: { ca: [...rootCertificates] } }));
+  }
   const argv = process.argv.slice(2);
   if (argv[0] === 'export') {
     await runExport(argv.slice(1));

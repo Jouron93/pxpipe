@@ -17,6 +17,9 @@ importers:
       gpt-tokenizer:
         specifier: ^3.4.0
         version: 3.4.0
+      undici:
+        specifier: 7.29.0
+        version: 7.29.0
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^5.20260804.1

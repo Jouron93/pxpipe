@@ -60,7 +60,7 @@ await build({
   define: { __PXPIPE_VERSION__: JSON.stringify(pkg.version) },
   // Atlas is inlined as a base64 string in src/core/atlas.ts, so no external assets.
   // CommonJS cross-spawn must load through Node, not esbuild's ESM require stub.
-  external: ['cross-spawn'],
+  external: ['cross-spawn', 'undici'],
   banner: { js: '#!/usr/bin/env node' },
 });
 

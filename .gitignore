@@ -40,6 +40,7 @@ SESSION_PLAYBOOK.md
 .cursor/
 .aider*
 .continue/
+.clinerules
 eval/gsm8k/novel_imgs/
 eval/gist-recall/work*/*.png
 # Eval corpus = real captured transcripts (PII: file paths, project names, and

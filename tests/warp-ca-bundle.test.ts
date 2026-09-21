@@ -6,8 +6,9 @@
  *
  * Run just this file:  pnpm vitest run tests/warp-ca-bundle.test.ts
  */
-import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { rootCertificates } from 'node:tls';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CertificateAuthority, findSystemRootBundle } from '../src/warp/ca.js';
@@ -15,10 +16,16 @@ import { CertificateAuthority, findSystemRootBundle } from '../src/warp/ca.js';
 const CERT_RE = /-----BEGIN CERTIFICATE-----/g;
 const count = (pem: string): number => (pem.match(CERT_RE) ?? []).length;
 
+vi.mock('node:fs', async importOriginal => {
+  const fs = await importOriginal<typeof import('node:fs')>();
+  return { ...fs, existsSync: vi.fn(fs.existsSync) };
+});
+
 describe('warp CA bundle (#245)', () => {
   const dirs: string[] = [];
   const savedEnv = process.env.SSL_CERT_FILE;
   afterEach(() => {
+    vi.mocked(existsSync).mockReset();
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
     if (savedEnv === undefined) delete process.env.SSL_CERT_FILE;
     else process.env.SSL_CERT_FILE = savedEnv;
@@ -41,7 +48,7 @@ describe('warp CA bundle (#245)', () => {
       expect(count(bundle)).toBeGreaterThan(1);
       expect(count(bundle)).toBe(1 + count(readFileSync(ca.systemRootsPath, 'utf8')));
     } else {
-      expect(count(bundle)).toBe(1);
+      expect(count(bundle)).toBe(1 + rootCertificates.length);
     }
   });
 
@@ -68,8 +75,16 @@ describe('warp CA bundle (#245)', () => {
     expect(count(readFileSync(second.bundlePath, 'utf8'))).toBe(n);
   });
 
-  it('falls back to CA-only and reports it when no system bundle exists', () => {
+  it('falls back to Node public roots when no system bundle exists', () => {
     delete process.env.SSL_CERT_FILE;
+    vi.mocked(existsSync).mockReturnValue(false);
     expect(findSystemRootBundle(['/nonexistent/a.pem', '/nonexistent/b.pem'])).toBeNull();
+    const ca = CertificateAuthority.loadOrCreate(tmp());
+    expect(ca.systemRootsPath).toBeNull();
+    const cert = readFileSync(ca.certPath, 'utf8');
+    const bundle = readFileSync(ca.bundlePath, 'utf8');
+    expect(count(cert)).toBe(1);
+    expect(count(bundle)).toBe(1 + rootCertificates.length);
+    expect(bundle).toBe(cert + rootCertificates.join('\n') + '\n');
   });
 });
