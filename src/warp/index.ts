@@ -15,6 +15,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import crossSpawn from 'cross-spawn';
 import { accessSync, constants, existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
@@ -139,6 +140,13 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
    */
   const spawnResolved = (command: string[], env: NodeJS.ProcessEnv) => {
     const direct = { stdio: 'inherit', env } as const;
+    // Resolve Windows PATH/PATHEXT, including npm .cmd shims, before any
+    // POSIX alias lookup. cross-spawn uses cmd.exe for shims and handles its
+    // extra quoting layer; native .exe files are spawned directly. SHELL may
+    // point to Git Bash (or a nonexistent /usr/bin/bash) and is irrelevant.
+    if (process.platform === 'win32') {
+      return crossSpawn(command[0]!, command.slice(1), direct);
+    }
     const shell = env.SHELL || '/bin/sh';
     // An alias can shadow a real binary: `cc` is Apple clang on PATH and a
     // Claude Code alias in the user's zsh, so PATH alone would silently run
