@@ -13,6 +13,11 @@ import {
 } from './measurement.js';
 import type { Usage } from './types.js';
 import {
+  MeasuredAdmission,
+  anthropicBilledInputTokens,
+  measuredRevertEnabled,
+} from './measured-admission.js';
+import {
   anthropicMessagesToOpenAIResponses,
   openAIResponsesToAnthropicResponse,
 } from './messages-responses-bridge.js';
@@ -27,6 +32,10 @@ import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 
 export interface ProxyConfig {
+  /** Measured-loss revert on the Anthropic Messages lane (see measured-admission.ts).
+   *  Omitted: enabled unless PXPIPE_MEASURED_REVERT=0. `false`: disabled. An
+   *  instance: used as-is (tests inject one with a fake clock). */
+  measuredAdmission?: MeasuredAdmission | false;
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
    *  OpenAI paths drop the `/v1` prefix to match gateway shape. */
   provider?: 'cloudflare-ai-gateway';
@@ -1436,6 +1445,13 @@ export function createProxy(config: ProxyConfig = {}) {
   const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
   const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
   const maxRequestBytes = resolveMaxRequestBytes(config.maxRequestBytes);
+  const measuredAdmission: MeasuredAdmission | null =
+    config.measuredAdmission === false
+      ? null
+      : config.measuredAdmission
+        ?? (measuredRevertEnabled(typeof process !== 'undefined' ? process.env : undefined)
+          ? new MeasuredAdmission()
+          : null);
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -1550,6 +1566,21 @@ let responseContentType: string | undefined;
           } else {
             info.baselineProbeStatus = 'ok';
           }
+          // Feed the measured-loss guard. baselineStatusApplies is set only on the
+          // native Anthropic Messages path, so this is an imaged Anthropic request
+          // with a measured baseline and real usage: exactly the comparison the
+          // local estimate made in advance.
+          if (
+            measuredAdmission
+            && status === 200
+            && !bridgedGptMessages && !bridgedChatMessages
+            && info.compressed
+            && (info.imageCount ?? 0) > 0
+            && baselineResolved !== null
+          ) {
+            const billed = anthropicBilledInputTokens(usage);
+            if (billed !== null) measuredAdmission.record(requestModel, billed, baselineResolved);
+          }
         }
         // The Messages compatibility response exposes Anthropic's disjoint
         // usage buckets to the client. Dashboard accounting still needs the
@@ -1634,7 +1665,6 @@ let responseContentType: string | undefined;
     let requestModel: string | undefined = googleModelFromPath ?? undefined;
     let bridgedGptMessages = false;
     let bridgedChatMessages = false;
-    let modelRouteForRequest: 'openai' | 'cloudflare' | undefined;
 
     // Two count_tokens probes on the pre-compression body (see docs/HISTORY_CACHE_MODEL.md):
     //   baselinePromise          → full-body input_tokens
@@ -1710,7 +1740,6 @@ let responseContentType: string | undefined;
         const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
         const routedModel = decodedChatModel ?? model;
         const modelRoute = routedModel ? modelRoutes.get(routedModel) : undefined;
-        modelRouteForRequest = modelRoute;
         const forceChat = isMessages && modelRoute === 'cloudflare';
         const messagesAnthropic = isMessages
           && modelRoute === undefined && !forceChat && isClaudeModel(model);
@@ -1737,7 +1766,12 @@ let responseContentType: string | undefined;
         if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
           requestModel = effectiveModel;
         }
-        const effectiveOpts = modelOk
+        // A model whose imaged requests measured MORE billed input than their
+        // plain-text baseline passes through until its cooldown ends.
+        const measuredLossBypass = !!measuredAdmission
+          && messagesAnthropic && !bridgedGptMessages && !bridgedChatMessages
+          && modelOk && measuredAdmission.shouldBypass(model);
+        const effectiveOpts = modelOk && !measuredLossBypass
           ? transformOpts
           : { ...transformOpts, compress: false };
         const bridgeBody = bridgedGptMessages
@@ -1803,6 +1837,7 @@ let responseContentType: string | undefined;
           }
         }
         if (!modelOk) r.info.reason = 'unsupported_model';
+        else if (measuredLossBypass) r.info.reason = 'measured_loss';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
