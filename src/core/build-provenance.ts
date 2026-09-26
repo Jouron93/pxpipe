@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { getAllowedModelBases, getConfiguredModelBases } from './applicability.js';
 
 export interface BuildProvenance {
   schema_version: 1;
@@ -126,6 +127,25 @@ export function getBuildProvenance(): BuildProvenance {
     bundle_verified: false,
   });
   return cachedProvenance;
+}
+
+export interface RuntimeBuildInfo extends BuildProvenance {
+  /** Model scope this process is imaging right now (dashboard override included). */
+  runtime_model_scope: string[];
+  /** Scope from PXPIPE_MODELS / config at launch, ignoring the dashboard override. */
+  configured_model_scope: string[];
+}
+
+/** Payload for GET /build-info: provenance plus the model scope actually loaded.
+ *  Supervisors check runtime scope drift here. `/v1/models` is an upstream
+ *  route that needs the caller's credential, so an unauthenticated supervisor
+ *  probe got a 401 from Anthropic every tick and could never see drift. */
+export function getRuntimeBuildInfo(): RuntimeBuildInfo {
+  return {
+    ...getBuildProvenance(),
+    runtime_model_scope: getAllowedModelBases(),
+    configured_model_scope: getConfiguredModelBases(),
+  };
 }
 
 /** Testing helper to inject or clear the process-local cached provenance. */

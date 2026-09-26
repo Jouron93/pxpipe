@@ -6,6 +6,22 @@ behavioral changes, patch = fixes).
 
 ## Unreleased
 
+### Added
+- **Measured-loss revert on the Anthropic Messages lane.** The free
+  `count_tokens` baseline probe already runs beside every forward. Its result is
+  now compared with the real billed input (`input + cache_creation + cache_read`).
+  When a model's last imaged requests (at least 3, window 8) bill more than 2%
+  above their plain-text baseline in aggregate, that model passes through
+  unmodified for 30 minutes (`reason: measured_loss`), then is imaged and
+  measured again. The Google lane already reverts on a measured loss; this is
+  the same property for Anthropic, with no added latency. Measured before the
+  change: `claude-haiku-4-5` billed 5,748,105 tokens against a 5,232,177 baseline
+  over 40 of 40 imaged requests (-9.9%), while `claude-opus-5-5` saved 18.8%.
+  `PXPIPE_MEASURED_REVERT=0` disables it.
+- **`GET /build-info` reports `runtime_model_scope` and `configured_model_scope`**,
+  so a supervisor can check scope drift without an upstream credential.
+  An unauthenticated `GET /v1/models` is forwarded upstream and returns 401.
+
 ### Changed
 - **Gemini is on by default for every version, and opt-out works again.** The
   built-in scope is now `PXPIPE_MODELS=claude-fable-5,gemini`; the `gemini`

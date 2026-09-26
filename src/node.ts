@@ -39,7 +39,7 @@ import {
   type DashboardRoute,
 } from './dashboard.js';
 import { runStats } from './stats.js';
-import { getBuildProvenance } from './core/build-provenance.js';
+import { getBuildProvenance, getRuntimeBuildInfo } from './core/build-provenance.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -278,6 +278,9 @@ Environment:
   PXPIPE_MODELS           comma-separated model bases to image (Claude/Gemini/GPT/Grok);
                           default claude-fable-5,gemini (every Gemini; Sol/Opus/GPT-5.5/Grok opt-in);
                           off disables
+  PXPIPE_MEASURED_REVERT  0 disables the Anthropic measured-loss revert: a model whose
+                          imaged requests bill more than their count_tokens baseline
+                          passes through for 30 min, then is re-measured (default on)
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
@@ -536,8 +539,10 @@ async function dispatchDashboard(
       return dashboard.serveRecent();
     case 'build-info': {
       if (method !== 'GET' && method !== 'HEAD') return undefined;
+      // Provenance plus the model scope this process actually loaded, so a
+      // supervisor can check runtime scope drift without an upstream credential.
       return new Response(
-        method === 'HEAD' ? null : JSON.stringify(getBuildProvenance(), null, 2),
+        method === 'HEAD' ? null : JSON.stringify(getRuntimeBuildInfo(), null, 2),
         {
           headers: {
             'content-type': 'application/json; charset=utf-8',
