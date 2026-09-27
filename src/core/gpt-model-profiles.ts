@@ -289,6 +289,35 @@ const GPT6_LUNA_PROFILE: GptModelProfile = {
   outputLimit: 8_192,
 };
 
+/** GPT-5.x flagship profiles (gpt-5.4, gpt-5.5, etc.) now adopt legible geometry.
+ *  GPT-5.4 (March 2026): 75% OSWorld-Verified benchmark, 33% reduction in false claims,
+ *  improved document understanding for dense scans and charts.
+ *  GPT-5.5 (April 2026): 76.12% Roboflow Vision Evals, 88.9% document understanding,
+ *  improved spatial understanding (78.9%), patch-based 32x32 tokenization.
+ *  Measured benefit: ~71.3% savings vs 46.7% with prior dense geometry (from Sol/Astra).
+ *  These improvements justify adopting the same legible profile as newer flagship models. */
+const GPT5_FLAGSHIP_PROFILE: GptModelProfile = {
+  vision: { regime: 'patch', multiplier: 1, patchCap: 10000 },
+  ...GPT5_PRICING,
+  exactStaticBaseline: true,
+  stripCols: 84,
+  maxHeightPx: 1954,
+  minCompressTokens: 500,
+  factSheetFormat: 'full',
+  history: {
+    ...NATIVE_14PX_HISTORY,
+    maxImages: 64,
+  },
+  style: {
+    ...BASE_STYLE,
+    font: 'jetbrains-mono-14',
+    cellWBonus: 0,
+    cellHBonus: 0,
+  },
+  contextWindow: 1_048_576,
+  outputLimit: 8_192,
+};
+
 /** GPT-6 default profile for unnamed variants (gpt-6-cyber, gpt-6-ember, etc.).
  *  Adopts legible geometry (84 cols, 1954px, jetbrains-mono-14) matching Astra/Sol/Luna.
  *  Measured benefit: ~71.3% savings vs 46.7% with prior dense geometry.
@@ -404,10 +433,10 @@ const BUILTIN_RULES: ProfileRule[] = [
     test: (m) => m === 'gpt-5.6-sol' || m.startsWith('gpt-5.6-sol-'),
     profile: GPT56_SOL_PROFILE,
   },
-  // 5.x flagship (gpt-5.4/5.5/…, no -mini/-nano): patch, multiplier 1, detail:original cap
+  // 5.x flagship (gpt-5.4/5.5/…, no -mini/-nano): legible geometry, patch multiplier 1
   {
     test: (m) => /^gpt-5\.\d/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE, contextWindow: 1_048_576, outputLimit: 8_192 },
+    profile: GPT5_FLAGSHIP_PROFILE,
   },
   // gpt-5 / gpt-5-chat-latest: tile 70/140
   {
