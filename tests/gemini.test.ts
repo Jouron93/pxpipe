@@ -30,6 +30,11 @@ describe('Gemini Model Profiles & Identification', () => {
     expect(hasGeminiMeasuredProfile('google/gemini-3.6-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-3.7-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('google/gemini-3.7-flash')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-3.5-flash')).toBe(true);
+    expect(hasGeminiMeasuredProfile('google/gemini-3.5-flash')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-3.5-pro')).toBe(false);
+    expect(hasGeminiMeasuredProfile('gemini-3.8-live')).toBe(true);
+    expect(hasGeminiMeasuredProfile('gemini-omni-1.1-flash')).toBe(true);
     expect(hasGeminiMeasuredProfile('gemini-3.6-pro')).toBe(false);
     expect(hasGeminiMeasuredProfile('gemini-3.7-pro')).toBe(false);
     expect(hasGeminiMeasuredProfile('gemini-3.8-flash')).toBe(true);

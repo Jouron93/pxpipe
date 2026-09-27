@@ -1,6 +1,6 @@
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { describe, expect, it } from 'vitest';
-import { encodeGrayPng, encodeRgbPng } from '../src/core/png.js';
+import { encodeGrayPng, encodeIndexedPng, encodeRgbPng, encodeRgbPngSmallest } from '../src/core/png.js';
 
 /**
  * The encoder applies PNG's Average scanline filter, which must be bit-exact
@@ -59,6 +59,55 @@ describe('PNG encoder is lossless', () => {
       }
     }
     expect(firstDiff).toBe(-1);
+  });
+
+  // Every smallest-form branch must decode to exactly the RGB pixels it was given.
+  const rgbFirstDiff = (data: Uint8ClampedArray, pixels: Uint8Array): number => {
+    for (let i = 0; i < pixels.length / 3; i++) {
+      for (let c = 0; c < 3; c++) if (data[i * 4 + c] !== pixels[i * 3 + c]) return i * 3 + c;
+    }
+    return -1;
+  };
+  const colorType = (png: Uint8Array): number => png[25]!; // IHDR byte 9 after the 16-byte header
+
+  it('writes an all-gray RGB page as grayscale, pixel-identical', async () => {
+    const pixels = new Uint8Array(W * H * 3);
+    for (let i = 0; i < W * H; i++) pixels[i * 3] = pixels[i * 3 + 1] = pixels[i * 3 + 2] = (i * 7) & 255;
+    const png = await encodeRgbPngSmallest(pixels, W, H);
+    expect(colorType(png)).toBe(0);
+    expect(rgbFirstDiff((await decode(png)).data, pixels)).toBe(-1);
+    expect(png.length).toBeLessThan((await encodeRgbPng(pixels, W, H)).length);
+  });
+
+  it('writes a <=256-color RGB page as indexed, pixel-identical', async () => {
+    const colors = [[255, 255, 255], [0, 0, 0], [30, 90, 200], [200, 40, 40], [128, 128, 128], [20, 160, 60]];
+    const pixels = new Uint8Array(W * H * 3);
+    for (let i = 0; i < W * H; i++) pixels.set(colors[(i * 13 + (i >> 5)) % colors.length]!, i * 3);
+    const png = await encodeRgbPngSmallest(pixels, W, H);
+    expect(colorType(png)).toBe(3);
+    expect(rgbFirstDiff((await decode(png)).data, pixels)).toBe(-1);
+  });
+
+  it('falls back to truecolor above 256 colors, pixel-identical', async () => {
+    const pixels = new Uint8Array(W * H * 3);
+    for (let i = 0; i < pixels.length; i++) pixels[i] = (i * 37 + (i % 5)) & 255;
+    const png = await encodeRgbPngSmallest(pixels, W, H);
+    expect(colorType(png)).toBe(2);
+    expect(rgbFirstDiff((await decode(png)).data, pixels)).toBe(-1);
+  });
+
+  it('is deterministic for the same page', async () => {
+    const colors = [[255, 255, 255], [0, 0, 0], [30, 90, 200]];
+    const pixels = new Uint8Array(W * H * 3);
+    for (let i = 0; i < W * H; i++) pixels.set(colors[i % 3]!, i * 3);
+    const a = await encodeRgbPngSmallest(pixels, W, H);
+    const b = await encodeRgbPngSmallest(pixels, W, H);
+    expect(Buffer.from(a).equals(Buffer.from(b))).toBe(true);
+  });
+
+  it('rejects an empty or oversized palette', async () => {
+    await expect(encodeIndexedPng(new Uint8Array(4), new Uint8Array(0), 2, 2)).rejects.toThrow();
+    await expect(encodeIndexedPng(new Uint8Array(4), new Uint8Array(257 * 3), 2, 2)).rejects.toThrow();
   });
 
   it('preserves a solid run and a single-pixel image', async () => {

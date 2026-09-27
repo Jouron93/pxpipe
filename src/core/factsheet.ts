@@ -242,20 +242,30 @@ export function extractFactSheetEntriesAllPages(
   return { kept, dropped: all.length - kept.length };
 }
 
+// ASCII only, on purpose. The sheet used to join tokens with ' · ' (U+00B7) and mark
+// counts with '×N' (U+00D7). Measured with count_tokens on real Claude Code requests
+// (claude-opus-5-5, 2026-09-26), those two characters made the sheet cost 2.05 tokens
+// per char: 10,737 tokens for 5,225 chars across four imaged Read results, which erased
+// ~80% of what imaging those results saved. The same tokens joined with ASCII cost
+// 0.56 tokens/char (2,398), same entries, same counts. Every extracted token is
+// whitespace-free by construction, so a plain space is an unambiguous separator.
+const SEP = ' ';
+const countSuffix = (n: number): string => `(x${n})`;
+
 const OPEN =
-  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image: ';
-/** Variant used when at least one token repeats — explains the ×N annotation so the
+  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) - quote these verbatim instead of transcribing them from the image: ';
+/** Variant used when at least one token repeats - explains the (xN) annotation so the
  *  model can answer tally questions from the sheet instead of counting glyph rows. */
 const OPEN_COUNTS =
-  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image; ×N marks a token that occurs N times within the imaged content: ';
-const OPEN_COMPACT = '[Exact rendered identifiers—quote verbatim: ';
-const OPEN_COMPACT_COUNTS = '[Exact rendered identifiers—quote verbatim; ×N=count: ';
+  '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) - quote these verbatim instead of transcribing them from the image; a trailing (xN) means the token occurs N times within the imaged content: ';
+const OPEN_COMPACT = '[Exact rendered identifiers, quote verbatim: ';
+const OPEN_COMPACT_COUNTS = '[Exact rendered identifiers, quote verbatim; (xN)=count: ';
 
 export type FactSheetFormat = 'full' | 'compact';
 
 /** Build the one-line fact-sheet string from a pre-extracted token list. */
 export function factSheetTextFromTokens(tokens: string[]): string {
-  return tokens.length > 0 ? OPEN + tokens.join(' · ') + ']' : '';
+  return tokens.length > 0 ? OPEN + tokens.join(SEP) + ']' : '';
 }
 
 /** Build the one-line fact-sheet string from token+count entries. Byte-identical to
@@ -266,7 +276,7 @@ export function factSheetTextFromEntries(
 ): string {
   if (entries.length === 0) return '';
   const anyRepeat = entries.some((e) => e.count >= 2);
-  const body = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token)).join(' · ');
+  const body = entries.map((e) => (e.count >= 2 ? `${e.token}${countSuffix(e.count)}` : e.token)).join(SEP);
   const opener = format === 'compact'
     ? (anyRepeat ? OPEN_COMPACT_COUNTS : OPEN_COMPACT)
     : (anyRepeat ? OPEN_COUNTS : OPEN);

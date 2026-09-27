@@ -117,28 +117,28 @@ describe('ticket-style codes and occurrence counts', () => {
     expect(toks).not.toContain('NON-NULL');
   });
 
-  it('annotates repeated tokens with ×N and explains the notation', () => {
+  it('annotates repeated tokens with (xN) and explains the notation', () => {
     const text = 'retry DEPLOY-77 failed\nretry DEPLOY-77 ok\nfinal DEPLOY-77 done\nsha 9d121ac';
     const sheet = factSheetText(text);
-    expect(sheet).toContain('DEPLOY-77 ×3');
-    expect(sheet).toContain('×N marks a token that occurs N times');
-    expect(sheet).not.toContain('9d121ac ×');
+    expect(sheet).toContain('DEPLOY-77(x3)');
+    expect(sheet).toContain('a trailing (xN) means the token occurs N times');
+    expect(sheet).not.toContain('9d121ac(x');
   });
 
-  it('emits byte-identical sheets to the pre-count format when nothing repeats', () => {
+  it('emits no count annotation when nothing repeats', () => {
     const text = 'commit 9d121ac on port 47821';
     expect(factSheetText(text)).toContain('from the image: ');
-    expect(factSheetText(text)).not.toContain('×');
+    expect(factSheetText(text)).not.toMatch(/\(x\d+\)/);
   });
 
   it('supports compact profile framing without changing extracted facts', () => {
     const text = 'retry DEPLOY-77 on src/core/openai.ts port 47821 DEPLOY-77';
     const full = factSheetText(text);
     const compact = factSheetText(text, 'compact');
-    expect(compact).toContain('DEPLOY-77 ×2');
+    expect(compact).toContain('DEPLOY-77(x2)');
     expect(compact).toContain('src/core/openai.ts');
     expect(compact).toContain('47821');
-    expect(compact).toContain('×N=count');
+    expect(compact).toContain('(xN)=count');
     expect(compact.length).toBeLessThan(full.length);
   });
 
@@ -146,7 +146,18 @@ describe('ticket-style codes and occurrence counts', () => {
     // 1.2.3 is hit by the version pattern; its 1.2 substring by decimal — offset dedup
     // plus substring-collapse must leave a single un-annotated v1.2.3-style entry.
     const sheet = factSheetText('release v1.2.3 shipped');
-    expect(sheet).not.toMatch(/×\d/);
+    expect(sheet).not.toMatch(/\(x\d+\)/);
+  });
+
+  it('is pure ASCII so it tokenizes cheaply', () => {
+    // U+00B7 separators and U+00D7 count marks made the sheet cost 2.05 tokens/char on
+    // claude-opus-5-5 (measured 2026-09-26) versus 0.56 for the same entries in ASCII.
+    const text = 'retry DEPLOY-77 on src/core/openai.ts port 47821 DEPLOY-77 sha 9d121ac v1.2.3';
+    for (const format of ['full', 'compact'] as const) {
+      const sheet = factSheetText(text, format);
+      expect(sheet.length).toBeGreaterThan(0);
+      expect(/^[\x20-\x7e]*$/.test(sheet)).toBe(true);
+    }
   });
 
   it('keeps a rare ticket code over a flood of per-line hex ids (log-file shape)', () => {

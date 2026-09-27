@@ -1,0 +1,47 @@
+# ==========================================================================
+# Unicode, Multilingual Typography & Terminal Box-Drawing Test Matrix
+# Fixture: 04-unicode-box.txt
+# ==========================================================================
+
+## 1. Box Drawing & Form Borders (Single & Double Line)
+┌───────────────────────┬───────────────────────┬────────────────────────┐
+│ Component Name        │ Operational State     │ Latency (p99.9)        │
+├───────────────────────┼───────────────────────┼────────────────────────┤
+│ Core Neural Engine    │ RUNNING [ONLINE]      │ 12.45 ms               │
+│ Vision Atlas Cache    │ WARM [100% HIT]       │  0.08 ms               │
+│ Prompt Serializer     │ IDLE [READY]          │  1.12 ms               │
+└───────────────────────┴───────────────────────┴────────────────────────┘
+
+╔═══════════════════════╦═══════════════════════╦════════════════════════╗
+║ Double Frame Header   ║ Cluster Master Alpha  ║ Security Enclave B     ║
+╠═══════════════════════╬═══════════════════════╬════════════════════════╣
+║ Data Ingestion Pipeline║ ACTIVE: 42,500 msg/s  ║ VERIFIED: TLS 1.3 / OK ║
+║ Cryptographic Vault   ║ LOCKED: AES-256-GCM   ║ HARDWARE KEY ENFORCED  ║
+╚═══════════════════════╩═══════════════════════╩════════════════════════╝
+
+## 2. Block Elements & Progress Telemetry
+Progress Bar [Full Density]:   ████████████████████████████████ 100% Complete
+Progress Bar [Shaded Bands]:   ████████████████░░░░░░░░░░░░░░░░  50% Buffering
+Vertical Meter Blocks:          ▂▃▄▅▆▇█ | Level 8 Peak Volume
+Horizontal Quadrants:          ▖▗▘▙▚▛▜▝▞▟ | Geometric Glyphs
+
+## 3. Directional Flow & Mathematical Logic
+Flow Transition: Ingest ──► Validate ──► Normalize ──► Render ──► Transmit
+Bidirectional:   Client ◄──► Proxy Gate ◄──► Upstream API
+Logic Symbols:   ∀x ∈ Context: (x ≠ ∅) ∧ (x ⊆ Payload) ⇒ Decodable(x)
+Calculus/Stats:  ∫ f(t) dt = μ ± 3σ | ∑_{i=1}^N w_i · x_i | √λ · e^{-λ}
+
+## 4. Multilingual Scripts (CJK, Cyrillic, Greek, Accented Latin)
+- Chinese (Simplified):  深度学习上下文压缩代理正在运行中，显存占用正常。
+- Chinese (Traditional): 跨節點高並發狀態機架構驗證，延遲指標符合預期。
+- Japanese (Hiragana/Katakana/Kanji): リアルタイム推論パイプラインの正常稼働を確認しました。
+- Korean (Hangul):       초저지연 비전 렌더링 엔진 테스트가 성공적으로 완료되었습니다.
+- Greek:                 Η ακρίβεια της οπτικής αναγνώρισης χαρακτήρων είναι εξαιρετική.
+- Cyrillic:              Высокопроизводительный прокси-сервер сжатия контекста активен.
+- German / French:       Prüfung der Übertragungsqualität: naïve façon d'être sûr et fidèle.
+- Nordic / Spanish:      Blåbærsyltetøy på fjellet; niños pequeños jugando en la plaza española.
+
+## 5. Currencies, Arrows & Special Punctuation
+Currencies:  $100.00 | €85.50 | £72.20 | ¥14,500 | ₩135,000 | ₹8,300 | ₿0.0025 | Ξ0.045
+Arrows:      ← ↑ → ↓ ↔ ↕ ↖ ↗ ↘ ↙ ↚ ↛ ↞ ↠ ↢ ↣ ↦ ↩ ↪ ↫ ↬ ↰ ↱ ↲ ↳
+Checkmarks:  ✓ Passed  ✗ Failed  ⚠ Warning  ★ Star  ✦ Sparkle  ◆ Diamond

@@ -27,6 +27,8 @@ export const CLAUDE_PROFILE: GptModelProfile = {
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
   visionTier: 'high-res',
   factSheetFormat: 'full',
+  contextWindow: 1_000_000,
+  outputLimit: 8_192,
   // BASE_HISTORY.maxImages is a page count, and a page is not a fixed amount of
   // text: at GPT geometry (84 cols x 1954 px) a page holds ~660 chars, at
   // Anthropic geometry (312 cols x 728 px) it holds ~2750. The shared 32 was
@@ -81,6 +83,8 @@ export const CLAUDE_LEGACY_PROFILE: GptModelProfile = {
   ...CLAUDE_PROFILE,
   visionTier: 'standard',
   style: { ...BASE_STYLE },
+  contextWindow: 200_000,
+  outputLimit: 4_096,
 };
 
 /**
@@ -115,6 +119,49 @@ export const CLAUDE_LEGACY_LEGIBLE_PROFILE: GptModelProfile = {
   historyStripCols: CLAUDE_HISTORY_STRIP_COLS,
   historyStyle: { ...CLAUDE_HISTORY_STYLE },
 };
+
+/**
+ * Opus 5.5: JetBrains Mono 10px (6x11 cells) on high-res-tier pages.
+ *
+ * Measured 2026-09-26 with a fragment-to-exact-line battery on real private
+ * source (the old_string an Edit needs), through the production transform:
+ *
+ *   geometry                    exact  silently wrong  abstain  saved
+ *   jb14, 172 cols x 728 (prev)  55/64      0/64         9/64   46.7%
+ *   jb10, 428 cols x 1260        59/64      0/64         5/64   71.3%
+ *   jb10, 260 cols x 728         88/96      4/96         4/96   71.7%
+ *   spleen 5x10, 312 cols        50/64      7/64         7/64   76.9%
+ *   spleen 5x8, 312 cols         15/32      3/32        14/32   80.0%
+ *
+ * The spleen misses are plausible identifier substitutions (`filled_size` for
+ * `order_size`), the dangerous kind. 428 cols x 6 px + padding = 2576 px wide,
+ * the high-res tier's long-edge limit; 2576 x 1260 is 92 x 45 = 4,140 patches,
+ * under the 4,784 visual-token cap, so nothing is downscaled server-side. The
+ * wider page also needs ~20% fewer images than 260 cols for the same text.
+ *
+ * Opus 5.5 only: the same battery at this geometry read 0/32 on Sonnet 5 (all
+ * abstentions) and 5/32 on Opus 5, so they keep CLAUDE_LEGIBLE_PROFILE.
+ */
+export const CLAUDE_OPUS55_STRIP_COLS = 428;
+export const CLAUDE_OPUS55_MAX_HEIGHT_PX = 1260;
+const CLAUDE_OPUS55_STYLE: GptRenderStyle = {
+  ...BASE_STYLE,
+  font: 'jetbrains-mono-10',
+};
+
+export const CLAUDE_OPUS55_PROFILE: GptModelProfile = {
+  ...CLAUDE_PROFILE,
+  stripCols: CLAUDE_OPUS55_STRIP_COLS,
+  maxHeightPx: CLAUDE_OPUS55_MAX_HEIGHT_PX,
+  style: { ...CLAUDE_OPUS55_STYLE },
+  historyStripCols: CLAUDE_OPUS55_STRIP_COLS,
+  historyStyle: { ...CLAUDE_OPUS55_STYLE },
+};
+
+/** Opus 5.5 ids, including vendor-prefixed and bracketed transport variants. */
+export function isOpus55Claude(model: string): boolean {
+  return /opus-5-5(?![0-9])/.test(model.toLowerCase());
+}
 
 /** Fable is the only Claude family measured accurate at dense geometry, so it
  *  alone keeps the 5.28x dense rendering for history. */
@@ -161,5 +208,6 @@ export function resolveClaudeProfile(m: string): GptModelProfile {
   if (isFableClaude(m)) {
     return isPre47Claude(m) ? CLAUDE_LEGACY_PROFILE : CLAUDE_PROFILE;
   }
+  if (isOpus55Claude(m)) return CLAUDE_OPUS55_PROFILE;
   return isPre47Claude(m) ? CLAUDE_LEGACY_LEGIBLE_PROFILE : CLAUDE_LEGIBLE_PROFILE;
 }

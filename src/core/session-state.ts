@@ -96,6 +96,14 @@ interface SessionRecord {
    * that once had one, and then lost it, has provably free room to re-cut.
    */
   everCacheAlive?: boolean;
+  /**
+   * History page budget this session was last admitted at after a byte-fit trim.
+   * Monotonic non-increasing while the cache lives: re-deriving it per request
+   * made the collapse boundary flip between two states and re-write the whole
+   * image prefix each time (measured 2026-09-27: 3 full re-writes of 380-436k
+   * tokens in 26 turns on claude-opus-5-5).
+   */
+  historyByteBudget?: number;
 }
 
 const sessions = new Map<string, SessionRecord>();
@@ -205,6 +213,36 @@ export function recordFreezeStep(
   if (!sessionKey || !step || !Number.isFinite(step) || step <= 0) return;
   const rec = touch(sessionKey);
   if (step > rec.freezeStep) rec.freezeStep = step;
+}
+
+/** Sticky byte-fit history budget for a session, or undefined when none is pinned. */
+export function stickyHistoryByteBudget(sessionKey: string | undefined): number | undefined {
+  if (!sessionKey) return undefined;
+  return sessions.get(sessionKey)?.historyByteBudget;
+}
+
+/**
+ * Pin the byte-fit history budget. Only ever lowers an existing pin: a higher
+ * budget would move the collapse boundary and re-key every cached history image.
+ * `cold` (cache provably gone) is the one moment raising it is free.
+ */
+export function recordHistoryByteBudget(
+  sessionKey: string | undefined,
+  budget: number | undefined,
+  cold = false,
+): void {
+  if (!sessionKey || !budget || !Number.isFinite(budget) || budget <= 0) return;
+  const rec = touch(sessionKey);
+  if (cold || rec.historyByteBudget === undefined || budget < rec.historyByteBudget) {
+    rec.historyByteBudget = Math.floor(budget);
+  }
+}
+
+/** Drop the pin (used when a cold session may re-fit from scratch). */
+export function clearHistoryByteBudget(sessionKey: string | undefined): void {
+  if (!sessionKey) return;
+  const rec = sessions.get(sessionKey);
+  if (rec) rec.historyByteBudget = undefined;
 }
 
 /**

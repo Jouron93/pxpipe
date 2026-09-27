@@ -171,6 +171,10 @@ export interface GptModelProfile {
    *  and the final request can never overshoot the provider's limit. Set only
    *  from a documented provider limit (Workers AI 3.8: 32). */
   providerImageCap?: number;
+  /** Total context window capacity in tokens. */
+  contextWindow?: number;
+  /** Maximum generation output token limit. */
+  outputLimit?: number;
 }
 
 /** Default downscale-safe strip width (768px). Exported as the global cols default. */
@@ -195,6 +199,8 @@ export const DEFAULT_GPT_PROFILE: GptModelProfile = {
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: BASE_STYLE,
+  contextWindow: 128_000,
+  outputLimit: 4_096,
 };
 
 const GPT56_SOL_PROFILE: GptModelProfile = {
@@ -224,6 +230,54 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     cellWBonus: 0,
     cellHBonus: 0,
   },
+  contextWindow: 1_048_576,
+  outputLimit: 8_192,
+};
+
+/** gpt-6 family list prices: cached input $0.50 / input $2.00 / output $10.00 per 1M (50% cache read discount, 5x output multiplier). */
+const GPT6_PRICING = { cacheReadRate: 0.5, outputRate: 5 };
+
+const GPT6_ASTRA_PROFILE: GptModelProfile = {
+  vision: { regime: 'patch', multiplier: 1 },
+  ...GPT6_PRICING,
+  exactStaticBaseline: true,
+  stripCols: 84,
+  maxHeightPx: 1954,
+  minCompressTokens: 500,
+  factSheetFormat: 'full',
+  history: {
+    ...NATIVE_14PX_HISTORY,
+    maxImages: 64,
+  },
+  style: {
+    ...BASE_STYLE,
+    font: 'jetbrains-mono-14',
+    cellWBonus: 0,
+    cellHBonus: 0,
+  },
+  contextWindow: 1_048_576,
+  outputLimit: 16_384,
+};
+
+const GPT6_SOL_PROFILE: GptModelProfile = {
+  ...GPT56_SOL_PROFILE,
+  ...GPT6_PRICING,
+  contextWindow: 1_048_576,
+  outputLimit: 8_192,
+};
+
+const GPT6_LUNA_PROFILE: GptModelProfile = {
+  vision: { regime: 'patch', multiplier: 1, patchCap: 10000 },
+  cacheReadRate: 0.5,
+  outputRate: 4,
+  stripCols: C,
+  maxHeightPx: H,
+  minCompressTokens: 500,
+  factSheetFormat: 'full',
+  history: BASE_HISTORY,
+  style: BASE_STYLE,
+  contextWindow: 1_048_576,
+  outputLimit: 8_192,
 };
 
 interface ProfileRule {
@@ -241,13 +295,15 @@ const isGrokModel = (m: string): boolean => /^grok-/.test(m);
 /** Qwen 3.8 27B ids — the only Qwen geometry pxpipe has measured. Other Qwen
  *  variants deliberately do NOT match: the family-id guard below refuses them
  *  instead of gating an unmeasured model with this profile. */
-const isQwenModel = (m: string): boolean => /qwen3\.8-27b/i.test(m);
+const isQwenModel = (m: string): boolean => /qwen3\.8[-:_]27b/i.test(m);
 
 /** Shared GPT geometry for the small patch-billed models; only the patch
  *  multiplier and the family list prices differ between the rules below. */
 const miniNanoProfile = (
   multiplier: number,
   pricing: { cacheReadRate: number; outputRate: number },
+  contextWindow = 1_048_576,
+  outputLimit = 16_384,
 ): GptModelProfile => ({
   vision: { regime: 'patch', multiplier, patchCap: 1536 },
   ...pricing,
@@ -257,6 +313,8 @@ const miniNanoProfile = (
   factSheetFormat: 'full',
   history: BASE_HISTORY,
   style: BASE_STYLE,
+  contextWindow,
+  outputLimit,
 });
 
 /**
@@ -265,25 +323,56 @@ const miniNanoProfile = (
  *   mini/nano -> patch (nano 2.46 / mini 1.62, cap 1536), BEFORE 5.x flagship.
  */
 const BUILTIN_RULES: ProfileRule[] = [
+  // GPT-6 Astra
+  {
+    test: (m) => m === 'gpt-6-astra' || m.startsWith('gpt-6-astra-'),
+    profile: GPT6_ASTRA_PROFILE,
+  },
+  // GPT-6 Sol
+  {
+    test: (m) => m === 'gpt-6-sol' || m.startsWith('gpt-6-sol-'),
+    profile: GPT6_SOL_PROFILE,
+  },
+  // GPT-6 Luna
+  {
+    test: (m) => m === 'gpt-6-luna' || m.startsWith('gpt-6-luna-'),
+    profile: GPT6_LUNA_PROFILE,
+  },
+  // GPT-6 flagship and other variants: patch multiplier 1
+  {
+    test: (m) => /^gpt-6/.test(m),
+    profile: {
+      vision: { regime: 'patch', multiplier: 1, patchCap: 10000 },
+      ...GPT6_PRICING,
+      stripCols: C,
+      maxHeightPx: H,
+      minCompressTokens: 500,
+      factSheetFormat: 'full',
+      history: BASE_HISTORY,
+      style: BASE_STYLE,
+      contextWindow: 1_048_576,
+      outputLimit: 8_192,
+    },
+  },
   // nano patch models: ceil(patches * 2.46), cap 1536
   {
     test: (m) => isMiniNanoPatch(m) && /nano/.test(m) && /^gpt-5/.test(m),
-    profile: miniNanoProfile(2.46, GPT5_PRICING),
+    profile: miniNanoProfile(2.46, GPT5_PRICING, 1_048_576, 16_384),
   },
   // gpt-4.1-nano: same tokenization, older (less aggressive) cache discount.
   {
     test: (m) => isMiniNanoPatch(m) && /nano/.test(m),
-    profile: miniNanoProfile(2.46, BASE_PRICING),
+    profile: miniNanoProfile(2.46, BASE_PRICING, 128_000, 16_384),
   },
   // mini / o4-mini patch models: ceil(patches * 1.62), cap 1536
   {
     test: (m) => isMiniNanoPatch(m) && /^gpt-5/.test(m),
-    profile: miniNanoProfile(1.62, GPT5_PRICING),
+    profile: miniNanoProfile(1.62, GPT5_PRICING, 1_048_576, 16_384),
   },
   // gpt-4.1-mini / o4-mini: same tokenization, older cache discount.
   {
     test: isMiniNanoPatch,
-    profile: miniNanoProfile(1.62, BASE_PRICING),
+    profile: miniNanoProfile(1.62, BASE_PRICING, 128_000, 16_384),
   },
   // Exact Sol variant observed on production traffic. Do not match bare 5.6 or
   // sibling variants (for example gpt-5.6-terra): model-specific visual tuning
@@ -295,17 +384,17 @@ const BUILTIN_RULES: ProfileRule[] = [
   // 5.x flagship (gpt-5.4/5.5/…, no -mini/-nano): patch, multiplier 1, detail:original cap
   {
     test: (m) => /^gpt-5\.\d/.test(m),
-    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE, contextWindow: 1_048_576, outputLimit: 8_192 },
   },
   // gpt-5 / gpt-5-chat-latest: tile 70/140
   {
     test: (m) => /^gpt-5/.test(m),
-    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE, contextWindow: 1_048_576, outputLimit: 8_192 },
   },
   // o1 / o3 reasoning: tile 75/150
   {
     test: (m) => /^o[13]/.test(m),
-    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, ...BASE_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, ...BASE_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE, contextWindow: 200_000, outputLimit: 100_000 },
   },
 
   // Grok remains opt-in. Native 14px / 84 cols / maxH 512 is the densest best
@@ -339,6 +428,8 @@ const BUILTIN_RULES: ProfileRule[] = [
         grid: false,
         gridCols: 0,
       },
+      contextWindow: 524_288,
+      outputLimit: 8_192,
     },
   },
 
@@ -365,6 +456,8 @@ const BUILTIN_RULES: ProfileRule[] = [
         grid: false,
         gridCols: 0,
       },
+      contextWindow: 131_072,
+      outputLimit: 8_192,
     },
   },
 ];
@@ -580,6 +673,12 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       exactStaticBaseline: typeof p.exactStaticBaseline === 'boolean'
         ? p.exactStaticBaseline
         : base.exactStaticBaseline,
+      contextWindow: p.contextWindow === undefined
+        ? base.contextWindow
+        : posInt(p.contextWindow, base.contextWindow ?? 128000),
+      outputLimit: p.outputLimit === undefined
+        ? base.outputLimit
+        : posInt(p.outputLimit, base.outputLimit ?? 4096),
     });
   }
   return out;

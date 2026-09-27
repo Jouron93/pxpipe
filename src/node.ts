@@ -44,7 +44,7 @@ import { getBuildProvenance } from './core/build-provenance.js';
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
  *  control. No CLI flags beyond --help/--version. */
-interface RuntimeConfig {
+export interface RuntimeConfig {
   port: number;
   /** Interface to bind. Defaults to 127.0.0.1; non-loopback bindings expose
    *  only the proxy API because dashboard routes remain loopback-only. */
@@ -68,6 +68,52 @@ interface RuntimeConfig {
    *  (16 MiB). Raise it only if a real client needs more; the default binding is
    *  loopback, but HOST can expose this process to a network. */
   maxRequestBytes?: number;
+  /** Minimum inbound request body size in bytes to trigger compression.
+   *  Payloads smaller than this pass through uncompressed. */
+  minBodyBytes?: number;
+}
+
+export interface NodeServerOptions {
+  config?: {
+    min_body_bytes?: number | string;
+    models?: unknown;
+    [key: string]: unknown;
+  };
+  port?: number;
+  host?: string;
+  upstream?: string;
+  openAIUpstream?: string;
+  openAIApiKey?: string;
+  cloudflareUpstream?: string;
+  cloudflareApiKey?: string;
+  eventsFile?: string;
+  captureErrorReqBody?: boolean;
+  maxRequestBytes?: number;
+  minBodyBytes?: number;
+  argv?: string[];
+  [key: string]: unknown;
+}
+
+export const DEFAULT_MIN_BODY_BYTES =
+  process.env.NODE_ENV === 'test' || process.env.VITEST === 'true' ? 0 : 200_000;
+
+export function resolveMinBodyBytes(options?: NodeServerOptions): number {
+  if (options?.config?.min_body_bytes !== undefined) {
+    const raw = options.config.min_body_bytes;
+    const parsed = typeof raw === 'string' ? parseInt(raw, 10) : Number(raw);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+  }
+  if (options?.minBodyBytes !== undefined) {
+    const raw = options.minBodyBytes;
+    const parsed = typeof raw === 'string' ? parseInt(raw, 10) : Number(raw);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+  }
+  const envVal = process.env.PXPIPE_MIN_BODY_BYTES;
+  if (envVal !== undefined && envVal.trim() !== '') {
+    const parsed = parseInt(envVal, 10);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+  }
+  return DEFAULT_MIN_BODY_BYTES;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -82,17 +128,17 @@ function normalizeModelsConfig(value: unknown): string | undefined {
   return undefined;
 }
 
-function applyConfigFileDefaults(): void {
-  const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
-  if (!fs.existsSync(file)) return;
+export function applyConfigFileDefaults(configFile?: string): Record<string, unknown> | undefined {
+  const file = configFile ?? process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
+  if (!fs.existsSync(file)) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
   } catch (e) {
     console.warn(`[pxpipe] ignored invalid config ${file}: ${(e as Error).message}`);
-    return;
+    return undefined;
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
   const cfg = parsed as Record<string, unknown>;
 
   // Env wins over file config. The dashboard can still override the scope at
@@ -101,6 +147,10 @@ function applyConfigFileDefaults(): void {
     const models = normalizeModelsConfig(cfg.models);
     if (models !== undefined) process.env.PXPIPE_MODELS = models;
   }
+  if (process.env.PXPIPE_MIN_BODY_BYTES === undefined && cfg.min_body_bytes !== undefined) {
+    process.env.PXPIPE_MIN_BODY_BYTES = String(cfg.min_body_bytes);
+  }
+  return cfg;
 }
 
 /** Dashboard persistence hook: write the runtime model scope back to the
@@ -145,7 +195,7 @@ function persistModelBasesToConfig(bases: readonly string[]): void {
   }
 }
 
-function parseCli(argv: string[]): RuntimeConfig {
+export function parseCli(argv: string[] = [], options?: NodeServerOptions): RuntimeConfig {
   // Only flags accepted are --help and --version. Anything else is an
   // error — there is exactly ONE way to run pxpipe and the dashboard
   // exposes every metric the operator might want to inspect.
@@ -168,24 +218,25 @@ function parseCli(argv: string[]): RuntimeConfig {
       process.exit(2);
     }
   }
-  applyConfigFileDefaults();
-  const sharedUpstream = process.env.PXPIPE_UPSTREAM;
+  const fileCfg = applyConfigFileDefaults();
+  const effectiveConfig = options?.config ?? fileCfg;
+  const sharedUpstream = options?.upstream ?? process.env.PXPIPE_UPSTREAM;
   const cfAccount = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
-  const cfToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  const cfToken = (options?.cloudflareApiKey as string | undefined) ?? process.env.CLOUDFLARE_API_TOKEN?.trim();
   const parseModels = (value: string | undefined): string[] | undefined => {
     if (value === undefined) return undefined;
     return value.split(',').map((model) => model.trim()).filter(Boolean);
   };
-  const cloudflareUpstream = cfAccount && cfToken
+  const cloudflareUpstream = (options?.cloudflareUpstream as string | undefined) ?? (cfAccount && cfToken
     ? `https://api.cloudflare.com/client/v4/accounts/${cfAccount}/ai/v1`
-    : undefined;
+    : undefined);
   return {
-    port: Number(process.env.PORT ?? 47821),
+    port: Number(options?.port ?? process.env.PORT ?? 47821),
     // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
-    host: process.env.HOST?.trim() || '127.0.0.1',
-    upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
-    openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
-    openAIApiKey: process.env.OPENAI_API_KEY,
+    host: options?.host ?? (process.env.HOST?.trim() || '127.0.0.1'),
+    upstream: options?.upstream ?? process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
+    openAIUpstream: options?.openAIUpstream ?? process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+    openAIApiKey: options?.openAIApiKey ?? process.env.OPENAI_API_KEY,
     cloudflareUpstream,
     cloudflareApiKey: cfToken,
     openAIModels: parseModels(process.env.OPENAI_MODELS),
@@ -193,11 +244,12 @@ function parseCli(argv: string[]): RuntimeConfig {
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
-    eventsFile: process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE,
+    eventsFile: options?.eventsFile ?? process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE,
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
-    captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
-    maxRequestBytes: parseMaxRequestBytes(process.env.PXPIPE_MAX_REQUEST_BYTES),
+    captureErrorReqBody: options?.captureErrorReqBody ?? process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
+    maxRequestBytes: options?.maxRequestBytes ?? parseMaxRequestBytes(process.env.PXPIPE_MAX_REQUEST_BYTES),
+    minBodyBytes: resolveMinBodyBytes({ ...options, config: effectiveConfig }),
   };
 }
 
@@ -1150,254 +1202,10 @@ async function main(): Promise<void> {
     createWarpRuntime({ port: opts.port, routes: warpRoutes }).launch(warpCommand);
     return;
   }
-  // A/B harness passthrough switch (see the `transform` callback below).
-  const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
-  if (forcePassthrough) {
-    console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
-  }
-  // Subscription bearers expire. A client that froze its bearer at startup — a
-  // container handed CLAUDE_CODE_OAUTH_TOKEN as an env var — cannot renew one,
-  // so its max session length is the token's remaining life. When this is set we
-  // resolve the bearer per request from the file instead, which keeps rotation
-  // on the host with a single writer: N parallel containers refreshing their own
-  // copies would rotate each other's credential out from under them.
-  // Cached on mtime, so it costs a stat per request rather than a read.
-  const authTokenFile = process.env.ANTHROPIC_OAUTH_TOKEN_FILE?.trim() || undefined;
-  let authTokenCache: { mtimeMs: number; token: string } | undefined;
-  const anthropicAuthToken = authTokenFile
-    ? (): string | undefined => {
-        try {
-          const { mtimeMs } = fs.statSync(authTokenFile);
-          if (authTokenCache?.mtimeMs !== mtimeMs) {
-            authTokenCache = { mtimeMs, token: fs.readFileSync(authTokenFile, 'utf8').trim() };
-          }
-          return authTokenCache.token || undefined;
-        } catch {
-          // Mid-rotation the writer may have unlinked it; last good beats none.
-          return authTokenCache?.token;
-        }
-      }
-    : undefined;
-  if (authTokenFile) {
-    console.log(`[pxpipe] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
-  }
-  // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
-  // process emits, so you can eyeball exactly what the model received (OCR /
-  // legibility audits, demo inspection). Best-effort — never affects requests.
-  // Note: the PXPIPE_DISABLE arm renders nothing, so only the compress proxy
-  // produces files here.
-  let imageDumpDir: string | undefined = process.env.PXPIPE_DUMP_DIR?.trim() || undefined;
-  let imageDumpSeq = 0;
-  if (imageDumpDir) {
-    try {
-      ensurePrivateDirectory(imageDumpDir);
-      console.log(`[pxpipe] PXPIPE_DUMP_DIR set — dumping rendered PNGs to ${imageDumpDir}`);
-    } catch (err) {
-      console.warn(`[pxpipe] PXPIPE_DUMP_DIR unusable (${(err as Error).message}) — image dumping disabled`);
-      imageDumpDir = undefined;
-    }
-  }
-  // Transform options pass through empty — the proxy uses the DEFAULTS
-  // baked into transform.ts. There are no behavior toggles: system slab,
-  // reminders, tool_results, and history compression all run
-  // unconditionally; the per-block break-even gate decides per-call
-  // whether to actually image each piece. The function-form `transform`
-  // below is ONLY a kill switch (PXPIPE_DISABLE / dashboard toggle →
-  // compress:false); on the active path it returns {}, so the gate always
-  // runs on static DEFAULTS — charsPerToken=4, priorWarm*=0 — which leaves
-  // the warm-baseline and anti-flapping burn terms inert. That is
-  // deliberate, NOT an oversight: there is no live-α feedback loop from
-  // the dashboard. Telemetry (2026-06, 897 sessions / 21,347 measured
-  // rows) showed 5 mode flips ever and losses at 0.8% of wins — all
-  // one-time cache-create amortization — so closing the loop would not
-  // change decisions. Re-run that reconciliation before wiring one in.
-  const tracker: Tracker = new FileTracker(opts.eventsFile);
 
-  // Sidecar dir for oversized 4xx request-body samples. Lives next to the
-  // events.jsonl so a single `rm -rf` cleans up both. Lazy-mkdir'd on first
-  // sidecar write (see maybeWriteBodySidecar).
+  const app = await createNodeApp({ argv: cliArgv });
+  const { config, server, tracker } = app;
   const bodySidecarDir = path.join(path.dirname(opts.eventsFile), '4xx-bodies');
-
-  // Live dashboard state — populated on every request via onRequest below,
-  // served via the route interception in front of the proxy handler. The
-  // SessionsPaths handle lets the dashboard surface session/disk/stats data
-  // without reaching back into module-scope globals.
-  const dashboard = new DashboardState(
-    {
-      eventsFile: opts.eventsFile,
-      sidecarDir: bodySidecarDir,
-    },
-    undefined,
-    persistModelBasesToConfig,
-  );
-  // Seed the "recent requests" table from the JSONL log so a process restart
-  // doesn't reset what you can see in the UI. Best-effort; ignored on error.
-  await dashboard.replay(opts.eventsFile).catch(() => {});
-
-  const config: ProxyConfig = {
-    authToken: anthropicAuthToken,
-    provider: opts.provider,
-    gatewayBaseUrl: opts.gatewayBaseUrl,
-    gatewayHeaders: opts.gatewayHeaders,
-    upstream: opts.upstream,
-    openAIUpstream: opts.openAIUpstream,
-    openAIApiKey: opts.openAIApiKey,
-    cloudflareUpstream: opts.cloudflareUpstream,
-    cloudflareApiKey: opts.cloudflareApiKey,
-    openAIModels: opts.openAIModels,
-    cloudflareModels: opts.cloudflareModels,
-    captureErrorReqBody: opts.captureErrorReqBody,
-    maxRequestBytes: opts.maxRequestBytes,
-    // Per-request transform options:
-    //   1. Runtime kill switch — when the dashboard "passthrough" toggle
-    //      is off, force compress=false so /v1/messages forwards
-    //      untransformed. Lets the operator instantly disable the proxy
-    //      when upstream is unhealthy without restarting.
-    //   2. Otherwise use DEFAULTS in transform.ts for break-even gating.
-    transform: () => {
-      // A/B harness: PXPIPE_DISABLE=1 forces passthrough (compress=false) for the
-      // whole process, so the "normal" arm can be scripted on its own port while
-      // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
-      // (The dashboard kill switch does the same thing at runtime.)
-      if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
-      // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return {};
-    },
-    onRequest: async (e) => {
-      // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
-      // info.firstImagePng, so capturing has to happen on the raw event.
-      dashboard.update(e);
-      // Debug: persist this request's rendered PNGs (see PXPIPE_DUMP_DIR above).
-      // Filenames sort by request order: <stamp>_reqNNN_<model>_pNN.png.
-      if (imageDumpDir && e.info?.imagePngs && e.info.imagePngs.length > 0) {
-        const seq = ++imageDumpSeq;
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const modelTag = (e.model ?? 'model').replace(/[^A-Za-z0-9._-]+/g, '_');
-        const pngs = e.info.imagePngs;
-        for (let i = 0; i < pngs.length; i++) {
-          const name = `${stamp}_req${String(seq).padStart(3, '0')}_${modelTag}_p${String(i + 1).padStart(2, '0')}.png`;
-          try {
-            fs.writeFileSync(path.join(imageDumpDir, name), pngs[i]!, { mode: 0o600 });
-          } catch (err) {
-            console.warn(`[pxpipe] PNG dump write failed: ${(err as Error).message}`);
-            break; // dir vanished / full — stop hammering it this request
-          }
-        }
-        console.log(`  ↳ dumped ${pngs.length} rendered png(s) → ${imageDumpDir}`);
-      }
-      // Terse human-readable console line.
-      const extra: string[] = [];
-      if (e.info?.toolResultImgs) extra.push(`tr+${e.info.toolResultImgs}`);
-      const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
-      const tag = e.info?.compressed
-        ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
-        : e.info?.reason
-          ? e.info.reason === 'unsupported_model' && e.model
-            ? `skip(unsupported=${e.model})`
-            : `skip(${e.info.reason})`
-          : '';
-      const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
-      const inputTokens = e.usage?.input_tokens ?? 0;
-      const usageTag =
-        e.usage !== undefined
-          ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
-          : '';
-      // Split the wall clock into the half we control and the half we don't:
-      // `tx` is local render+encode, the remainder is upstream. Without this the
-      // duration alone can't distinguish our CPU from a slow provider.
-      //
-      // `fb` further splits the upstream half: request start → response headers,
-      // so it covers upload + provider queue/processing but NOT generation. With
-      // all three, `fb - tx` isolates how much a large image payload costs to put
-      // on the wire, which is the number that decides whether shrinking IDATs pays.
-      const timingParts = [`${e.durationMs}ms`];
-      if (e.transformMs !== undefined) {
-        timingParts.push(
-          `tx=${e.transformMs}ms`,
-          `up=${Math.max(0, e.durationMs - e.transformMs)}ms`,
-        );
-      }
-      if (e.firstByteMs !== undefined) timingParts.push(`fb=${e.firstByteMs}ms`);
-      const timing = timingParts.join(' ');
-      console.log(
-        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
-      );
-
-      // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;
-      // custom gateways may echo prompt fragments or credentials in them.
-      if (e.errorBody) {
-        const trimmed = e.errorBody.length > 400
-          ? e.errorBody.slice(0, 400) + '…'
-          : e.errorBody;
-        console.warn(`[pxpipe ${e.status}] upstream body: ${trimmed}`);
-      }
-
-      // Canary: surface unknown tag-shaped blocks so a Claude Code release
-      // that adds a new dynamic tag is caught within hours.
-      if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
-        console.warn(
-          `[pxpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
-            `— may need to add to DYNAMIC_BLOCK_TAGS (per-turn) or KNOWN_STATIC_TAGS (static) in src/core/transform.ts`,
-        );
-      }
-
-      // If the proxy captured a gzipped 4xx body that won't fit inline in
-      // the JSONL row, write it to a sidecar file and put the path on the
-      // event instead. Threshold: gz_bytes * 4/3 > inline cap (b64 expansion).
-      if (e.reqBodyGz && e.reqBodyGz.byteLength * 4 > TRACK_BODY_INLINE_MAX * 3) {
-        const writtenPath = await maybeWriteBodySidecar(
-          e.reqBodyGz,
-          e.reqBodySha8,
-          bodySidecarDir,
-        );
-        if (writtenPath) {
-          e.reqBodySamplePath = writtenPath;
-          e.reqBodyGz = undefined; // tracker will pick up the path instead
-        }
-        // If write failed: leave reqBodyGz; the tracker will silently drop
-        // it (still too big to inline). We never lose the sha8 / error_body.
-      }
-
-      // Persistent JSONL event for offline analysis (pxpipe stats etc.).
-      tracker.emit(toTrackEvent(e));
-    },
-  };
-  const handle = createProxy(config);
-
-  const server = createServer((req, res) => {
-    Promise.resolve()
-      .then(async () => {
-        // Local dashboard routes — handled BEFORE the proxy so they never hit
-        // api.anthropic.com (which would 404 them).
-        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-        const route = dashboardPath(url.pathname);
-        if (route) {
-          if (!isLoopbackAddress(req.socket.remoteAddress) || !isLoopbackHostname(url.hostname)) {
-            await writeWebResponse(new Response('dashboard is loopback-only', { status: 403 }), res);
-            return;
-          }
-          if (isDashboardMutation(route, req.method ?? 'GET')
-            && !isSameOriginDashboardRequest(req, url)) {
-            await writeWebResponse(new Response('cross-origin dashboard mutation denied', { status: 403 }), res);
-            return;
-          }
-          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
-          if (webRes) {
-            await writeWebResponse(webRes, res);
-            return;
-          }
-        }
-        const webReq = toWebRequest(req);
-        const webRes = await handle(webReq);
-        await writeWebResponse(webRes, res);
-      })
-      .catch((err) => {
-        if (isConnectionAbort(err) && (req.aborted || res.destroyed)) return;
-        console.error('[pxpipe] handler error:', err);
-        if (!res.headersSent) res.statusCode = 500;
-        if (!res.writableEnded) res.end();
-      });
-  });
 
   // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
   const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
@@ -1472,7 +1280,227 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-main().catch((err) => {
-  console.error('[pxpipe] fatal:', err);
-  process.exit(1);
-});
+export interface NodeAppInstance {
+  opts: RuntimeConfig;
+  config: ProxyConfig;
+  handle: (req: Request) => Promise<Response>;
+  server: ReturnType<typeof createServer>;
+  dashboard: DashboardState;
+  tracker: Tracker;
+  close: () => Promise<void>;
+}
+
+export async function createNodeApp(options?: NodeServerOptions): Promise<NodeAppInstance> {
+  const cliArgv = options?.argv ?? [];
+  const opts = parseCli(cliArgv, options);
+
+  // A/B harness passthrough switch (see the `transform` callback below).
+  const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
+  if (forcePassthrough) {
+    console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
+  }
+
+  const authTokenFile = process.env.ANTHROPIC_OAUTH_TOKEN_FILE?.trim() || undefined;
+  let authTokenCache: { mtimeMs: number; token: string } | undefined;
+  const anthropicAuthToken = authTokenFile
+    ? (): string | undefined => {
+        try {
+          const { mtimeMs } = fs.statSync(authTokenFile);
+          if (authTokenCache?.mtimeMs !== mtimeMs) {
+            authTokenCache = { mtimeMs, token: fs.readFileSync(authTokenFile, 'utf8').trim() };
+          }
+          return authTokenCache.token || undefined;
+        } catch {
+          // Mid-rotation the writer may have unlinked it; last good beats none.
+          return authTokenCache?.token;
+        }
+      }
+    : undefined;
+  if (authTokenFile) {
+    console.log(`[pxpipe] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
+  }
+
+  let imageDumpDir: string | undefined = process.env.PXPIPE_DUMP_DIR?.trim() || undefined;
+  let imageDumpSeq = 0;
+  if (imageDumpDir) {
+    try {
+      ensurePrivateDirectory(imageDumpDir);
+      console.log(`[pxpipe] PXPIPE_DUMP_DIR set — dumping rendered PNGs to ${imageDumpDir}`);
+    } catch (err) {
+      console.warn(`[pxpipe] PXPIPE_DUMP_DIR unusable (${(err as Error).message}) — image dumping disabled`);
+      imageDumpDir = undefined;
+    }
+  }
+
+  const tracker: Tracker = new FileTracker(opts.eventsFile);
+  const bodySidecarDir = path.join(path.dirname(opts.eventsFile), '4xx-bodies');
+
+  const dashboard = new DashboardState(
+    {
+      eventsFile: opts.eventsFile,
+      sidecarDir: bodySidecarDir,
+    },
+    undefined,
+    persistModelBasesToConfig,
+  );
+  await dashboard.replay(opts.eventsFile).catch(() => {});
+
+  const config: ProxyConfig = {
+    authToken: anthropicAuthToken,
+    provider: opts.provider,
+    gatewayBaseUrl: opts.gatewayBaseUrl,
+    gatewayHeaders: opts.gatewayHeaders,
+    upstream: opts.upstream,
+    openAIUpstream: opts.openAIUpstream,
+    openAIApiKey: opts.openAIApiKey,
+    cloudflareUpstream: opts.cloudflareUpstream,
+    cloudflareApiKey: opts.cloudflareApiKey,
+    openAIModels: opts.openAIModels,
+    cloudflareModels: opts.cloudflareModels,
+    captureErrorReqBody: opts.captureErrorReqBody,
+    maxRequestBytes: opts.maxRequestBytes,
+    minBodyBytes: opts.minBodyBytes,
+    transform: () => {
+      if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
+      return {};
+    },
+    onRequest: async (e) => {
+      dashboard.update(e);
+      if (imageDumpDir && e.info?.imagePngs && e.info.imagePngs.length > 0) {
+        const seq = ++imageDumpSeq;
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const modelTag = (e.model ?? 'model').replace(/[^A-Za-z0-9._-]+/g, '_');
+        const pngs = e.info.imagePngs;
+        for (let i = 0; i < pngs.length; i++) {
+          const name = `${stamp}_req${String(seq).padStart(3, '0')}_${modelTag}_p${String(i + 1).padStart(2, '0')}.png`;
+          try {
+            fs.writeFileSync(path.join(imageDumpDir, name), pngs[i]!, { mode: 0o600 });
+          } catch (err) {
+            console.warn(`[pxpipe] PNG dump write failed: ${(err as Error).message}`);
+            break;
+          }
+        }
+        console.log(`  ↳ dumped ${pngs.length} rendered png(s) → ${imageDumpDir}`);
+      }
+      const extra: string[] = [];
+      if (e.info?.toolResultImgs) extra.push(`tr+${e.info.toolResultImgs}`);
+      const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
+      const tag = e.info?.compressed
+        ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
+        : e.info?.reason
+          ? e.info.reason === 'unsupported_model' && e.model
+            ? `skip(unsupported=${e.model})`
+            : `skip(${e.info.reason})`
+          : '';
+      const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
+      const inputTokens = e.usage?.input_tokens ?? 0;
+      const usageTag =
+        e.usage !== undefined
+          ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
+          : '';
+      const timingParts = [`${e.durationMs}ms`];
+      if (e.transformMs !== undefined) {
+        timingParts.push(
+          `tx=${e.transformMs}ms`,
+          `up=${Math.max(0, e.durationMs - e.transformMs)}ms`,
+        );
+      }
+      if (e.firstByteMs !== undefined) timingParts.push(`fb=${e.firstByteMs}ms`);
+      const timing = timingParts.join(' ');
+      console.log(
+        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
+      );
+
+      if (e.errorBody) {
+        const trimmed = e.errorBody.length > 400
+          ? e.errorBody.slice(0, 400) + '…'
+          : e.errorBody;
+        console.warn(`[pxpipe ${e.status}] upstream body: ${trimmed}`);
+      }
+
+      if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
+        console.warn(
+          `[pxpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
+            `— may need to add to DYNAMIC_BLOCK_TAGS (per-turn) or KNOWN_STATIC_TAGS (static) in src/core/transform.ts`,
+        );
+      }
+
+      if (e.reqBodyGz && e.reqBodyGz.byteLength * 4 > TRACK_BODY_INLINE_MAX * 3) {
+        const writtenPath = await maybeWriteBodySidecar(
+          e.reqBodyGz,
+          e.reqBodySha8,
+          bodySidecarDir,
+        );
+        if (writtenPath) {
+          e.reqBodySamplePath = writtenPath;
+          e.reqBodyGz = undefined;
+        }
+      }
+
+      tracker.emit(toTrackEvent(e));
+    },
+  };
+  const handle = createProxy(config);
+
+  const server = createServer((req, res) => {
+    Promise.resolve()
+      .then(async () => {
+        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+        const route = dashboardPath(url.pathname);
+        if (route) {
+          if (!isLoopbackAddress(req.socket.remoteAddress) || !isLoopbackHostname(url.hostname)) {
+            await writeWebResponse(new Response('dashboard is loopback-only', { status: 403 }), res);
+            return;
+          }
+          if (isDashboardMutation(route, req.method ?? 'GET')
+            && !isSameOriginDashboardRequest(req, url)) {
+            await writeWebResponse(new Response('cross-origin dashboard mutation denied', { status: 403 }), res);
+            return;
+          }
+          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
+          if (webRes) {
+            await writeWebResponse(webRes, res);
+            return;
+          }
+        }
+        const webReq = toWebRequest(req);
+        const webRes = await handle(webReq);
+        await writeWebResponse(webRes, res);
+      })
+      .catch((err) => {
+        if (isConnectionAbort(err) && (req.aborted || res.destroyed)) return;
+        console.error('[pxpipe] handler error:', err);
+        if (!res.headersSent) res.statusCode = 500;
+        if (!res.writableEnded) res.end();
+      });
+  });
+
+  const close = async (): Promise<void> => {
+    if (tracker instanceof FileTracker) tracker.close();
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  };
+
+  return {
+    opts,
+    config,
+    handle,
+    server,
+    dashboard,
+    tracker,
+    close,
+  };
+}
+
+export function shouldAutoRun(): boolean {
+  const argv = process.argv;
+  return argv.some((arg) => /([/\\]|^)(node|pxpipe)\.(ts|js)$/.test(arg) || arg.endsWith('pxpipe'));
+}
+
+if (shouldAutoRun()) {
+  main().catch((err) => {
+    console.error('[pxpipe] fatal:', err);
+    process.exit(1);
+  });
+}
