@@ -5,7 +5,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  CLAUDE_LEGIBLE_PROFILE,
+  CLAUDE_SPACED_PROFILE,
   CLAUDE_OPUS55_PROFILE,
   isOpus55Claude,
   resolveClaudeProfile,
@@ -35,8 +35,8 @@ describe('Opus 5.5 profile', () => {
     expect(p.stripCols).toBe(428);
     expect(p.maxHeightPx).toBe(1260);
     expect(p.cacheReadRate).toBe(0.1); // Anthropic cache read = 0.10x input (evidence/provider-cache-matrix.md)
-    expect(resolveClaudeProfile('claude-opus-5')).toBe(CLAUDE_LEGIBLE_PROFILE);
-    expect(resolveClaudeProfile('claude-sonnet-5')).toBe(CLAUDE_LEGIBLE_PROFILE);
+    expect(resolveClaudeProfile('claude-opus-5')).toBe(CLAUDE_SPACED_PROFILE);
+    expect(resolveClaudeProfile('claude-sonnet-5')).toBe(CLAUDE_SPACED_PROFILE);
   });
 
   it('renders pages inside the high-res tier (no server-side downscale)', async () => {

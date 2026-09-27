@@ -21,7 +21,7 @@ import {
   isPre47Claude,
   resolveClaudeProfile,
   CLAUDE_PROFILE,
-  CLAUDE_LEGIBLE_PROFILE,
+  CLAUDE_SPACED_PROFILE,
   CLAUDE_OPUS55_PROFILE,
 } from '../src/core/claude-model-profiles.js';
 import {
@@ -69,7 +69,7 @@ describe('Challenger Challenge 1: Suffix Routing Stress', () => {
     const sonnetBase = resolveGptProfile('claude-sonnet-5');
     const sonnetTagged = resolveGptProfile('claude-sonnet-5[1m]');
     expect(sonnetTagged).toEqual(sonnetBase);
-    expect(sonnetTagged.stripCols).toBe(172);
+    expect(sonnetTagged.stripCols).toBe(312);
     expect(isMisresolvedModelId('claude-sonnet-5[1m]')).toBe(false);
   });
 
@@ -84,7 +84,7 @@ describe('Challenger Challenge 1: Suffix Routing Stress', () => {
     for (const id of testCases) {
       const prof = resolveGptProfile(id);
       // Opus 5.5 has its own measured geometry; every other Claude id stays legible.
-      expect(prof).toEqual(id.includes('opus-5-5') ? CLAUDE_OPUS55_PROFILE : CLAUDE_LEGIBLE_PROFILE);
+      expect(prof).toEqual(id.includes('opus-5-5') ? CLAUDE_OPUS55_PROFILE : CLAUDE_SPACED_PROFILE);
       expect(isMisresolvedModelId(id)).toBe(false);
     }
   });

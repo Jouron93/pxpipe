@@ -22,9 +22,9 @@ import {
   isPre47Claude,
   isFableClaude,
   CLAUDE_PROFILE,
-  CLAUDE_LEGIBLE_PROFILE,
+  CLAUDE_SPACED_PROFILE,
   CLAUDE_LEGACY_PROFILE,
-  CLAUDE_LEGACY_LEGIBLE_PROFILE,
+  CLAUDE_LEGACY_SPACED_PROFILE,
 } from '../src/core/claude-model-profiles.js';
 import {
   resolveGeminiProfile,
