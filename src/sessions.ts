@@ -232,8 +232,9 @@ export async function aggregateSessions(
         prevCacheable,
         cc1h,
         cc5m,
+        ev.model,
       );
-      const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m);
+      const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, ev.model);
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);

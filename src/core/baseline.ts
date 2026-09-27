@@ -4,10 +4,25 @@
  * See docs/CACHING_AND_SAVINGS.md for the full derivation and audit history.
  */
 
-/** Documented Anthropic price ratios: cc_5m = 1.25×, cc_1h = 2×, cr = 0.1× base input. */
+/** Documented Anthropic price ratios: cc_5m = 1.25×, cc_1h = 2×, cr = 0.1× base input.
+ *  Opus 5.5 has 0.05× cache read rate (documented Anthropic pricing).
+ */
 export const CACHE_CREATE_RATE = 1.25;
 const CACHE_CREATE_1H_RATE = 2.0;
 export const CACHE_READ_RATE = 0.1;
+/** Opus 5.5 has half the cache read rate of other models. */
+export const CACHE_READ_RATE_OPUS55 = 0.05;
+
+/** Return the cache read rate for a given model.
+ *  Opus 5.5 models have 0.05× rate; all others default to 0.1×.
+ *  Model matching is case-insensitive and includes vendor prefixes.
+ */
+export function getCacheReadRate(model?: string | null): number {
+  if (!model) return CACHE_READ_RATE;
+  // Opus 5.5: includes vendor prefix (e.g., 'anthropic/claude-opus-5-5', 'claude-opus-5-5')
+  if (/opus-5-5(?![0-9])/i.test(model)) return CACHE_READ_RATE_OPUS55;
+  return CACHE_READ_RATE;
+}
 
 /** Effective cache-write rate for this request. Older usage payloads do not
  * expose the tier split; preserve the historical/conservative 5-minute rate
@@ -105,8 +120,9 @@ export function deriveBaselineWarmth(
  *   cold turn (first turn / >5min since this session's last turn):
  *     text has no warm cache either ⇒ cacheable×CACHE_CREATE_RATE + coldTail×1.0
  *   warm turn (a prior turn cached the prefix within TTL):
- *     text append-caches ⇒ reused×CACHE_READ_RATE + grown×CACHE_CREATE_RATE + coldTail×1.0
+ *     text append-caches ⇒ reused×cacheReadRate + grown×CACHE_CREATE_RATE + coldTail×1.0
  *     where reused = min(prevCacheable, cacheable), grown = cacheable − reused.
+ *     Cache read rate depends on model (Opus 5.5 = 0.05×, others = 0.1×).
  *     This is what TEXT pays regardless of whether pxpipe's image busted its
  *     own cache on a growth turn — so the real growth loss is preserved.
  *
@@ -115,6 +131,7 @@ export function deriveBaselineWarmth(
  * @param baselineCacheable  tokens up to the last cache_control marker. ≤0 ⇒ credit nothing.
  * @param warm               was a warm cache available for this session this turn?
  * @param prevCacheable      cacheable prefix size on this session's previous turn (warm only).
+ * @param model              model ID (e.g., 'claude-opus-5-5'), used to select cache read rate.
  */
 export function computeBaselineInputEff(
   baseline: number,
@@ -124,13 +141,17 @@ export function computeBaselineInputEff(
   cr: number,
   warm = false,
   prevCacheable = 0,
+  model?: string | null,
 ): number {
   return computeBaselineInputEffWithCacheTier(
-    baseline, baselineCacheable, inputTokens, cc, cr, warm, prevCacheable, 0,
+    baseline, baselineCacheable, inputTokens, cc, cr, warm, prevCacheable, 0, undefined, model,
   );
 }
 
-/** Tier-aware variant for internal telemetry accounting. */
+/** Tier-aware variant for internal telemetry accounting.
+ * @param model  model ID (e.g., 'claude-opus-5-5'), used to select cache read rate.
+ *               Opus 5.5 uses 0.05×; all others default to 0.1×.
+ */
 export function computeBaselineInputEffWithCacheTier(
   baseline: number,
   baselineCacheable: number,
@@ -141,24 +162,25 @@ export function computeBaselineInputEffWithCacheTier(
   prevCacheable: number,
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
+  model?: string | null,
 ): number {
   if (baseline <= 0) return 0;
   // Probe miss: can't split prefix from tail, so credit nothing (same as actual).
   if (baselineCacheable <= 0) {
     return computeActualInputEffWithCacheTier(
-      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens,
+      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens, model,
     );
   }
   const cacheable = Math.min(baselineCacheable, baseline);
   const coldTail = baseline - cacheable;
   const createRate = cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens);
   if (warm) {
-    // Text reads the prefix it already had cached (0.10×) and creates only the
-    // growth since last turn (at the observed write-tier rate). Independent of
-    // the image path's cache.
+    // Text reads the prefix it already had cached (model-aware rate: Opus 5.5 = 0.05×,
+    // others = 0.1×) and creates only the growth since last turn (at the observed
+    // write-tier rate). Independent of the image path's cache.
     const reused = Math.min(Math.max(prevCacheable, 0), cacheable);
     const grown = cacheable - reused;
-    return reused * CACHE_READ_RATE + grown * createRate + coldTail * 1.0;
+    return reused * getCacheReadRate(model) + grown * createRate + coldTail * 1.0;
   }
   // Cold (first turn / TTL expiry): no warm cache for text either, so it
   // re-creates the whole cacheable prefix at the create rate — same event the
@@ -166,24 +188,32 @@ export function computeBaselineInputEffWithCacheTier(
   return cacheable * createRate + coldTail * 1.0;
 }
 
-/** Weighted input cost pxpipe actually paid this turn. */
+/** Weighted input cost pxpipe actually paid this turn.
+ * @param model  model ID (e.g., 'claude-opus-5-5'), used to select cache read rate.
+ *               Opus 5.5 uses 0.05×; all others default to 0.1×.
+ */
 export function computeActualInputEff(
   inputTokens: number,
   cc: number,
   cr: number,
+  model?: string | null,
 ): number {
-  return computeActualInputEffWithCacheTier(inputTokens, cc, cr, 0);
+  return computeActualInputEffWithCacheTier(inputTokens, cc, cr, 0, undefined, model);
 }
 
-/** Tier-aware variant for internal telemetry accounting. */
+/** Tier-aware variant for internal telemetry accounting.
+ * @param model  model ID (e.g., 'claude-opus-5-5'), used to select cache read rate.
+ *               Opus 5.5 uses 0.05×; all others default to 0.1×.
+ */
 export function computeActualInputEffWithCacheTier(
   inputTokens: number,
   cc: number,
   cr: number,
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
+  model?: string | null,
 ): number {
   return inputTokens
     + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
-    + cr * CACHE_READ_RATE;
+    + cr * getCacheReadRate(model);
 }
