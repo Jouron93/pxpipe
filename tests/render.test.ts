@@ -2456,7 +2456,7 @@ describe('colorByRole (structure-through slot string)', () => {
     expect(ROLE_PALETTE[0]).not.toEqual(ROLE_PALETTE[1]);
   });
 
-  it('emits RGB truecolor PNG when slot coloring is on, grayscale when off', async () => {
+  it('emits a color PNG when slot coloring is on, grayscale when off', async () => {
     const text = '<user>\nhello user\n</user>\n\n<assistant>\nhello model\n</assistant>';
     const slot =
       `${roleSlotSegment('user', 'hello user', SLOT_MARK_USER)}\n\n` +
@@ -2464,7 +2464,9 @@ describe('colorByRole (structure-through slot string)', () => {
     const colored = await renderChunkToPng(text, 40, { colorByRole: true }, undefined, slot);
     const plain = await renderChunkToPng(text, 40, {});
     // PNG IHDR colorType byte: sig(8) + len(4) + "IHDR"(4) + ihdr[9] = offset 25.
-    expect(colored.png[25]).toBe(2); // 2 = truecolor RGB
+    // A small role-colored page fits a palette, so it ships indexed (3); pages with
+    // more than 256 colors fall back to truecolor (2). Both carry the colored tags.
+    expect([2, 3]).toContain(colored.png[25]);
     expect(plain.png[25]).toBe(0); // 0 = grayscale
   });
 });

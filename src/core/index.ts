@@ -51,3 +51,8 @@ export {
   CACHE_CREATE_RATE,
   CACHE_READ_RATE,
 } from './baseline.js';
+export {
+  extractUsageTokens,
+  type ParsedUsageTokens,
+} from './usage-accounting.js';
+

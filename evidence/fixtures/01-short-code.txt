@@ -1,0 +1,111 @@
+/**
+ * TokenBucketRateLimiter - High-concurrency rate limiting with burst support
+ * and microsecond sliding-window state tracking.
+ */
+import { EventEmitter } from 'node:events';
+
+export interface BucketConfig {
+  readonly capacity: number;
+  readonly refillRatePerSecond: number;
+  readonly maxBurstRatio?: number;
+  readonly onThrottled?: (key: string, retryAfterMs: number) => void;
+}
+
+export interface ConsumptionResult {
+  readonly allowed: boolean;
+  readonly remainingTokens: number;
+  readonly retryAfterMs: number;
+  readonly currentFillRate: number;
+}
+
+export class TokenBucketRateLimiter extends EventEmitter {
+  private readonly buckets = new Map<string, { tokens: number; lastRefillMicros: bigint }>();
+  private readonly config: Required<BucketConfig>;
+
+  constructor(config: BucketConfig) {
+    super();
+    this.config = {
+      capacity: Math.max(1, config.capacity),
+      refillRatePerSecond: Math.max(0.001, config.refillRatePerSecond),
+      maxBurstRatio: Math.min(2.0, Math.max(1.0, config.maxBurstRatio ?? 1.25)),
+      onThrottled: config.onThrottled ?? (() => {}),
+    };
+  }
+
+  public tryConsume(key: string, tokensRequested: number = 1): ConsumptionResult {
+    if (tokensRequested <= 0) {
+      throw new RangeError(`tokensRequested must be strictly positive; received ${tokensRequested}`);
+    }
+
+    const nowMicros = process.hrtime.bigint() / 1000n;
+    const bucket = this.getOrInitializeBucket(key, nowMicros);
+    this.refillBucket(bucket, nowMicros);
+
+    const maxAllowedTokens = this.config.capacity * this.config.maxBurstRatio;
+    if (tokensRequested > maxAllowedTokens) {
+      return {
+        allowed: false,
+        remainingTokens: bucket.tokens,
+        retryAfterMs: Number.POSITIVE_INFINITY,
+        currentFillRate: this.config.refillRatePerSecond,
+      };
+    }
+
+    if (bucket.tokens >= tokensRequested) {
+      bucket.tokens -= tokensRequested;
+      return {
+        allowed: true,
+        remainingTokens: Math.floor(bucket.tokens),
+        retryAfterMs: 0,
+        currentFillRate: this.config.refillRatePerSecond,
+      };
+    }
+
+    const deficit = tokensRequested - bucket.tokens;
+    const retryAfterMs = Math.ceil((deficit / this.config.refillRatePerSecond) * 1000);
+    this.config.onThrottled(key, retryAfterMs);
+    this.emit('throttled', { key, requested: tokensRequested, available: bucket.tokens, retryAfterMs });
+
+    return {
+      allowed: false,
+      remainingTokens: Math.floor(bucket.tokens),
+      retryAfterMs,
+      currentFillRate: this.config.refillRatePerSecond,
+    };
+  }
+
+  private getOrInitializeBucket(key: string, nowMicros: bigint): { tokens: number; lastRefillMicros: bigint } {
+    let entry = this.buckets.get(key);
+    if (!entry) {
+      entry = { tokens: this.config.capacity, lastRefillMicros: nowMicros };
+      this.buckets.set(key, entry);
+    }
+    return entry;
+  }
+
+  private refillBucket(entry: { tokens: number; lastRefillMicros: bigint }, nowMicros: bigint): void {
+    const elapsedMicros = Number(nowMicros - entry.lastRefillMicros);
+    if (elapsedMicros <= 0) return;
+
+    const elapsedSeconds = elapsedMicros / 1_000_000;
+    const refilledTokens = elapsedSeconds * this.config.refillRatePerSecond;
+    const maxCapacity = this.config.capacity * this.config.maxBurstRatio;
+
+    entry.tokens = Math.min(maxCapacity, entry.tokens + refilledTokens);
+    entry.lastRefillMicros = nowMicros;
+  }
+
+  public purgeStale(maxIdleSeconds: number): number {
+    const nowMicros = process.hrtime.bigint() / 1000n;
+    const threshold = BigInt(Math.floor(maxIdleSeconds * 1_000_000));
+    let purged = 0;
+
+    for (const [key, state] of this.buckets.entries()) {
+      if (nowMicros - state.lastRefillMicros > threshold) {
+        this.buckets.delete(key);
+        purged++;
+      }
+    }
+    return purged;
+  }
+}

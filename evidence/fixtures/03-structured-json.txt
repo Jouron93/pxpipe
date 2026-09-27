@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FrontierContextProxyConfiguration",
+  "version": "2.5.0-production",
+  "metadata": {
+    "generatedAt": "2026-09-24T10:00:00.000Z",
+    "environment": "production",
+    "cluster": "us-east-metal-01",
+    "datacenterId": 42,
+    "activeNodes": [
+      "node-01.traderbot.local",
+      "node-02.traderbot.local",
+      "node-03.traderbot.local"
+    ],
+    "tags": [
+      "inference",
+      "context-compression",
+      "token-saver",
+      "caching-v2"
+    ]
+  },
+  "routing": {
+    "defaultProvider": "anthropic",
+    "fallbackProvider": "openai",
+    "timeoutMs": 30000,
+    "retryPolicy": {
+      "maxRetries": 3,
+      "backoffMultiplier": 1.5,
+      "initialDelayMs": 250,
+      "maxDelayMs": 2000,
+      "retryableStatusCodes": [
+        429,
+        500,
+        502,
+        503,
+        504
+      ]
+    },
+    "rateLimits": {
+      "globalRequestsPerMinute": 1200,
+      "globalTokensPerMinute": 40000000,
+      "perClientConcurrency": 16
+    }
+  },
+  "rendering": {
+    "defaultFont": "spleen-5x8",
+    "fallbackFont": "jetbrains-mono-14",
+    "antiAliasing": true,
+    "gridLines": false,
+    "maxHeightPx": 728,
+    "stripCols": 312,
+    "cellWBonus": 0,
+    "cellHBonus": 0,
+    "paperGray": 255,
+    "contrastThreshold": 0.85
+  },
+  "modelProfiles": [
+    {
+      "id": "claude-opus-5-5",
+      "family": "anthropic",
+      "contextWindow": 1048576,
+      "maxOutputTokens": 16384,
+      "pricing": {
+        "inputPerMtok": 4,
+        "outputPerMtok": 20,
+        "cacheReadPerMtok": 0.4,
+        "cacheWritePerMtok": 5
+      },
+      "renderingOverride": {
+        "stripCols": 312,
+        "maxHeightPx": 728,
+        "font": "spleen-5x8"
+      },
+      "caching": {
+        "type": "ephemeral",
+        "minTokens": 1024,
+        "ttlSeconds": 300,
+        "maxBreakpoints": 4
+      }
+    },
+    {
+      "id": "claude-sonnet-5",
+      "family": "anthropic",
+      "contextWindow": 1048576,
+      "maxOutputTokens": 8192,
+      "pricing": {
+        "inputPerMtok": 3,
+        "outputPerMtok": 15,
+        "cacheReadPerMtok": 0.3,
+        "cacheWritePerMtok": 3.75
+      },
+      "renderingOverride": {
+        "stripCols": 312,
+        "maxHeightPx": 728,
+        "font": "spleen-5x8"
+      },
+      "caching": {
+        "type": "ephemeral",
+        "minTokens": 1024,
+        "ttlSeconds": 300,
+        "maxBreakpoints": 4
+      }
+    },
+    {
+      "id": "gpt-6-astra",
+      "family": "openai",
+      "contextWindow": 1048576,
+      "maxOutputTokens": 16384,
+      "pricing": {
+        "inputPerMtok": 10,
+        "outputPerMtok": 50,
+        "cacheReadPerMtok": 5,
+        "cacheWritePerMtok": 10
+      },
+      "renderingOverride": {
+        "stripCols": 84,
+        "maxHeightPx": 1954,
+        "font": "jetbrains-mono-14"
+      },
+      "caching": {
+        "type": "prefix",
+        "minTokens": 1024,
+        "autoEvict": true
+      }
+    },
+    {
+      "id": "gpt-6-sol",
+      "family": "openai",
+      "contextWindow": 1048576,
+      "maxOutputTokens": 8192,
+      "pricing": {
+        "inputPerMtok": 2,
+        "outputPerMtok": 10,
+        "cacheReadPerMtok": 1,
+        "cacheWritePerMtok": 2
+      },
+      "renderingOverride": {
+        "stripCols": 84,
+        "maxHeightPx": 1954,
+        "font": "jetbrains-mono-14"
+      },
+      "caching": {
+        "type": "prefix",
+        "minTokens": 1024,
+        "autoEvict": true
+      }
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "family": "google",
+      "contextWindow": 2097152,
+      "maxOutputTokens": 8192,
+      "pricing": {
+        "inputPerMtok": 0.35,
+        "outputPerMtok": 1.4,
+        "cacheReadPerMtok": 0.0875,
+        "cacheWritePerMtok": 0.35
+      },
+      "renderingOverride": {
+        "stripCols": 312,
+        "maxHeightPx": 728,
+        "font": "spleen-5x8"
+      },
+      "caching": {
+        "type": "explicit",
+        "minTokens": 32768,
+        "ttlSeconds": 3600
+      }
+    },
+    {
+      "id": "grok-4.7",
+      "family": "xai",
+      "contextWindow": 524288,
+      "maxOutputTokens": 8192,
+      "pricing": {
+        "inputPerMtok": 2,
+        "outputPerMtok": 6,
+        "cacheReadPerMtok": 1,
+        "cacheWritePerMtok": 2
+      },
+      "renderingOverride": {
+        "stripCols": 152,
+        "maxHeightPx": 512,
+        "font": "spleen-5x8"
+      },
+      "caching": {
+        "type": "prefix",
+        "minTokens": 1024
+      }
+    }
+  ],
+  "features": {
+    "enableFactsheetExtraction": true,
+    "maxFactsheetEntries": 96,
+    "enableHistoryCollapse": true,
+    "historyCollapseThresholdTurns": 10,
+    "enableReflowNewlineMarkers": true,
+    "strictImageBudgetEnforcement": true,
+    "maxDecodedImagePayloadMiB": 18
+  }
+}

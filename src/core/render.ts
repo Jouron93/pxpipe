@@ -77,7 +77,7 @@ import {
   ATLAS_GRAY_WIDE_FLAGS as JBM14_GRAY_WIDE_FLAGS,
   atlasGrayRank as jbMono14GrayRank,
 } from './atlas-gray-jbmono14.js';
-import { encodeGrayPng, encodeRgbPng } from './png.js';
+import { encodeGrayPng, encodeRgbPngSmallest } from './png.js';
 
 export type RenderFont = 'spleen-5x8' | 'jetbrains-mono-10' | 'jetbrains-mono-12' | 'jetbrains-mono-14';
 export const DEFAULT_RENDER_FONT: RenderFont = 'spleen-5x8';
@@ -247,6 +247,15 @@ const DEFAULT_COLS = ANTHROPIC_SLAB_COLS;
 export const PAD_X = 4;
 /** Vertical padding (top + bottom each), px. Exported for transform.ts token-cost math. */
 export const PAD_Y = 4;
+
+/**
+ * Strict image-budget constants derived from upstream provider constraints:
+ * - Anthropic wire limit: maximum 100 images per request.
+ * - Decoded image payload ceiling: 18 MiB soft limit / 20 MiB hard ceiling.
+ */
+export const ANTHROPIC_MAX_IMAGES_WIRE = 100;
+export const MAX_DECODED_IMAGE_PAYLOAD_SOFT_BYTES = 18 * 1024 * 1024; // 18 MiB
+export const MAX_DECODED_IMAGE_PAYLOAD_HARD_BYTES = 20 * 1024 * 1024; // 20 MiB
 
 /** Production ships bare 5×8 atlas cell (reflow+grayscale+inimage instruction band
  *  brought 5×8 to 98.95% OCR accuracy on Opus 4.7, matching or beating padded cells).
@@ -1045,7 +1054,8 @@ export async function renderChunkToPng(
         rgb[i * 3 + 2] = g;
       }
     }
-    png = await encodeRgbPng(rgb, width, height);
+    // Lossless: gray/indexed when the page allows it, truecolor otherwise.
+    png = await encodeRgbPngSmallest(rgb, width, height);
   } else if (markerMask) {
     // markerRed: ↵ pixels → red, everything else stays greyscale.
     const rgb = new Uint8Array(width * height * 3);
@@ -1061,7 +1071,7 @@ export async function renderChunkToPng(
         rgb[i * 3 + 2] = g;
       }
     }
-    png = await encodeRgbPng(rgb, width, height);
+    png = await encodeRgbPngSmallest(rgb, width, height);
   } else {
     png = await encodeGrayPng(fb, width, height);
   }

@@ -96,6 +96,9 @@ export interface ProxyConfig {
    *  negative value is ignored in favour of that default: an unusable limit must
    *  not silently become no limit. */
   maxRequestBytes?: number;
+  /** Minimum inbound request body size in bytes to trigger compression.
+   *  Bodies smaller than this pass through uncompressed. */
+  minBodyBytes?: number;
 }
 
 export interface ProxyEvent {
@@ -1771,7 +1774,9 @@ let responseContentType: string | undefined;
         const measuredLossBypass = !!measuredAdmission
           && messagesAnthropic && !bridgedGptMessages && !bridgedChatMessages
           && modelOk && measuredAdmission.shouldBypass(model);
-        const effectiveOpts = modelOk && !measuredLossBypass
+        const minBodyBytes = config.minBodyBytes ?? 0;
+        const bodyOk = minBodyBytes <= 0 || bodyIn.byteLength >= minBodyBytes;
+        const effectiveOpts = (modelOk && bodyOk && !measuredLossBypass)
           ? transformOpts
           : { ...transformOpts, compress: false };
         const bridgeBody = bridgedGptMessages

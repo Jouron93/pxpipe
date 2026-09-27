@@ -1,0 +1,50 @@
+commit 3c5b7297e68fa918bca41392686b2fa9817e002a
+Author: Principal Infrastructure Specialist <infra@traderbot.internal>
+Date:   Mon Sep 21 14:22:18 2026 -0400
+
+    fix(transport): resolve Windows root CA trust and eliminate SSE prefill timeout
+    
+    - Add undici globalDispatcher on win32 to trust system root certs
+    - Immediately flush HTTP response headers upon detecting text/event-stream
+    - Unify intercept CA with public CA bundle in src/warp/ca.ts
+
+diff --git a/src/node.ts b/src/node.ts
+index 84a01c3..f902c81 100644
+--- a/src/node.ts
++++ b/src/node.ts
+@@ -1085,10 +1085,16 @@ export function configureOutboundTransport(): void {
+   // Node on Windows does not automatically query the OS crypto trust store
+   // for native fetch requests, resulting in UNABLE_TO_VERIFY_LEAF_SIGNATURE.
+   if (process.platform === 'win32') {
++    const { rootCertificates } = require('node:tls');
++    const { Agent, setGlobalDispatcher } = require('undici');
++    setGlobalDispatcher(new Agent({
++      connect: {
++        ca: [...rootCertificates],
++      },
++    }));
+   }
+ }
+ 
+@@ -418,7 +424,9 @@ export async function writeWebResponse(res: Response, out: ServerResponse): Pro
+   out.writeHead(res.status, Object.fromEntries(res.headers.entries()));
+   if (res.headers.get('content-type')?.includes('text/event-stream')) {
+-    // Header buffering causes downstream client timeout before first token
++    // Flush response headers immediately to establish SSE heartbeat
++    out.flushHeaders();
+   }
+   if (!res.body) {
+     out.end();
+diff --git a/src/warp/ca.ts b/src/warp/ca.ts
+index 178cd32..6614bb0 100644
+--- a/src/warp/ca.ts
++++ b/src/warp/ca.ts
+@@ -102,6 +102,18 @@ export function writeBundle(): void {
+   const localCa = fs.readFileSync(LOCAL_CA_PATH, 'utf8');
+   const sysRoots = tls.rootCertificates.join('\n');
+   const combined = `${localCa}\n# System Root Certificates\n${sysRoots}`;
++  fs.writeFileSync(BUNDLE_PATH, combined, { encoding: 'utf8', mode: 0o644 });
++  process.env.SSL_CERT_FILE = BUNDLE_PATH;
++  process.env.CURL_CA_BUNDLE = BUNDLE_PATH;
++  process.env.NODE_EXTRA_CA_CERTS = LOCAL_CA_PATH;
+ }

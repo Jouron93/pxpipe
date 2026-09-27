@@ -182,10 +182,17 @@ describe('telemetry distinguishes the two ceilings', () => {
   });
 
   it('warns before the next turn walks into the wall', async () => {
+    // Measure the slab under an unconstrained budget, then admit it at ~91% full:
+    // nothing is dropped this turn, and the next one will be. Derived rather than
+    // hard-coded so the test tracks the encoder's actual output size.
+    const probe = await transformRequest(withSlab([{ role: 'user', content: 'go' }]), {
+      maxImageBytes: 64 * 1024 * 1024,
+    });
+    resetSessionState();
+    const slabBytes = probe.info.imageBytes;
+    expect(slabBytes).toBeGreaterThan(0);
     const { info } = await transformRequest(withSlab([{ role: 'user', content: 'go' }]), {
-      // The slab measures 12,683 bytes, so a 14,000-byte budget admits it at
-      // about 91% full: nothing is dropped this turn, and the next one will be.
-      maxImageBytes: 14_000,
+      maxImageBytes: Math.ceil(slabBytes / 0.91),
     });
     expect(info.imageCount ?? 0).toBeGreaterThan(0);
     expect(info.imageBytesNearLimit).toBe(true);

@@ -51,7 +51,12 @@ import {
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
-import { noteHistoryRequest, recordFreezeStep } from './session-state.js';
+import {
+  noteHistoryRequest,
+  recordFreezeStep,
+  recordHistoryByteBudget,
+  stickyHistoryByteBudget,
+} from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
 import { visionTokens, type VisionPricing } from './vision-cost.js';
@@ -93,8 +98,12 @@ export interface TransformOptions {
   compressToolResults?: boolean;
   /** Don't compress if total compressible chars below this. */
   minCompressChars?: number;
-  /** Per-block threshold for compressToolResults (chars). */
+  /** Per-block threshold for compressToolResults (chars). Applies to file-read tool
+   *  results (see READ_TOOL_NAMES), whose text an Edit must reproduce byte-exactly. */
   minToolResultChars?: number;
+  /** Threshold for every other tool's results (Bash, Grep, WebFetch, MCP, ...). Never
+   *  higher than `minToolResultChars`. */
+  minNonReadToolResultChars?: number;
   /** Soft-wrap width in monospace cells. */
   cols?: number;
   /** Hard upper bound on images per tool_result; source text truncated with a paging
@@ -148,6 +157,12 @@ const DEFAULTS: Required<TransformOptions> = {
   compressToolResults: true,
   minCompressChars: 2000,
   minToolResultChars: 6000,
+  // Measured 2026-09-26 on claude-opus-5-5 with count_tokens (ASCII fact-sheet):
+  // imaging a 2,500-char tool_result saved 26.7% of its text tokens across five
+  // shapes (json read, code read, prose, jsonl, grep output), 1,500 chars 19.6%.
+  // File reads keep the 6,000 floor: their text feeds Edit's exact old_string,
+  // and code reads saved the least at small sizes (5% at 2,500 chars).
+  minNonReadToolResultChars: 2500,
   // system field rejects images (400 system.N.type: Input should be 'text') —
   // images always go into the first user message.
   // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
@@ -229,6 +244,10 @@ export const SLAB_CHARS_PER_TOKEN = 2.0;
 // Tools whose stub description keeps a live-text read-before-edit precondition
 // when full docs move into the imaged Tool Reference (read-gate audit, 2026-07-03).
 const READ_FIRST_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
+
+/** Tools whose tool_result is file content an Edit may have to quote byte-exactly.
+ *  They keep the conservative `minToolResultChars` floor. */
+const READ_TOOL_NAMES = new Set(['Read', 'NotebookRead', 'read_file', 'view_file', 'fs_read']);
 
 /** Empirical cpt for the history-collapse path (same Opus 4.7 telemetry as SLAB_CHARS_PER_TOKEN).
  *  History is even denser (tool_use JSON dominates), so 2.0 is doubly conservative. */
@@ -449,8 +468,29 @@ export function evalCompressionProfitability(
   };
 }
 
+export interface CompressionProfitabilityOptions {
+  textTokens: number;
+  imageTokens: number;
+  priorWarmTokens?: number;
+  priorWarmImageTokens?: number;
+}
+
+export function isCompressionProfitable(
+  opts: CompressionProfitabilityOptions,
+): boolean;
 export function isCompressionProfitable(
   text: string,
+  cols?: number,
+  imageCountCap?: number,
+  charsPerToken?: number,
+  priorWarmTokens?: number,
+  priorWarmImageTokens?: number,
+  shrinkWidth?: boolean,
+  maxCharsPerImage?: number,
+  geometry?: GateGeometry,
+): boolean;
+export function isCompressionProfitable(
+  textOrOpts: string | CompressionProfitabilityOptions,
   cols: number = DEFAULTS.cols,
   imageCountCap?: number,
   charsPerToken: number = CHARS_PER_TOKEN,
@@ -460,6 +500,18 @@ export function isCompressionProfitable(
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   geometry?: GateGeometry,
 ): boolean {
+  if (typeof textOrOpts === 'object' && textOrOpts !== null) {
+    const { textTokens, imageTokens, priorWarmTokens = 0, priorWarmImageTokens = 0 } = textOrOpts;
+    if (!Number.isFinite(textTokens) || !Number.isFinite(imageTokens)) return false;
+    const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
+      ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+      : 0;
+    const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
+      ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+      : 0;
+    return imageTokens + burnImageSide < textTokens + burnTextSide;
+  }
+  const text = textOrOpts;
   if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
@@ -478,6 +530,7 @@ export function isCompressionProfitable(
     : 0;
   return imageTokensCost_ + burnImageSide < textTokensEquivalent + burnTextSide;
 }
+
 
 /**
  * Horizon-aware variant of `isCompressionProfitable` for history-collapse.
@@ -1930,13 +1983,67 @@ export function countNativeImages(messages: readonly Message[] | undefined): num
  * upstream cache is provably dead, and never below a grid this session already
  * froze at. See {@link noteHistoryRequest}.
  */
+/**
+ * Run the history collapse, and when the rendered group overflows the byte headroom,
+ * re-run it with a proportionally smaller page budget so the OLDEST history that fits
+ * is collapsed instead of none of it.
+ *
+ * Admission stays atomic by weight (the caller still rejects a group that does not
+ * fit), but a rejection used to be all-or-nothing: once a session's history rendered
+ * past `maxImageBytes`, every later turn shipped the whole history as text. The budget
+ * trim keeps the collapsed range anchored at the protected prefix (collapseHistory
+ * trims from the newest end), so completed chunks stay byte-identical and cached.
+ * Measured 2026-09-26 on a 664K-token Claude-Code-shaped body: the untrimmed collapse
+ * was rejected on bytes and the request saved 14.5%.
+ */
+async function collapseHistoryFittingBytes(
+  messages: Parameters<typeof collapseHistory>[0],
+  isProfitable: Parameters<typeof collapseHistory>[1],
+  opts: Parameters<typeof collapseHistory>[2],
+  byteHeadroom: number,
+  sessionKey?: string,
+  cold = false,
+): ReturnType<typeof collapseHistory> {
+  // A session that was trimmed before starts from its pinned budget. Re-deriving
+  // the trim from each request's untrimmed render moved the collapse boundary back
+  // and forth as history grew, re-writing the entire cached image prefix each time
+  // (3 re-writes of 380-436k tokens in 26 claude-opus-5-5 turns, 2026-09-27). A
+  // fixed budget over unchanged old messages yields byte-identical pages.
+  const pinned = cold ? undefined : stickyHistoryByteBudget(sessionKey);
+  let budget = Math.min(opts?.imageBudget ?? ANTHROPIC_HISTORY_IMAGE_BUDGET, pinned ?? Infinity);
+  let run = await collapseHistory(messages, isProfitable, { ...opts, imageBudget: budget });
+  if (pinned !== undefined) run.info.budgetTrimmed = true;
+  let trimmed = pinned !== undefined;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const hi = run.info;
+    if (hi.collapsedTurns <= 0 || hi.collapsedImages <= 1 || hi.collapsedImageBytes <= byteHeadroom) break;
+    // The budget is a planning estimate (chars per page), and real renders can come out
+    // ~2x more pages than planned (chunk boundaries, user-prompt pages). Scale by what
+    // this render actually produced, not by the budget we asked for.
+    const perImage = hi.collapsedImageBytes / hi.collapsedImages;
+    const fitImages = Math.floor((byteHeadroom * 0.95) / perImage);
+    const next = Math.min(Math.floor((budget * fitImages) / hi.collapsedImages), budget - 1);
+    if (next < 1) break;
+    budget = next;
+    trimmed = true;
+    run = await collapseHistory(messages, isProfitable, { ...opts, imageBudget: budget });
+    run.info.budgetTrimmed = true;
+  }
+  // Pin only a budget that was actually admitted by weight; the caller still
+  // rejects anything over the headroom, and a rejected budget must not stick.
+  if (trimmed && run.info.collapsedTurns > 0 && run.info.collapsedImageBytes <= byteHeadroom) {
+    recordHistoryByteBudget(sessionKey, budget, cold);
+  }
+  return run;
+}
+
 function historyGridTuning(
   info: TransformInfo,
-): { imageBudget: number; packFill: boolean; minFreezeStep: number } {
+): { imageBudget: number; packFill: boolean; minFreezeStep: number; cold: boolean } {
   const headroom = imageHeadroom(info);
   const imageBudget = Math.max(1, Math.min(ANTHROPIC_HISTORY_IMAGE_BUDGET, headroom));
   const session = noteHistoryRequest(info.firstUserSha8);
-  return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep };
+  return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep, cold: session.cold };
 }
 
 async function runHistoryCollapseAndFinalize(
@@ -1985,7 +2092,7 @@ async function runHistoryCollapseAndFinalize(
     // non-collapse path already keeps <system-reminder> as text below.
     const protectedPrefix = firstMessageHasSystemReminder(req.messages) ? 1 : 0;
     const tuning = historyGridTuning(info);
-    const { messages: newMessages, info: histInfo } = await collapseHistory(
+    const { messages: newMessages, info: histInfo } = await collapseHistoryFittingBytes(
       req.messages,
       historyProfitable,
       {
@@ -1999,6 +2106,9 @@ async function runHistoryCollapseAndFinalize(
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
       },
+      imageByteHeadroom(info, o.maxImageBytes),
+      info.firstUserSha8,
+      tuning.cold,
     );
     recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
@@ -2523,7 +2633,7 @@ export async function transformRequest(
     // headings inside the image; stub ↔ reference invariant holds because both
     // are applied on this same path (gate-fail paths return earlier with
     // original tools untouched).
-    req.system = sysTail.length > 0 ? sysTail : undefined;
+    req.system = sysTail.length > 0 ? sysTail : (Array.isArray(req.system) ? [] : undefined);
 
     const firstUserIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
     if (firstUserIdx >= 0) {
@@ -2573,7 +2683,7 @@ export async function transformRequest(
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
     const tuning = historyGridTuning(info);
-    const { messages: newMessages, info: histInfo } = await collapseHistory(
+    const { messages: newMessages, info: histInfo } = await collapseHistoryFittingBytes(
       req.messages,
       historyProfitable,
       {
@@ -2587,6 +2697,9 @@ export async function transformRequest(
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
       },
+      imageByteHeadroom(info, o.maxImageBytes),
+      info.firstUserSha8,
+      tuning.cold,
     );
     recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
     if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
@@ -2662,6 +2775,23 @@ export async function transformRequest(
   // `imageHeadroom(info)` is the headroom left after the collapse spent its
   // share. Out of headroom degrades to sharp text, which is the safe direction.
   if (o.compressToolResults) {
+    // tool_use id -> tool name, so the size threshold can tell file reads apart.
+    const toolNameById = new Map<string, string>();
+    for (const m of req.messages ?? []) {
+      if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+      for (const b of m.content) {
+        const tu = b as { type?: string; id?: unknown; name?: unknown };
+        if (tu?.type === 'tool_use' && typeof tu.id === 'string' && typeof tu.name === 'string') {
+          toolNameById.set(tu.id, tu.name);
+        }
+      }
+    }
+    const minCharsFor = (toolUseId: unknown): number => {
+      const name = typeof toolUseId === 'string' ? toolNameById.get(toolUseId) : undefined;
+      // Unknown provenance is treated as a file read: the conservative floor.
+      if (name === undefined || READ_TOOL_NAMES.has(name)) return o.minToolResultChars;
+      return Math.min(o.minToolResultChars, o.minNonReadToolResultChars);
+    };
     for (const msg of req.messages ?? []) {
       if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
       const rewritten: ContentBlock[] = [];
@@ -2695,7 +2825,7 @@ export async function transformRequest(
             const inner = compactSlabWhitespace(innerRaw);
             // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
             const innerR = maybeReflow(inner, o.reflow);
-            if (innerR.length < o.minToolResultChars) {
+            if (innerR.length < minCharsFor(tr.tool_use_id)) {
               bumpPassthrough(info, 'below_threshold');
               rewritten.push(blk);
             } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
@@ -2807,7 +2937,7 @@ export async function transformRequest(
               const innerText = compactSlabWhitespace(innerTextRaw);
               // R3: gate/page/render on reflowed text; classify pre-reflow.
               const innerTextR = maybeReflow(innerText, o.reflow);
-              if (innerTextR.length < o.minToolResultChars) {
+              if (innerTextR.length < minCharsFor(tr.tool_use_id)) {
                 bumpPassthrough(info, 'below_threshold');
                 newInner.push(ib as TextBlock | ImageBlock);
                 continue;
