@@ -345,6 +345,23 @@ export function renderCellHeight(style: RenderStyle = {}): number {
   return atlas.cellH + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
 }
 
+/** Pixel width of a PNG rendered at `cols` columns. Same formula as
+ *  `renderChunkToPng`, including the overhang when the cell pitch is narrower
+ *  than the atlas glyph. */
+export function renderWidthPx(cols: number, style: RenderStyle = {}): number {
+  const atlas = style.aa === true ? atlasSet(style.font).gray : atlasSet(style.font).bit;
+  const cellW = renderCellWidth(style);
+  return 2 * PAD_X + Math.max(1, Math.floor(cols)) * cellW + Math.max(0, atlas.cellW - cellW);
+}
+
+/** Widest column count whose rendered PNG is at most `widthPx` wide (floor 1). */
+export function maxColsForWidthPx(widthPx: number, style: RenderStyle = {}): number {
+  const atlas = style.aa === true ? atlasSet(style.font).gray : atlasSet(style.font).bit;
+  const cellW = renderCellWidth(style);
+  const usable = widthPx - 2 * PAD_X - Math.max(0, atlas.cellW - cellW);
+  return Math.max(1, Math.floor(usable / cellW));
+}
+
 // --- column-aware wrapping -------------------------------------------------
 
 /** Visual width of a codepoint in cells (1 = Latin, 2 = East Asian Wide).

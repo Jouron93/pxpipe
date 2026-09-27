@@ -14,19 +14,37 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX,
+  ANTHROPIC_MANY_IMAGE_THRESHOLD,
   countNativeImages,
+  imageDimsFromBase64,
   imageHeadroom,
   transformRequest,
+  violatesManyImageLimit,
 } from '../src/core/transform.js';
 import { ANTHROPIC_MAX_IMAGES } from '../src/core/history.js';
 import { resetSessionState } from '../src/core/session-state.js';
+import { toTrackEvent } from '../src/core/tracker.js';
 import type { Message } from '../src/core/types.js';
 
 const big = (n: number) => 'x'.repeat(n);
 
-const img = () => ({
+/** Base64 of a PNG signature + IHDR declaring `w`×`h` — enough for a header read. */
+function pngB64(w: number, h: number): string {
+  const b = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b, 0);
+  b.writeUInt32BE(13, 8);
+  b.write('IHDR', 12, 'latin1');
+  b.writeUInt32BE(w, 16);
+  b.writeUInt32BE(h, 20);
+  return b.toString('base64');
+}
+
+// A small, measurable screenshot. The many-image guard treats an unreadable
+// header as oversized, so the fixture carries a real IHDR.
+const img = (w = 64, h = 64) => ({
   type: 'image' as const,
-  source: { type: 'base64' as const, media_type: 'image/png' as const, data: 'iVBORw0KGgo=' },
+  source: { type: 'base64' as const, media_type: 'image/png' as const, data: pngB64(w, h) },
 });
 
 function enc(obj: unknown): Uint8Array {
@@ -53,7 +71,7 @@ function wireImages(msgs: Message[]): number {
 
 /** A user turn holding `n` client images, as Claude Code sends pasted screenshots. */
 function clientImages(n: number): Message {
-  return { role: 'user', content: Array.from({ length: n }, img) };
+  return { role: 'user', content: Array.from({ length: n }, () => img()) };
 }
 
 /** A tool_result big enough that pxpipe would normally image it. */
@@ -223,5 +241,144 @@ describe('wireImages — what the provider actually counts', () => {
     );
     expect(info.wireImages).toBe(wireImages(dec(out).messages));
     expect(info.wireImages).toBe((info.imageCount ?? 0) + (info.nativeImages ?? 0));
+  });
+});
+
+/** Every image on the wire with its header size (all fixtures are inline base64). */
+function wireDims(msgs: Message[]): Array<{ width: number; height: number }> {
+  const out: Array<{ width: number; height: number }> = [];
+  const visit = (b: any) => {
+    if (b?.type !== 'image') return;
+    const d = imageDimsFromBase64(b.source.data);
+    if (!d) throw new Error('unreadable image on the wire');
+    out.push(d);
+  };
+  for (const m of msgs) {
+    if (!Array.isArray(m.content)) continue;
+    for (const b of m.content as any[]) {
+      visit(b);
+      if (b?.type === 'tool_result' && Array.isArray(b.content)) b.content.forEach(visit);
+    }
+  }
+  return out;
+}
+
+/** A Claude Code session on claude-opus-5-5: anchor, then `turns` Read calls
+ *  whose results are big enough to image. Transform it with {@link OPUS55}: the
+ *  proxy always passes the effective model, and without it the jb10 profile never
+ *  applies. Measured 2026-09-27: 16 turns ship 18 images at the 2576px jb10
+ *  geometry; 20 turns ship 22, 28 turns ship 30 (both clamped to 2000px). */
+const OPUS55 = { model: 'claude-opus-5-5' } as const;
+function opus55Session(turns: number, extra: Message[] = []): Uint8Array {
+  const messages: any[] = [{ role: 'user', content: 'ANCHOR ' + big(2000) }];
+  for (let i = 0; i < turns; i++) {
+    messages.push({ role: 'assistant', content: [{ type: 'tool_use', id: 't' + i, name: 'Read', input: {} }] });
+    messages.push({
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't' + i, content: 'RES\n' + 'word '.repeat(4000) }],
+    });
+  }
+  messages.push(...extra, { role: 'user', content: 'go' });
+  return enc({
+    model: 'claude-opus-5-5',
+    max_tokens: 16,
+    system: [{ type: 'text', text: 'SLAB\n' + 'word '.repeat(10_000) }],
+    messages,
+  });
+}
+
+/** 20 small client screenshots plus one wider than the many-image edge. */
+const oversizedClientTurn = (): Message =>
+  ({ role: 'user', content: [img(2576, 900), ...Array.from({ length: 20 }, () => img())] }) as Message;
+
+describe('many-image limit — >20 images forces every edge ≤ 2000px', () => {
+  beforeEach(() => resetSessionState());
+  const overEdge = (d: { width: number; height: number }) =>
+    d.width > ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX || d.height > ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX;
+
+  it('pins the documented numbers', () => {
+    expect(ANTHROPIC_MANY_IMAGE_THRESHOLD).toBe(20);
+    expect(ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX).toBe(2000);
+  });
+
+  it('(a) re-renders at a smaller geometry when the request carries >20 images', async () => {
+    const { body: out, info } = await transformRequest(opus55Session(28), OPUS55);
+    const dims = wireDims(dec(out).messages);
+    expect(dims.length).toBeGreaterThan(ANTHROPIC_MANY_IMAGE_THRESHOLD);
+    expect(dims.filter(overEdge)).toEqual([]);
+    expect(info.manyImageEdgeClampPx).toBe(ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX);
+    expect(info.compressed).toBe(true);
+    expect(info.reason).not.toBe('many_images_limit');
+    expect(violatesManyImageLimit(out)).toBe(false);
+  });
+
+  it('(b) leaves the high-res geometry alone at ≤20 images', async () => {
+    const { body: out, info } = await transformRequest(opus55Session(16), OPUS55);
+    const dims = wireDims(dec(out).messages);
+    expect(dims.length).toBeGreaterThan(0);
+    expect(dims.length).toBeLessThanOrEqual(ANTHROPIC_MANY_IMAGE_THRESHOLD);
+    // The jb10 pages stay wider than the many-image edge: nothing was clamped.
+    expect(dims.some(overEdge)).toBe(true);
+    expect(info.manyImageEdgeClampPx).toBeUndefined();
+  });
+
+  it('(c) passes the original through when a client image over the edge rides a >20 request', async () => {
+    const body = opus55Session(4, [oversizedClientTurn()]);
+    const { body: out, info } = await transformRequest(body, OPUS55);
+    expect(out).toBe(body);
+    expect(info.compressed).toBe(false);
+    expect(info.reason).toBe('many_images_limit');
+    expect(info.passthroughReasons?.many_images_limit).toBe(1);
+    expect(info.nativeImages).toBe(21);
+  });
+
+  it('(d) the reason and the clamp reach the events.jsonl record', async () => {
+    const pass = await transformRequest(opus55Session(4, [oversizedClientTurn()]), OPUS55);
+    const ev = toTrackEvent({
+      method: 'POST', path: '/v1/messages', model: 'claude-opus-5-5', status: 200, durationMs: 1, info: pass.info,
+    });
+    expect(ev.reason).toBe('many_images_limit');
+    expect(ev.passthrough_reasons?.many_images_limit).toBe(1);
+
+    resetSessionState();
+    const clamp = await transformRequest(opus55Session(28), OPUS55);
+    const ev2 = toTrackEvent({
+      method: 'POST', path: '/v1/messages', model: 'claude-opus-5-5', status: 200, durationMs: 1, info: clamp.info,
+    });
+    expect(ev2.many_image_edge_clamp_px).toBe(ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX);
+  });
+});
+
+describe('imageDimsFromBase64', () => {
+  const b64 = (bytes: number[]) => Buffer.from(bytes).toString('base64');
+
+  it('reads PNG, GIF, WebP (VP8X) and JPEG headers', () => {
+    expect(imageDimsFromBase64(pngB64(2576, 1260))).toEqual({ width: 2576, height: 1260 });
+    expect(imageDimsFromBase64(b64([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x10, 0x08, 0x20, 0x04])))
+      .toEqual({ width: 2064, height: 1056 });
+    const webp = Buffer.alloc(30);
+    webp.write('RIFF', 0, 'latin1');
+    webp.write('WEBPVP8X', 8, 'latin1');
+    webp.writeUIntLE(2999, 24, 3);
+    webp.writeUIntLE(1499, 27, 3);
+    expect(imageDimsFromBase64(webp.toString('base64'))).toEqual({ width: 3000, height: 1500 });
+    // SOI, APP0 (len 16), SOF0: height 0x0438 = 1080, width 0x0780 = 1920.
+    const jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, ...new Array<number>(14).fill(0),
+      0xff, 0xc0, 0x00, 0x11, 0x08, 0x04, 0x38, 0x07, 0x80, 0x03];
+    expect(imageDimsFromBase64(b64(jpeg))).toEqual({ width: 1920, height: 1080 });
+  });
+
+  it('returns null for a truncated or unknown header', () => {
+    expect(imageDimsFromBase64('iVBORw0KGgo=')).toBeNull();
+    expect(imageDimsFromBase64(b64([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]))).toBeNull();
+  });
+
+  it('counts an unreadable inline image as oversized once the request is over 20', () => {
+    const bad = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } };
+    const content: unknown[] = [bad, ...Array.from({ length: 20 }, () => img())];
+    const body = () => enc({ model: 'claude-opus-5-5', messages: [{ role: 'user', content }] });
+    expect(violatesManyImageLimit(body())).toBe(true);
+    content.pop();
+    expect(violatesManyImageLimit(body())).toBe(false);
   });
 });

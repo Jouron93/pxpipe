@@ -36,6 +36,7 @@ import {
   renderCellWidth,
   LINES_PER_IMAGE,
   maxCharsPerImage,
+  maxColsForWidthPx,
   type RenderStyle,
 } from './render.js';
 import {
@@ -106,6 +107,13 @@ export interface TransformOptions {
   minNonReadToolResultChars?: number;
   /** Soft-wrap width in monospace cells. */
   cols?: number;
+  /** Longest allowed edge, in px, of every image pxpipe renders. Clamps the
+   *  column count (width) and page height of the slab, tool_result, and history
+   *  geometries. 0 (default) leaves the model profile's geometry alone.
+   *  `transformRequest` sets it to {@link ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX} on its
+   *  own when the outgoing request would carry more than
+   *  {@link ANTHROPIC_MANY_IMAGE_THRESHOLD} images. */
+  maxImageEdgePx?: number;
   /** Hard upper bound on images per tool_result; source text truncated with a paging
    *  marker above this to stay under Anthropic's 100-image/request cap. Default 10. */
   maxImagesPerToolResult?: number;
@@ -167,6 +175,7 @@ const DEFAULTS: Required<TransformOptions> = {
   // images always go into the first user message.
   // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
   cols: ANTHROPIC_SLAB_COLS,
+  maxImageEdgePx: 0,
   maxImagesPerToolResult: 10,
   // Deliberately under the ~20 MiB cliff observed in production rather than at
   // it: the measured threshold is empirical and varies by route and provider.
@@ -183,6 +192,24 @@ const DEFAULTS: Required<TransformOptions> = {
   gptHistory: {},
   model: '',
 };
+
+/** Image count above which Anthropic applies the stricter per-image dimension
+ *  limit. Anthropic docs, Vision → "Image limits and costs" → "Request limits"
+ *  (https://docs.claude.com/en/docs/build-with-claude/vision): "If a single API
+ *  request contains more than 20 images, a stricter per-image dimension limit
+ *  applies to every image in that request. All `image` blocks in the request
+ *  count toward this threshold, including images from earlier conversation
+ *  turns that you resend and images nested inside `tool_result` content …
+ *  Images exceeding the stricter limit are rejected with an
+ *  `invalid_request_error` whose message references "many-image requests" …
+ *  resize each image so that neither dimension exceeds 2000 px, or keep the
+ *  request to 20 or fewer image and document blocks." The count_tokens probe
+ *  does not enforce it, so only the send path sees the 400. */
+export const ANTHROPIC_MANY_IMAGE_THRESHOLD = 20;
+/** Per-edge pixel limit that applies once a request carries more than
+ *  {@link ANTHROPIC_MANY_IMAGE_THRESHOLD} images (same docs citation). Also the
+ *  override value `transformRequest` passes as `maxImageEdgePx` on the re-render. */
+export const ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX = 2000;
 
 /**
  * Subscription OAuth requests are classified as first-party traffic only when
@@ -356,20 +383,40 @@ function historyGateGeometry(
   const dense = denseGateGeometry(o);
   const profile = o?.model ? resolveGptProfile(o.model) : undefined;
   if (profile?.historyStripCols === undefined && profile?.historyStyle === undefined) return dense;
-  return {
-    ...dense,
-    cols: callerOverrodeCols ? o!.cols : profile.historyStripCols ?? dense.cols,
-    style: profile.historyStyle ?? dense.style,
-  };
+  const style = profile.historyStyle ?? dense.style;
+  const cols = clampColsToEdge(
+    callerOverrodeCols ? o!.cols : profile.historyStripCols ?? dense.cols,
+    style,
+    o?.maxImageEdgePx,
+  );
+  return { ...dense, cols, maxChars: maxCharsPerImage(cols), style };
+}
+
+/** Widest `cols` (≤ `cols`) whose rendered PNG fits `edgePx`. No-op when
+ *  `edgePx` is unset/0 — the many-image clamp is the only caller that sets it. */
+function clampColsToEdge(cols: number, style: RenderStyle, edgePx: number | undefined): number {
+  if (edgePx === undefined || !(edgePx > 0)) return cols;
+  return Math.min(cols, maxColsForWidthPx(edgePx, style));
+}
+
+/** Page height clamped to `edgePx` (same no-op rule as {@link clampColsToEdge}). */
+function clampHeightToEdge(heightPx: number, edgePx: number | undefined): number {
+  if (edgePx === undefined || !(edgePx > 0)) return heightPx;
+  return Math.min(heightPx, edgePx);
 }
 
 /** Gate geometry for dense tool-result, reminder, and history pages. */
 function denseGateGeometry(o?: Required<TransformOptions>): GateGeometry {
   const profile = o?.model ? resolveGptProfile(o.model) : undefined;
-  const cols = o?.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS;
+  const style = profile?.style ?? DENSE_RENDER_STYLE;
+  const cols = clampColsToEdge(
+    o?.cols ?? profile?.stripCols ?? DENSE_CONTENT_COLS,
+    style,
+    o?.maxImageEdgePx,
+  );
   return {
     cols,
-    maxHeightPx: profile?.maxHeightPx ?? MAX_HEIGHT_PX,
+    maxHeightPx: clampHeightToEdge(profile?.maxHeightPx ?? MAX_HEIGHT_PX, o?.maxImageEdgePx),
     // Price a page at the width we actually render at, NOT at the 312-col constant.
     // These are the same number in the default Anthropic geometry, but a narrower
     // COLS (env override, GPT strip profile) holds proportionally fewer chars: the
@@ -377,7 +424,7 @@ function denseGateGeometry(o?: Required<TransformOptions>): GateGeometry {
     // budget cleared a plan that then emitted 3× the images and the oversized
     // request came back 500. Capacity must track cols or the budget is fiction.
     maxChars: maxCharsPerImage(cols),
-    style: profile?.style ?? DENSE_RENDER_STYLE,
+    style,
     // No model on the request (Anthropic slab path): price at the Claude
     // profile, which is what is actually serving it.
     pricing: profile ?? CLAUDE_PROFILE,
@@ -580,7 +627,7 @@ export function isCompressionProfitableAmortized(
 /** Increment a passthrough-reason counter on `info`. Lazily allocates `passthroughReasons`. */
 function bumpPassthrough(
   info: TransformInfo,
-  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'image_budget',
+  reason: 'below_threshold' | 'not_profitable' | 'kept_sharp' | 'image_budget' | 'many_images_limit',
 ): void {
   if (!info.passthroughReasons) info.passthroughReasons = {};
   info.passthroughReasons[reason] = (info.passthroughReasons[reason] ?? 0) + 1;
@@ -771,7 +818,11 @@ export interface TransformInfo {
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
   /** Why blocks passed through without compression. Only present when count > 0. */
-  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number; image_budget?: number };
+  passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number; image_budget?: number; many_images_limit?: number };
+  /** Set to {@link ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX} when the outgoing request
+   *  carried more than {@link ANTHROPIC_MANY_IMAGE_THRESHOLD} images and pxpipe
+   *  re-rendered its pages under that edge. Absent on every other request. */
+  manyImageEdgeClampPx?: number;
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
    *  Lets hosts measure flap-prevention efficacy and tune amortization horizon. */
   gateEval?: {
@@ -2172,12 +2223,158 @@ async function runHistoryCollapseAndFinalize(
   return { body: outBody, info, collapsed: collapsedFlag };
 }
 
+/** Pixel size of a base64 image payload, read from its header. Handles the four
+ *  formats Anthropic accepts (PNG, JPEG, GIF, WebP). `null` when the bytes are
+ *  not one of them or the header is truncated. */
+export function imageDimsFromBase64(b64: string): { width: number; height: number } | null {
+  let bin: string;
+  try {
+    // 64 KiB of base64 covers any JPEG SOF placed after typical EXIF/ICC blocks;
+    // the other three formats need < 32 bytes.
+    const clean = b64.slice(0, 87_384).replace(/[^A-Za-z0-9+/]/g, '');
+    // Keep the trailing partial quantum (2 or 3 chars = 1 or 2 bytes) by
+    // re-padding it; a lone leftover char carries no whole byte.
+    const rem = clean.length % 4;
+    bin = atob(rem === 1 ? clean.slice(0, -1) : clean + '='.repeat((4 - rem) % 4));
+  } catch {
+    return null;
+  }
+  const u8 = (i: number): number => bin.charCodeAt(i);
+  const be16 = (i: number): number => (u8(i) << 8) | u8(i + 1);
+  const be32 = (i: number): number => ((u8(i) << 24) >>> 0) + (u8(i + 1) << 16) + (u8(i + 2) << 8) + u8(i + 3);
+  const le16 = (i: number): number => u8(i) | (u8(i + 1) << 8);
+  const le24 = (i: number): number => u8(i) | (u8(i + 1) << 8) | (u8(i + 2) << 16);
+  const n = bin.length;
+  // PNG: 8-byte signature, IHDR width/height at 16/20.
+  if (n >= 24 && bin.startsWith('\x89PNG\r\n\x1a\n')) return { width: be32(16), height: be32(20) };
+  // GIF: logical screen size at 6/8.
+  if (n >= 10 && (bin.startsWith('GIF87a') || bin.startsWith('GIF89a'))) {
+    return { width: le16(6), height: le16(8) };
+  }
+  // WebP: RIFF....WEBP then VP8 / VP8L / VP8X.
+  if (n >= 30 && bin.startsWith('RIFF') && bin.slice(8, 12) === 'WEBP') {
+    const chunk = bin.slice(12, 16);
+    if (chunk === 'VP8 ') return { width: le16(26) & 0x3fff, height: le16(28) & 0x3fff };
+    if (chunk === 'VP8L') {
+      const b = u8(21) | (u8(22) << 8) | (u8(23) << 16) | (u8(24) << 24);
+      return { width: (b & 0x3fff) + 1, height: ((b >>> 14) & 0x3fff) + 1 };
+    }
+    if (chunk === 'VP8X') return { width: le24(24) + 1, height: le24(27) + 1 };
+    return null;
+  }
+  // JPEG: walk markers to the first SOFn.
+  if (n >= 4 && u8(0) === 0xff && u8(1) === 0xd8) {
+    let i = 2;
+    while (i + 9 < n) {
+      if (u8(i) !== 0xff) return null;
+      const marker = u8(i + 1);
+      if (marker === 0xff) { i++; continue; }
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+      const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+      if (isSof) return { width: be16(i + 7), height: be16(i + 5) };
+      i += 2 + be16(i + 2);
+    }
+  }
+  return null;
+}
+
+/** Every image block in an outgoing Messages request (top level and nested in
+ *  `tool_result`), with its pixel size when the payload is inline base64.
+ *  `dims` is `undefined` for url/file sources — the proxy never holds those
+ *  bytes — and `null` for an inline payload whose header could not be read. */
+export function outgoingImages(
+  messages: readonly Message[] | undefined,
+): Array<{ dims: { width: number; height: number } | null | undefined }> {
+  const out: Array<{ dims: { width: number; height: number } | null | undefined }> = [];
+  const visit = (blk: unknown): void => {
+    const b = blk as { type?: string; source?: { type?: string; data?: unknown } } | null;
+    if (b?.type !== 'image') return;
+    out.push({
+      dims: b.source?.type === 'base64' && typeof b.source.data === 'string'
+        ? imageDimsFromBase64(b.source.data)
+        : undefined,
+    });
+  };
+  for (const m of messages ?? []) {
+    if (!Array.isArray(m.content)) continue;
+    for (const blk of m.content) {
+      visit(blk);
+      const tr = blk as ToolResultBlock | null;
+      if (tr?.type === 'tool_result' && Array.isArray(tr.content)) {
+        for (const inner of tr.content) visit(inner);
+      }
+    }
+  }
+  return out;
+}
+
+/** True when `body` would trip Anthropic's many-image rule: more than
+ *  {@link ANTHROPIC_MANY_IMAGE_THRESHOLD} images and at least one whose edge
+ *  exceeds {@link ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX}. An inline image we cannot
+ *  measure counts as oversized — the rule is enforced upstream whether or not
+ *  we can read the header. url/file sources are not measurable here and are
+ *  sent unchanged on every path, so they count toward the total only. */
+export function violatesManyImageLimit(body: Uint8Array): boolean {
+  let req: MessagesRequest;
+  try {
+    req = JSON.parse(new TextDecoder().decode(body)) as MessagesRequest;
+  } catch {
+    return false;
+  }
+  const imgs = outgoingImages(req.messages);
+  if (imgs.length <= ANTHROPIC_MANY_IMAGE_THRESHOLD) return false;
+  return imgs.some(({ dims }) =>
+    dims === null
+    || (dims !== undefined
+      && (dims.width > ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX || dims.height > ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX)));
+}
+
 /**
  * Rewrite a Messages API request body. Returns the new body (still JSON
  * bytes) plus diagnostic info. On any error, returns the original bytes
  * unchanged.
+ *
+ * Many-image guard: when the outgoing body carries more than
+ * {@link ANTHROPIC_MANY_IMAGE_THRESHOLD} images and any edge exceeds
+ * {@link ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX}, the transform re-runs with
+ * `maxImageEdgePx` set so every pxpipe page is re-rendered at a smaller
+ * geometry (never a rescaled bitmap). If the result still violates the rule —
+ * a client image over the edge — the original body is forwarded with
+ * `reason: 'many_images_limit'`, which reaches events.jsonl as `reason`.
  */
 export async function transformRequest(
+  body: Uint8Array,
+  opts: TransformOptions = {},
+): Promise<{ body: Uint8Array; info: TransformInfo }> {
+  const first = await transformRequestInner(body, opts);
+  // Untouched bytes: pxpipe added nothing, so there is nothing of ours to shrink.
+  if (first.body === body || !violatesManyImageLimit(first.body)) return first;
+  const clamped = await transformRequestInner(body, {
+    ...opts,
+    maxImageEdgePx: ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX,
+  });
+  if (clamped.body !== body && !violatesManyImageLimit(clamped.body)) {
+    clamped.info.manyImageEdgeClampPx = ANTHROPIC_MANY_IMAGE_MAX_EDGE_PX;
+    return clamped;
+  }
+  const info: TransformInfo = {
+    compressed: false,
+    origChars: first.info.origChars,
+    compressedChars: 0,
+    imageCount: 0,
+    imageBytes: 0,
+    staticChars: 0,
+    dynamicChars: 0,
+    dynamicBlockCount: 0,
+    droppedChars: 0,
+    reason: 'many_images_limit',
+  };
+  if (first.info.nativeImages !== undefined) info.nativeImages = first.info.nativeImages;
+  bumpPassthrough(info, 'many_images_limit');
+  return { body, info };
+}
+
+async function transformRequestInner(
   body: Uint8Array,
   opts: TransformOptions = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
@@ -2497,7 +2694,13 @@ export async function transformRequest(
   // so the gate's prediction and the renderer's output agree at the smallest
   // legible width. The banner above sets the natural floor — no separate
   // minWidth knob needed.
-  const slabCols = shrinkColsToContent(combinedWithHeader, o.cols, 1, denseGeo.style.font);
+  // `clampColsToEdge` is a no-op unless the many-image rerun set maxImageEdgePx.
+  const slabCols = shrinkColsToContent(
+    combinedWithHeader,
+    clampColsToEdge(o.cols, denseGeo.style, o.maxImageEdgePx),
+    1,
+    denseGeo.style.font,
+  );
   const slabGateEval = evalCompressionProfitability(
     combinedWithHeader, slabCols, undefined, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
     false, // already shrunk — don't double-shrink
@@ -2855,7 +3058,7 @@ export async function transformRequest(
               const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                 await textToImageBlocks(
                   paged.text,
-                  o.cols,
+                  clampColsToEdge(o.cols, denseGeo.style, o.maxImageEdgePx),
                   true,
                   denseGeo.style,
                   denseGeo.maxHeightPx,
@@ -2966,7 +3169,7 @@ export async function transformRequest(
               const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                 await textToImageBlocks(
                   paged.text,
-                  o.cols,
+                  clampColsToEdge(o.cols, denseGeo.style, o.maxImageEdgePx),
                   true,
                   denseGeo.style,
                   denseGeo.maxHeightPx,

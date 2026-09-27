@@ -41,6 +41,9 @@ export interface TrackEvent {
    *  image_count + native_images — i.e. when the history collapse absorbed
    *  messages that already carried images, so we rendered more than we sent. */
   wire_images?: number;
+  /** Edge cap (px) the renderer was re-run at because the request carried more
+   *  than ANTHROPIC_MANY_IMAGE_THRESHOLD images. Absent when no clamp ran. */
+  many_image_edge_clamp_px?: number;
   image_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
@@ -98,7 +101,11 @@ export interface TrackEvent {
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
   dropped_codepoints_top?: Record<string, number>;
   /** Blocks that weren't image-compressed this request; only emitted when at least one counter > 0. */
-  passthrough_reasons?: { below_threshold?: number; not_profitable?: number };
+  passthrough_reasons?: {
+    below_threshold?: number;
+    not_profitable?: number;
+    many_images_limit?: number;
+  };
   /** Unrecognized tag names in the static slab — canary for Claude Code releases adding new dynamic tags. */
   unknown_static_tags?: string[];
   /** Slab tags whose content changed within a session — proven per-turn dynamics busting the image cache. */
@@ -256,6 +263,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.wireImages !== undefined
         && info.wireImages !== (info.imageCount ?? 0) + (info.nativeImages ?? 0)) {
       out.wire_images = info.wireImages;
+    }
+    if (info.manyImageEdgeClampPx !== undefined) {
+      out.many_image_edge_clamp_px = info.manyImageEdgeClampPx;
     }
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
