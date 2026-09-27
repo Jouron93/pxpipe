@@ -41,12 +41,28 @@
  * `cache_create`. {@link recordFreezeStep} pins the floor; the collapse only ever
  * doubles it.
  *
- * ## Failure mode we deliberately accept
+ * ## Why the state survives a restart
  *
- * State is in-memory and per proxy process. After a restart a live session looks
- * *unknown*, and unknown is treated as WARM (no repack) — the conservative
- * choice: at worst we keep paying the old image count, we never nuke a live cache
- * on a guess. The state re-arms itself on the first idle gap after the restart.
+ * The map lives in this process, and a proxy restart used to lose it. The header
+ * once called that an accepted failure mode — "unknown is treated as warm, at
+ * worst we keep paying the old image count". That stopped being true the moment
+ * the byte-fit budget became a pin ({@link recordHistoryByteBudget}): with the pin
+ * gone, the first request after a restart re-derives the budget, the collapse
+ * boundary moves, and every history chunk re-keys. Measured 2026-09-27 on the
+ * production host across one supervisor swap: every live session paid a full
+ * prefix rewrite on its next turn (claude-opus-5-5: cache_create 384,490 / read
+ * 12,341 against a warm steady state of create ≤3k / read ~400k; claude-fable-5-1:
+ * create 323,009), same `history_freeze_step` 640 before and after, collapsed
+ * turns 487 → 463. That is the whole cache, bought again, per session, per
+ * restart.
+ *
+ * So the host may attach a {@link SessionStateStore}. Every mutation schedules a
+ * debounced save ({@link PERSIST_DEBOUNCE_MS}); the record shape on disk is the
+ * in-memory record plus its key. On configure the file is read back and records
+ * idle for more than {@link PERSIST_MAX_IDLE_MS} are dropped — past the cold
+ * horizon the clock already declares them cold, so nothing they pin is protecting
+ * a live cache. Records already in memory win over the file. The core never
+ * touches a filesystem: without a store the module behaves exactly as before.
  */
 
 /** Sessions tracked before the oldest is evicted. One small record each. */
@@ -74,6 +90,24 @@ const COLD_GRACE_MS = 30_000;
  * from the provider's own accounting whenever a response has been seen.
  */
 const COLD_HORIZON_MS = 3_600_000 + COLD_GRACE_MS;
+
+/** On-disk format tag. Bump when a field changes meaning; older files are ignored. */
+const PERSIST_FORMAT = 1;
+
+/**
+ * Records idle longer than this are not persisted and not restored. Well past
+ * {@link COLD_HORIZON_MS}, where the clock alone already declares the session
+ * cold and a repack is free — a pin that old protects nothing. 24 hours.
+ */
+const PERSIST_MAX_IDLE_MS = 24 * 3_600_000;
+
+/**
+ * Coalesce saves. Every request touches `lastSeenMs`, and a Claude Code turn can
+ * be several requests in a burst; one write per burst is plenty. Short enough
+ * that a supervisor hard-kill (no signal on Windows) loses at most this window
+ * of clock updates — never a pin recorded on an earlier turn.
+ */
+const PERSIST_DEBOUNCE_MS = 250;
 
 interface SessionRecord {
   /** Wall-clock ms of the last request we saw for this session. */
@@ -117,13 +151,163 @@ function touch(key: string): SessionRecord {
   }
   const fresh: SessionRecord = { lastSeenMs: 0, freezeStep: 0, cacheDead: false };
   sessions.set(key, fresh);
+  evictToCapacity();
+  return fresh;
+}
+
+function evictToCapacity(): void {
   while (sessions.size > SESSIONS_MAX) {
     const oldest = sessions.keys().next().value;
     if (oldest === undefined) break;
     sessions.delete(oldest);
   }
-  return fresh;
 }
+
+// --- persistence ------------------------------------------------------------
+
+/**
+ * Host-supplied storage for the session map. The core stays filesystem-free;
+ * `node.ts` backs this with `~/.pxpipe/session-state.json`, tests with a string.
+ * `load` returns the last saved text or `undefined` when nothing was saved yet.
+ * `save` must be atomic from the reader's point of view (write-then-rename).
+ */
+export interface SessionStateStore {
+  load(): string | undefined;
+  save(text: string): void;
+}
+
+let store: SessionStateStore | undefined;
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let dirty = false;
+
+interface PersistedRecord extends SessionRecord {
+  key: string;
+}
+
+interface PersistedState {
+  format: number;
+  saved_at_ms: number;
+  sessions: PersistedRecord[];
+}
+
+/**
+ * Attach (or with `undefined`, detach) the store and restore what it holds.
+ * Flushes pending changes to the previous store first. Returns how many
+ * sessions were restored. Never throws: a store that cannot be read leaves the
+ * map as it was — the pre-persistence behaviour, which is safe (unknown = warm).
+ */
+export function configureSessionStateStore(
+  next: SessionStateStore | undefined,
+  nowMs: number = Date.now(),
+): number {
+  flushSessionState();
+  store = next;
+  if (!next) return 0;
+  let text: string | undefined;
+  try {
+    text = next.load();
+  } catch {
+    return 0;
+  }
+  return restoreSessionState(text, nowMs);
+}
+
+/**
+ * Merge a serialized snapshot into the map. Records already in memory win (they
+ * are newer by construction); records idle past {@link PERSIST_MAX_IDLE_MS} or
+ * malformed in any field are skipped. Returns the number restored.
+ */
+export function restoreSessionState(text: string | undefined, nowMs: number = Date.now()): number {
+  if (!text) return 0;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return 0;
+  }
+  if (!isPersistedState(parsed)) return 0;
+  let restored = 0;
+  for (const entry of parsed.sessions) {
+    const rec = validRecord(entry, nowMs);
+    if (!rec || sessions.has(entry.key)) continue;
+    sessions.set(entry.key, rec);
+    restored++;
+  }
+  evictToCapacity();
+  return restored;
+}
+
+function isPersistedState(value: unknown): value is PersistedState {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Partial<PersistedState>;
+  return v.format === PERSIST_FORMAT && Array.isArray(v.sessions);
+}
+
+function isBool(v: unknown): v is boolean {
+  return typeof v === 'boolean';
+}
+
+function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
+  if (!entry || typeof entry !== 'object') return undefined;
+  const e = entry as Partial<PersistedRecord>;
+  if (typeof e.key !== 'string' || e.key === '') return undefined;
+  if (typeof e.lastSeenMs !== 'number' || !Number.isFinite(e.lastSeenMs) || e.lastSeenMs <= 0) return undefined;
+  if (nowMs - e.lastSeenMs > PERSIST_MAX_IDLE_MS) return undefined;
+  if (typeof e.freezeStep !== 'number' || !Number.isFinite(e.freezeStep) || e.freezeStep < 0) return undefined;
+  if (!isBool(e.cacheDead)) return undefined;
+  const rec: SessionRecord = { lastSeenMs: e.lastSeenMs, freezeStep: e.freezeStep, cacheDead: e.cacheDead };
+  if (isBool(e.lastCacheAlive)) rec.lastCacheAlive = e.lastCacheAlive;
+  if (isBool(e.everCacheAlive)) rec.everCacheAlive = e.everCacheAlive;
+  if (typeof e.historyByteBudget === 'number' && Number.isFinite(e.historyByteBudget) && e.historyByteBudget > 0) {
+    rec.historyByteBudget = Math.floor(e.historyByteBudget);
+  }
+  return rec;
+}
+
+/** The map as JSON, oldest session first (LRU order), stale records omitted. */
+export function serializeSessionState(nowMs: number = Date.now()): string {
+  const out: PersistedRecord[] = [];
+  for (const [key, rec] of sessions) {
+    if (rec.lastSeenMs <= 0 || nowMs - rec.lastSeenMs > PERSIST_MAX_IDLE_MS) continue;
+    out.push({ key, ...rec });
+  }
+  const state: PersistedState = { format: PERSIST_FORMAT, saved_at_ms: nowMs, sessions: out };
+  return JSON.stringify(state);
+}
+
+function scheduleSave(): void {
+  if (!store) return;
+  dirty = true;
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = undefined;
+    flushSessionState();
+  }, PERSIST_DEBOUNCE_MS);
+  // Never keep the process alive for a bookkeeping write.
+  (saveTimer as { unref?: () => void }).unref?.();
+}
+
+/**
+ * Write pending changes now. Returns true when a save happened. Called by the
+ * debounce timer, on store change, and by the host on shutdown. A failing store
+ * is swallowed: persistence is an optimisation and must never fail a request.
+ */
+export function flushSessionState(): boolean {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = undefined;
+  }
+  if (!store || !dirty) return false;
+  dirty = false;
+  try {
+    store.save(serializeSessionState());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// --- request-path API -------------------------------------------------------
 
 export interface HistorySessionState {
   /** The upstream prefix cache is provably gone — re-cutting the grid is free. */
@@ -175,6 +359,7 @@ export function noteHistoryRequest(
   const cold = rec.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
   rec.lastSeenMs = nowMs;
   rec.cacheDead = false; // consumed: this request gets the repack
+  scheduleSave();
   return { cold, minFreezeStep: rec.freezeStep };
 }
 
@@ -200,6 +385,7 @@ export function noteCacheOutcome(
   const alive = (cacheReadTokens ?? 0) > 0 || (cacheCreateTokens ?? 0) > 0;
   rec.lastCacheAlive = alive;
   if (alive) rec.everCacheAlive = true;
+  scheduleSave();
 }
 
 /**
@@ -212,7 +398,10 @@ export function recordFreezeStep(
 ): void {
   if (!sessionKey || !step || !Number.isFinite(step) || step <= 0) return;
   const rec = touch(sessionKey);
-  if (step > rec.freezeStep) rec.freezeStep = step;
+  if (step > rec.freezeStep) {
+    rec.freezeStep = step;
+    scheduleSave();
+  }
 }
 
 /** Sticky byte-fit history budget for a session, or undefined when none is pinned. */
@@ -235,6 +424,7 @@ export function recordHistoryByteBudget(
   const rec = touch(sessionKey);
   if (cold || rec.historyByteBudget === undefined || budget < rec.historyByteBudget) {
     rec.historyByteBudget = Math.floor(budget);
+    scheduleSave();
   }
 }
 
@@ -242,7 +432,10 @@ export function recordHistoryByteBudget(
 export function clearHistoryByteBudget(sessionKey: string | undefined): void {
   if (!sessionKey) return;
   const rec = sessions.get(sessionKey);
-  if (rec) rec.historyByteBudget = undefined;
+  if (rec && rec.historyByteBudget !== undefined) {
+    rec.historyByteBudget = undefined;
+    scheduleSave();
+  }
 }
 
 /**
@@ -253,6 +446,7 @@ export function clearHistoryByteBudget(sessionKey: string | undefined): void {
 export function markCacheDead(sessionKey: string | undefined): void {
   if (!sessionKey) return;
   touch(sessionKey).cacheDead = true;
+  scheduleSave();
 }
 
 /**
@@ -287,9 +481,14 @@ export function responseLeftNoCache(status: number, errorBody?: string): boolean
   return false;
 }
 
-/** Test seam: drop all session state. */
+/** Test seam: drop all session state and any pending save. The store stays attached. */
 export function resetSessionState(): void {
   sessions.clear();
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = undefined;
+  }
+  dirty = false;
 }
 
 /** Test/telemetry seam: inspect a session without mutating its clock. */
@@ -298,4 +497,9 @@ export function peekSessionState(
 ): { lastSeenMs: number; freezeStep: number; cacheDead: boolean } | undefined {
   const rec = sessions.get(sessionKey);
   return rec ? { ...rec } : undefined;
+}
+
+/** Telemetry seam: how many sessions are currently tracked. */
+export function sessionStateSize(): number {
+  return sessions.size;
 }
