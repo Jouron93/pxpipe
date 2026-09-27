@@ -20,6 +20,8 @@ export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
   minCompressTokens: 500,
   factSheetFormat: 'compact',
+  contextWindow: 2_097_152,
+  outputLimit: 8_192,
   history: {
     maxImages: 32,
     keepTail: 4,
@@ -43,36 +45,30 @@ export const GEMINI_3_6_FLASH_PROFILE: GptModelProfile = {
   },
 };
 
-/** Dedicated profile for Gemini 3.7 Flash. Reuses the measured 3.6 Flash
- *  image geometry (1568×728 @ 1,078 tokens) and shared pricing structure. */
-export const GEMINI_3_7_FLASH_PROFILE: GptModelProfile = {
-  ...GEMINI_3_6_FLASH_PROFILE,
-  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
-  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
-  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
-};
-
-export const GEMINI_3_8_FLASH_PROFILE: GptModelProfile = {
-  ...GEMINI_3_6_FLASH_PROFILE,
-  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
-  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
-  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
-};
-
-export const GEMINI_3_1_FLASH_PROFILE: GptModelProfile = {
-  ...GEMINI_3_6_FLASH_PROFILE,
-  vision: { ...GEMINI_3_6_FLASH_PROFILE.vision },
-  history: { ...GEMINI_3_6_FLASH_PROFILE.history },
-  style: { ...GEMINI_3_6_FLASH_PROFILE.style },
-};
+/** All Gemini Flash models share the measured 3.6 Flash geometry
+ *  (1568×728 @ 1,078 tokens) and unified pricing structure. Exported
+ *  as separate constants for clarity and future-proofing; runtime uses
+ *  GEMINI_3_6_FLASH_PROFILE as the canonical definition. */
+export const GEMINI_3_7_FLASH_PROFILE = GEMINI_3_6_FLASH_PROFILE;
+export const GEMINI_3_8_FLASH_PROFILE = GEMINI_3_6_FLASH_PROFILE;
+export const GEMINI_3_1_FLASH_PROFILE = GEMINI_3_6_FLASH_PROFILE;
+export const GEMINI_3_5_FLASH_PROFILE = GEMINI_3_6_FLASH_PROFILE;
+export const GEMINI_3_8_LIVE_PROFILE = GEMINI_3_6_FLASH_PROFILE;
+export const GEMINI_OMNI_1_1_FLASH_PROFILE = GEMINI_3_6_FLASH_PROFILE;
 
 const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
+  'gemini-3.5-flash': GEMINI_3_5_FLASH_PROFILE,
+  'gemini-3.5-flash-high': GEMINI_3_5_FLASH_PROFILE,
+  'gemini-3.5-flash-medium': GEMINI_3_5_FLASH_PROFILE,
+  'gemini-3.5-flash-low': GEMINI_3_5_FLASH_PROFILE,
   'gemini-3.6-flash': GEMINI_3_6_FLASH_PROFILE,
   'gemini-3.7-flash': GEMINI_3_7_FLASH_PROFILE,
   'gemini-3.8-flash': GEMINI_3_8_FLASH_PROFILE,
   'gemini-3.8-flash-high': GEMINI_3_8_FLASH_PROFILE,
   'gemini-3.8-flash-medium': GEMINI_3_8_FLASH_PROFILE,
   'gemini-3.8-flash-low': GEMINI_3_8_FLASH_PROFILE,
+  'gemini-3.8-live': GEMINI_3_8_LIVE_PROFILE,
+  'gemini-omni-1.1-flash': GEMINI_OMNI_1_1_FLASH_PROFILE,
   'gemini-3.1-flash': GEMINI_3_1_FLASH_PROFILE,
   'gemini-3.1-flash-lite': GEMINI_3_1_FLASH_PROFILE,
 };
@@ -89,12 +85,13 @@ export function isGeminiModel(model: string | null | undefined): boolean {
 }
 
 /** True for Gemini models with a validated or forward-compatible profile.
- *  Supports 3.8+, 3.9+, 4+, 5+, Pro, and registered 3.6/3.7/3.1 flash models. */
+ *  Supports 3.8+, 3.9+, 4+, 5+, Pro, and registered 3.5/3.6/3.7/3.1 flash and omni models. */
 export function hasGeminiMeasuredProfile(model: string | null | undefined): boolean {
   const id = normalizeGeminiId(model);
   if (!id) return false;
   if (id in GEMINI_MEASURED_PROFILES) return true;
   if (id === 'gemini-pro' || id === 'gemini-flash' || id === 'gemini') return true;
+  if (/^gemini-omni-/.test(id)) return true;
   const m = id.match(/^gemini-(\d+)(?:\.(\d+))?/);
   if (!m) return false;
   const major = parseInt(m[1]!, 10);
