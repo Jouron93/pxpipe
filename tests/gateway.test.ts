@@ -3,7 +3,7 @@
  * the suite never touches the network (global fetch is stubbed).
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { createProxy, parseGatewayHeaders, resolveUpstreams } from '../src/core/proxy.js';
+import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyEvent } from '../src/core/proxy.js';
 
 const FAKE_BASE = 'https://gateway.example.test/v1/acct_fake/gw_fake';
 const FAKE_TOKEN = 'Bearer fake-gateway-token';
@@ -98,6 +98,53 @@ describe('gateway end-to-end routing (stubbed fetch)', () => {
     expect(cap.url).toBe(`${FAKE_BASE}/anthropic/v1/messages`);
     expect(cap.headers?.get('cf-aig-authorization')).toBe(FAKE_TOKEN);
     expect(cap.headers?.get('x-api-key')).toBe('fake-anthropic-key');
+  });
+
+  it('stamps launcher identity headers onto the receipt event without persisting secrets', async () => {
+    const cap: { url?: string; headers?: Headers } = {};
+    stubFetch(cap);
+    const events: ProxyEvent[] = [];
+    const res = await createProxy({
+      provider: 'cloudflare-ai-gateway',
+      gatewayBaseUrl: FAKE_BASE,
+      gatewayHeaders: { 'cf-aig-authorization': FAKE_TOKEN },
+      onRequest: (e) => { events.push(e); },
+    })(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': 'fake-anthropic-key',
+          authorization: 'Bearer fake-oauth-secret',
+          'chatgpt-account-id': 'acct-secret',
+          'user-agent': 'claude-cli/9.9.9 (external, cli)',
+          'x-app': 'cli',
+          'x-account': 'claude-orn',
+          'x-session-id': 'claude-orn-20260927-test',
+          'x-request-id': '90d853eb-4834-4566-842b-15d20a5a5ed4',
+        },
+        body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    // The receipt is emitted after the upstream body has been measured, so
+    // drain it and let the emit settle — same discipline as min-body-bytes
+    // and gateway-wire-shape.
+    await res.text();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(events).toHaveLength(1);
+    const ev = events[0]!;
+    expect(ev.account).toBe('claude-orn');
+    expect(ev.sessionId).toBe('claude-orn-20260927-test');
+    expect(ev.requestId).toBe('90d853eb-4834-4566-842b-15d20a5a5ed4');
+    expect(ev.caller).toContain('x-account=claude-orn');
+    expect(ev.caller).toContain('user-agent=claude-cli/9.9.9 (external, cli)');
+    // Credentials and provider account identifiers must never reach a receipt.
+    const blob = JSON.stringify(ev);
+    expect(blob).not.toMatch(/fake-oauth-secret/);
+    expect(blob).not.toMatch(/acct-secret/);
+    expect(blob).not.toMatch(/chatgpt-account-id/i);
+    expect(blob).not.toMatch(/authorization/i);
   });
 
   it('routes OpenAI /v1/chat/completions to {base}/openai/chat/completions', async () => {

@@ -142,10 +142,59 @@ export interface ProxyEvent {
   /** Upstream response media/encoding metadata for scanner diagnostics. */
   responseContentType?: string;
   responseContentEncoding?: string;
+  /** Redacted caller identity from RECEIPT_ID_HEADERS (see describeCaller).
+   *  Set on EVERY event, not just failures — without it rows are unattributable
+   *  and per-account spend cannot be computed. Never contains credential material. */
+  caller?: string;
+  /** Explicit x-session-id when the caller supplies one. */
+  sessionId?: string;
+  /** x-request-id, for correlating this receipt to the caller's own logs. */
+  requestId?: string;
+  /** Account/profile label (claude-orn, codex-a, ...) when the caller declares one. */
+  account?: string;
 }
 
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
+
+/** Headers safe to persist on EVERY receipt row, indefinitely.
+ *
+ *  Everything here is either a harness label we generate (x-account,
+ *  x-session-id from the launchers) or an opaque correlation id. Nothing here
+ *  identifies a billable account at the provider — provider identifiers such as
+ *  `chatgpt-account-id` / `openai-organization` / `openai-project` are
+ *  deliberately excluded, and `tests/gateway.test.ts` asserts they never reach
+ *  a receipt. The stainless/version headers are omitted too: no attribution
+ *  value, pure row noise. */
+const RECEIPT_ID_HEADERS = [
+  'user-agent',
+  'x-app',
+  'x-session-id',
+  'x-request-id',
+  'x-account',
+] as const;
+
+/** Redacted caller identity for per-request receipts. Never credentials, and
+ *  never provider account identifiers — see RECEIPT_ID_HEADERS above.
+ *
+ *  Returns undefined when the caller sent none of these, so an absent identity
+ *  stays absent rather than being recorded as an empty string. */
+export function describeCaller(headers: Headers): string | undefined {
+  const parts = fingerprintHeaders(headers, RECEIPT_ID_HEADERS);
+  return parts.length > 0 ? parts.join(' | ') : undefined;
+}
+
+/** The single implementation of the header-fingerprint rule. Values are
+ *  truncated to 80 chars and stripped of whitespace/pipes so one hostile header
+ *  cannot bloat a row or forge a field separator. */
+function fingerprintHeaders(headers: Headers, names: readonly string[]): string[] {
+  const parts: string[] = [];
+  for (const name of names) {
+    const v = headers.get(name);
+    if (v) parts.push(`${name}=${v.slice(0, 80).replace(/[\s|]+/g, ' ')}`);
+  }
+  return parts;
+}
 
 /** Headers should arrive well inside this; generous enough for slow reasoning starts. */
 const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
@@ -1622,6 +1671,14 @@ let responseContentType: string | undefined;
           stopReason,
           responseContentType,
           responseContentEncoding,
+          // Receipts: attach caller identity to EVERY event, independent of
+          // status. Deployed main lost this on 2026-09-16 (the identity work
+          // only ever lived on runtime/abyss) and every row since has been
+          // unattributable — verify-ai-launchers.ps1 grades on exactly this.
+          caller: describeCaller(req.headers),
+          sessionId: req.headers.get('x-session-id') ?? undefined,
+          requestId: req.headers.get('x-request-id') ?? undefined,
+          account: req.headers.get('x-account') ?? undefined,
         });
       };
       void finalize();

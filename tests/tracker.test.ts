@@ -1,6 +1,41 @@
 import { describe, it, expect } from 'vitest';
-import { toTrackEvent, JsonLogTracker, noopTracker, type TrackEvent } from '../src/core/tracker.js';
+import { toTrackEvent, JsonLogTracker, noopTracker, UNKNOWN_SESSION_ID, type TrackEvent } from '../src/core/tracker.js';
 import type { ProxyEvent } from '../src/core/proxy.js';
+
+describe('toTrackEvent receipt identity', () => {
+  const base: ProxyEvent = { method: 'POST', path: '/v1/messages', status: 200, durationMs: 1 };
+
+  it('persists caller / session_id / request_id / account on every row', () => {
+    const out = toTrackEvent({
+      ...base,
+      caller: 'user-agent=codex-cli | x-account=codex-a',
+      sessionId: 'codex-a-20260927-abc',
+      requestId: '6a847d42-8845-4458-b31f-6ecf216a2722',
+      account: 'codex-a',
+    });
+    expect(out.caller).toBe('user-agent=codex-cli | x-account=codex-a');
+    expect(out.session_id).toBe('codex-a-20260927-abc');
+    expect(out.request_id).toBe('6a847d42-8845-4458-b31f-6ecf216a2722');
+    expect(out.account).toBe('codex-a');
+  });
+
+  it('writes the <unknown> session sentinel unconditionally and omits absent identity', () => {
+    const out = toTrackEvent(base);
+    expect(out.session_id).toBe(UNKNOWN_SESSION_ID);
+    expect(out.session_id).toBe('<unknown>');
+    expect('caller' in out).toBe(false);
+    expect('request_id' in out).toBe(false);
+    expect('account' in out).toBe(false);
+  });
+
+  it('stamps identity on failure rows too — 401 is graded separately from identity', () => {
+    const out = toTrackEvent({ ...base, status: 401, error: 'auth_denied', account: 'codex-b', sessionId: 'codex-b-x' });
+    expect(out.status).toBe(401);
+    expect(out.error).toBe('auth_denied');
+    expect(out.account).toBe('codex-b');
+    expect(out.session_id).toBe('codex-b-x');
+  });
+});
 
 describe('toTrackEvent', () => {
   it('persists bridged accounting semantics and GPT-native overhead', () => {

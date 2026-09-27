@@ -28,7 +28,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import * as readline from 'node:readline';
-import type { TrackEvent } from './core/tracker.js';
+import { UNKNOWN_SESSION_ID, type TrackEvent } from './core/tracker.js';
 import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
@@ -117,9 +117,25 @@ export async function* readEvents(
 
 // ---- Aggregation -----------------------------------------------------------
 
-export const UNKNOWN_SESSION = '<unknown>';
+/** Re-exported from core/tracker so the emitter and this aggregator can never
+ *  disagree on the sentinel for unattributable traffic. */
+export const UNKNOWN_SESSION = UNKNOWN_SESSION_ID;
 
+/** Resolve a row to a session bucket, most explicit signal first.
+ *
+ *  1. `session_id` — set from the caller's x-session-id header. Any harness can
+ *     send it, which is the point: it does not depend on prompt shape.
+ *  2. `first_user_sha8` — hash of the first user message. Only identifies
+ *     harnesses that emit a stable first message. Kept as fallback so
+ *     historical rows still bucket correctly.
+ *  3. UNKNOWN_SESSION — explicit, never silently dropped.
+ *
+ *  Note `session_id` is written unconditionally by toTrackEvent and already
+ *  defaults to the sentinel, so the `??` chain here is belt-and-braces for rows
+ *  emitted by builds that predate the field. */
 function sessionIdOf(ev: TrackEvent): string {
+  const explicit = ev.session_id;
+  if (explicit && explicit !== UNKNOWN_SESSION) return explicit;
   return ev.first_user_sha8 ?? UNKNOWN_SESSION;
 }
 
