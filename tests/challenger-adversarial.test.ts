@@ -123,8 +123,10 @@ describe('Challenger Challenge 2: Down-Rewrite Challenge (GPT-6)', () => {
       expect(prof6.vision.multiplier).toBe(1);
       expect(prof6.vision.patchCap).toBe(10000);
     }
-    expect(prof6.stripCols).toBe(152);
-    expect(prof6.maxHeightPx).toBe(1932);
+    // GPT6_DEFAULT_PROFILE adopted the legible Astra/Sol/Luna geometry (bcd0646):
+    // 84 cols × 1954px, not the dense 152 × 1932 it launched with.
+    expect(prof6.stripCols).toBe(84);
+    expect(prof6.maxHeightPx).toBe(1954);
     expect(prof6.cacheReadRate).toBe(0.5);
     expect(prof6.outputRate).toBe(5);
     expect(isMisresolvedModelId('gpt-6-terra')).toBe(false);

@@ -1121,13 +1121,21 @@ describe('resolveGptProfile (GPT-5.6 Sol)', () => {
       });
       expect(sol.factSheetFormat, model).toBe('full');
     }
+    // GPT5_FLAGSHIP_PROFILE (7fd3d57): non-Sol GPT-5.6 variants adopted the same legible
+    // geometry as Sol/Astra/Luna but keep GPT-5 pricing and the 10000 patch cap.
     for (const model of ['gpt-5.6', 'gpt-5.6-terra', 'gpt-5.6-terra[1m]']) {
       const notSol = resolveGptProfile(model);
-      expect(notSol.stripCols, model).toBe(152);
-      expect(notSol.style.font, model).toBe('spleen-5x8');
-      expect(notSol.history.responsesMode, model).toBe('pairs');
-      expect(notSol.history.maxImages, model).toBe(32);
+      expect(notSol.stripCols, model).toBe(84);
+      expect(notSol.maxHeightPx, model).toBe(1954);
+      expect(notSol.style.font, model).toBe('jetbrains-mono-14');
+      expect(notSol.exactStaticBaseline, model).toBe(true);
+      expect(notSol.history.responsesMode, model).toBe('mixed');
+      expect(notSol.history.maxImages, model).toBe(64);
       expect(notSol.factSheetFormat, model).toBe('full');
+      if (notSol.vision.regime === 'patch') {
+        expect(notSol.vision.patchCap, model).toBe(10000);
+      }
+      expect(notSol.outputRate, model).toBe(8); // still GPT-5 pricing, not Sol/GPT-6
     }
     expect(resolveGptProfile('gpt-5.6-sol').maxSerializedRequestBytes).toBeUndefined();
   });

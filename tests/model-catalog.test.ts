@@ -69,10 +69,16 @@ describe('Phase 4: Model Catalog & Schema Verification', () => {
       expect(prof.history?.maxImages).toBe(64);
       expect(isMisresolvedModelId('gpt-6-astra')).toBe(false);
 
-      // Verify it is distinct from generic gpt-6 fallback
+      // Verify it is distinct from generic gpt-6 fallback. Since bcd0646 the fallback
+      // shares the legible geometry (84 cols, jetbrains-mono-14); what still separates
+      // Astra is the uncapped patch regime and its measured exactStaticBaseline.
       const genericProf = resolveGptProfile('gpt-6-generic');
-      expect(genericProf.stripCols).toBe(152); // fallback uses default cols
-      expect(genericProf.style.font).toBe('spleen-5x8'); // fallback uses base style
+      expect(genericProf.stripCols).toBe(84);
+      expect(genericProf.style.font).toBe('jetbrains-mono-14');
+      if (genericProf.vision.regime === 'patch') {
+        expect(genericProf.vision.patchCap).toBe(10000);
+      }
+      expect(genericProf.exactStaticBaseline).not.toBe(true);
       expect(prof).not.toEqual(genericProf);
     });
 
